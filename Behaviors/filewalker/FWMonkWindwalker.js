@@ -1,1308 +1,1283 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
-import Common from '@/Core/Common';
-import Spell from "@/Core/Spell";
-import CombatTimer from "@/Core/CombatTimer";
-import { me } from "@/Core/ObjectManager";
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import { defaultHealTargeting as heal } from '@/Targeting/HealTargeting';
-import Settings from "@/Core/Settings";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
 /**
- * Behavior implementation for Windwalker Monk
- * Based on SimC APL: March 17, 2025 - c02ee75
+ * Windwalker Monk Behavior - Midnight 12.0.1
+ * Full SimC APL match: apl_monk.cpp windwalker namespace (midnight branch)
+ * Auto-detects: Shado-Pan (Flurry Strikes) vs Conduit of the Celestials (Celestial Conduit)
+ *
+ * Resource: Energy (PowerType 3) + Chi (PowerType 12), max Chi = 5 (6 with Ascension)
+ * CRITICAL: Combo Strikes — never repeat same ability (Mastery bonus)
+ *
+ * Midnight: Zenith (1249625) replaces SEF — 2 charges, 15s buff, Chi costs -1, BOK CDR +1s, resets RSK
+ * Shado-Pan: Flurry Charges from auto-attacks, unleashed by abilities
+ * Conduit: Celestial Conduit channel, Heart of the Jade Serpent CDR windows
+ *
+ * SimC APL action lists: opener, big_coc, zenith, racials, default_st, multitarget, fallback
+ * Total SimC lines: opener(2) + coc(11) + zen(15) + racials(4) + st(32) + multi(31) + fallback(4) = ~99
+ * Non-patchwerk simplifications applied (fight_style.patchwerk conditions always false)
+ *
+ * COMBO STRIKES FIX: spell.getLastSuccessfulSpell() returns raw spellNameOrId (number),
+ * NOT an object with .id. Use spell.getLastSuccessfulSpells(1)[0]?.id for the last cast ID.
  */
+
+const S = {
+  // Core
+  tigerPalm:          100780,
+  blackoutKick:       100784,
+  risingSunKick:      107428,
+  fistsOfFury:        113656,
+  spinningCraneKick:  101546,
+  whirlingDragonPunch: 152175,
+  strikeOfWindlord:   392983,
+  slicingWinds:       1217413,
+  rushingWindKick:    1250566,
+  touchOfDeath:       322109,
+  chiBurst:           123986,
+  jadefireStomp:      388193,
+  // Burst CDs
+  zenith:             1249625,
+  invokeXuen:         123904,
+  celestialConduit:   443028,
+  // Utility
+  expelHarm:          322101,
+  touchOfKarma:       122470,
+  // Interrupt
+  spearHandStrike:    116705,
+  // Racials
+  berserking:         26297,
+  bloodFury:          20572,
+  fireblood:          265221,
+  ancestralCall:      274738,
+  arcaneTorrent:      50613,
+};
+
+const A = {
+  // Core
+  zenith:             1249625,
+  comboBreaker:       116768,
+  danceOfChiJi:       325202,
+  teachingsMonastery: 202090,   // Stacking buff (passive talent is 116645)
+  pressurePoint:      247255,
+  invokeXuen:         123904,
+  rushingWindKick:    1250554,  // Buff aura (cast is 1250566)
+  bloodlust:          2825,     // Also 32182 (Heroism), 80353 (Time Warp), etc.
+  powerInfusion:      10060,
+  // Shado-Pan
+  flurryCharge:       451021,
+  wisdomCritDmg:      452684,
+  wisdomMastery:      452685,
+  // Conduit of the Celestials
+  heartOfJadeSerpent:         443616,
+  heartOfJadeSerpentUnity:    443421,  // heart_of_the_jade_serpent_unity_within
+  heartOfJadeSerpentYulon:    1238904, // Yu'lon's Avatar buff
+  celestialConduit:   443028,
+  // Tigereye Brew (Apex)
+  tigereyeBrew:       1261724,  // 1-stack buff (3-stack variant: 1262042)
+  // WDP buff (internal CD tracking)
+  whirlingDragonPunch: 152175,
+};
+
+// Talent IDs for spell.isSpellKnown() checks
+const T = {
+  flurryStrikes:      450615,
+  celestialConduit:   443028,
+  whirlingDragonPunch: 152175,
+  strikeOfWindlord:   392983,
+  obsidianSpiral:     1249832,
+  innerPeace:         397768,
+  energyBurst:        451498,
+  sequencedStrikes:   260717,
+  craneVortex:        388848,
+  shadowboxingTreads: 392982,
+  jadefireStomp:      388193,
+  invokeXuen:         123904,
+  restoreBalance:     442719,
+  slicingWinds:       1217413,
+};
+
+// Bloodlust aura IDs (all variants)
+const BLOODLUST_IDS = [2825, 32182, 80353, 264667, 390386, 386540];
+
 export class WindwalkerMonkBehavior extends Behavior {
-  // Define context, specialization, name, and version
+  name = 'FW Windwalker Monk';
   context = BehaviorContext.Any;
-  specialization = Specialization.Monk.Windwalker; 
-  name = "FW Windwalker Monk";
-  version = 1;
-  
-  // Define talent build options
-  static TALENT_BUILDS = {
-    SHADO_PAN: 'shadowpan',
-    FLURRY: 'flurry',
-  };
-  
-  /**
-   * Settings for the behavior
-   * These will appear in the UI settings panel
-   */
+  specialization = Specialization.Monk.Windwalker;
+  version = wow.GameVersion.Retail;
+
+  // Combo Strikes tracking
+  _lastCastId = 0;
+  // Opener tracking
+  _combatStartTime = 0;
+
+  // Per-tick caches
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _energyFrame = 0;
+  _cachedEnergy = 0;
+  _chiFrame = 0;
+  _cachedChi = 0;
+  _chiMaxFrame = 0;
+  _cachedChiMax = 0;
+  _zenithFrame = 0;
+  _cachedZenith = null;  // aura object or null
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _bloodlustFrame = 0;
+  _cachedBloodlust = false;
+  _comboBreakerFrame = 0;
+  _cachedComboBreaker = null;
+  _danceFrame = 0;
+  _cachedDance = null;
+  _hotjsFrame = 0;
+  _cachedHotjs = null;
+  _hotjsUnityFrame = 0;
+  _cachedHotjsUnity = null;
+  _hotjsYulonFrame = 0;
+  _cachedHotjsYulon = null;
+  _versionLogged = false;
+  _lastDebug = 0;
+
   static settings = [
     {
-      header: "Windwalker Configuration",
+      header: 'General',
       options: [
-        {
-          uid: "UseAOERotation",
-          text: "Auto AOE Rotation",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "AOEThreshold",
-          text: "AOE Threshold",
-          type: "slider",
-          min:1,
-          max:10,
-          default: 3
-        },
-        {
-          uid: "UseCooldowns",
-          text: "Use Cooldowns",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "XuenThreshold",
-          text: "Xuen Time To Die Threshold",
-          type: "slider",
-          min:1,
-          max:100,
-          default: 14
-        },
-        {
-          uid: "SEFThreshold",
-          text: "SEF Time To Die Threshold",
-          type: "slider",
-          min:1,
-          max:100,
-          default: 6
-        },
-        {
-          uid: "UseTouchOfKarma",
-          text: "Use Touch of Karma",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "UseRacials",
-          text: "Use Racial Abilities",
-          type: "checkbox",
-          default: true
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWWWUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'checkbox', uid: 'FWWWDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWWWKarma', text: 'Use Touch of Karma', default: true },
+        { type: 'slider', uid: 'FWWWKarmaHP', text: 'Touch of Karma HP %', default: 50, min: 15, max: 70 },
+      ],
+    },
   ];
 
-  /**
-   * Builds the behavior tree for Windwalker Monk
-   * This is the main entry point for the behavior
-   * @returns {bt.Composite} The root node of the behavior tree
-   */
-  build() {
-    return new bt.Selector(
-        new bt.Action(() => {
-                if (!this.getCurrentTarget()) return bt.Status.Success;
-                
-              
-                
-                return bt.Status.Failure;
-              }),
-       Common.waitForCastOrChannel(),
-       Common.waitForNotMounted(),
-       new bt.Action(() => {
-               // Return success if we don't have a valid target
-               if (this.getCurrentTarget() === null) {
-                 return bt.Status.Success;
-               }
-               return bt.Status.Failure;
-             }),
-   
-      this.initVariables(),
-    //   Interrupt with Spear Hand Strike
-      Spell.cast("Spear Hand Strike", () => this.shouldInterrupt()),
-    //   Opener logic based on target count
-      new bt.Decorator(
-        () => this.isOpeningPhase() && this.getEnemyCount() > 2,
-        this.aoeOpener(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      new bt.Decorator(
-        () => this.isOpeningPhase() && this.getEnemyCount() < 3,
-        this.normalOpener(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      // Use cooldowns
-      new bt.Decorator(
-        () => Settings.UseCooldowns && Spell.isSpellKnown(137639), // Storm, Earth and Fire
-        this.useCooldowns(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      // Main rotations based on enemy count
-      new bt.Decorator(
-        () => this.getEnemyCount() >= 5 && Settings.UseAOERotation,
-        this.aoeRotation(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      new bt.Decorator(
-        () => this.getEnemyCount() > 1 && this.getEnemyCount() < 5 && Settings.UseAOERotation,
-        this.cleaveRotation(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      new bt.Decorator(
-        () => this.getEnemyCount() < 2 || !Settings.UseAOERotation,
-        this.singleTargetRotation(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      // Fallback in case all rotations fail
-    this.fallbackRotation()
-      // Racial abilities if enabled
-    //   new bt.Decorator(
-    //     () => Settings.UseRacials,
-    //     this.useRacials(),
-    //     new bt.Action(() => bt.Status.Success)
-    //   )
-    );
+  // ===== Hero Detection =====
+  isShadoPan() {
+    return spell.isSpellKnown(T.flurryStrikes);
   }
 
-  /**
-   * Initialize combat variables for rotation logic
-   */
-  initVariables() {
-    return new bt.Action(() => {
-      // Check for Shadopan hero talent
-      const isFlurryBuild = me.hasAura(59868); // Flurry Strikes
-      const target = this.getCurrentTarget();
-      // Setup SEF condition variable
-      const targetTimeToDie = this.getCurrentTarget()?.timeToDeath() || 999;
-      const hasSEFCondition = targetTimeToDie > Settings.SEFThreshold && 
-                             (this.hasCooldown("Rising Sun Kick") || this.getEnemyCount() > 2 || !Spell.isSpellKnown(378082)) && // Ordered Elements talent
-                             (me.hasAura(162264) || // Xuen active
-                             ((!Spell.isSpellKnown(392983) || // Last Emperor's Capacitor
-                               target.getAuraStacks(325092) > 17) && // Emperor's Capacitor buff stacks
-                              (this.hasCooldown("Strike of the Windlord") < 5 || 
-                               !Spell.isSpellKnown(392983)))); // Strike of the Windlord
+  isConduit() {
+    return !this.isShadoPan();
+  }
 
-      // Setup Xuen condition variable
-      const hasXuenCondition = (this.getEnemyCount() === 1 && (!Spell.isSpellKnown(395152) || // Celestial Conduit
-                                Spell.isSpellKnown(395152) && Spell.isSpellKnown(123904))) && // Xuen's Bond
-                               (this.getEnemyCount() > 1) && 
-                                Spell.getCooldown(137639)?.ready && // Storm, Earth, and Fire
-                               (targetTimeToDie > Settings.XuenThreshold);
-      
-      return bt.Status.Failure;
+  // ===== Combo Strikes =====
+  // FIX: spell.getLastSuccessfulSpell() returns raw number, NOT object with .id
+  // Must use spell.getLastSuccessfulSpells(1) which returns array of {name, id, spellName, targetName}
+  _updateLastCast() {
+    const history = spell.getLastSuccessfulSpells(1);
+    if (history && history.length > 0 && history[0]) {
+      this._lastCastId = history[0].id;
+    }
+  }
+
+  isComboStrike(spellId) {
+    return spellId !== this._lastCastId;
+  }
+
+  // Wrapper: cast only if Combo Strike condition met
+  castCombo(spellId, targetFn, conditionFn) {
+    return spell.cast(spellId, targetFn, () => {
+      if (!this.isComboStrike(spellId)) return false;
+      if (conditionFn && !conditionFn()) return false;
+      return true;
     });
   }
 
-  /**
-   * Check if we're in the opening phase of combat
-   */
-  isOpeningPhase() {
-    return me.inCombat() && (Date.now() - CombatTimer.getCombatStartTime() < 4000);
-  }
-
-  /**
-   * Get the current target, preferring the player's target if valid
-   */
+  // ===== Caching =====
   getCurrentTarget() {
-    const target = me.targetUnit;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const target = me.target;
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 8 && me.isFacing(target)) {
+      this._cachedTarget = target;
       return target;
     }
-    return combat.bestTarget;
+    const t = combat.bestTarget || (combat.targets && combat.targets[0]) || null;
+    this._cachedTarget = (t && me.isFacing(t)) ? t : null;
+    return this._cachedTarget;
   }
 
-  /**
-   * Get the number of enemies in range
-   */
+  getEnergy() {
+    if (this._energyFrame === wow.frameTime) return this._cachedEnergy;
+    this._energyFrame = wow.frameTime;
+    this._cachedEnergy = me.powerByType(PowerType.Energy);
+    return this._cachedEnergy;
+  }
+
+  getChi() {
+    if (this._chiFrame === wow.frameTime) return this._cachedChi;
+    this._chiFrame = wow.frameTime;
+    this._cachedChi = me.powerByType(PowerType.Chi);
+    return this._cachedChi;
+  }
+
+  getChiMax() {
+    if (this._chiMaxFrame === wow.frameTime) return this._cachedChiMax;
+    this._chiMaxFrame = wow.frameTime;
+    // Default 5, 6 with Ascension — check max power
+    this._cachedChiMax = me.maxPowerByType ? me.maxPowerByType(PowerType.Chi) : 5;
+    if (!this._cachedChiMax || this._cachedChiMax < 5) this._cachedChiMax = 5;
+    return this._cachedChiMax;
+  }
+
+  getZenithAura() {
+    if (this._zenithFrame === wow.frameTime) return this._cachedZenith;
+    this._zenithFrame = wow.frameTime;
+    this._cachedZenith = me.getAura(A.zenith);
+    return this._cachedZenith;
+  }
+
+  inZenith() {
+    return this.getZenithAura() !== null && this.getZenithAura() !== undefined;
+  }
+
+  zenithRemains() {
+    const aura = this.getZenithAura();
+    return aura ? aura.remaining : 0;
+  }
+
   getEnemyCount() {
-    const targetsInRange = combat.targets.filter(unit => unit.distanceTo(me) <= 8);
-    return targetsInRange.length || 1; // Default to 1 if no targets found
-  }
-
-  /**
-   * Check if a cooldown is available within specified seconds
-   */
-  hasCooldown(spellName, seconds = 0) {
-    const cd = Spell.getCooldown(spellName);
-    return cd && cd.ready ? false : cd.timeleft > (seconds * 1000);
-  }
-
-  /**
-   * Check if we should use cooldowns based on settings and targets
-   */
-  shouldUseCooldowns() {
-    return Settings.UseCooldowns && this.getCurrentTarget() && !this.getCurrentTarget().deadOrGhost;
-  }
-
-   /**
-   * Calculate the time until energy reaches maximum
-   * @returns {number} Time in seconds until energy is capped
-   */
-   getTimeToMaxEnergy() {
-    // Energy regeneration rate is typically 10 energy per second for Monk
-    // This can be affected by haste and other factors
-    const energyRegenRate = 10 * (1 + (me.modSpellHaste || 0));
-    const energyDeficit = me.maxPowerByType(PowerType.Energy) - me.powerByType(PowerType.Energy);
-    
-    if (energyDeficit <= 0) {
-      return 0; // Already at max energy
-    }
-    
-    if (energyRegenRate <= 0) {
-      return 9999; // Cannot regenerate energy
-    }
-    
-    return energyDeficit / energyRegenRate;
-  }
-
-  /**
-   * Check if we should interrupt the current cast
-   */
-  shouldInterrupt() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
     const target = this.getCurrentTarget();
-    return target && target.isCastingOrChanneling && target.isInterruptible;
+    this._cachedEnemyCount = target ? target.getUnitsAroundCount(8) + 1 : 1;
+    return this._cachedEnemyCount;
   }
 
-  /**
-   * Check if we have combo strike available
-   * Returns true if the last spell cast was different than the one we're checking
-   */
-  hasComboStrike(spellName) {
-    if (!Spell.isSpellKnown(115636)) {  // Mastery: Combo Strikes
-      return true;
-    }
-    
-    const lastSpell = Spell.getLastSuccessfulSpell();
-    return !lastSpell || lastSpell !== spellName;
+  hasBloodlust() {
+    if (this._bloodlustFrame === wow.frameTime) return this._cachedBloodlust;
+    this._bloodlustFrame = wow.frameTime;
+    this._cachedBloodlust = BLOODLUST_IDS.some(id => me.hasAura(id));
+    return this._cachedBloodlust;
   }
 
-  /**
-   * Check if the player has a specific talent
-   */
-  hasTalent(talentName) {
-    return Spell.isSpellKnown(talentName);
+  getComboBreaker() {
+    if (this._comboBreakerFrame === wow.frameTime) return this._cachedComboBreaker;
+    this._comboBreakerFrame = wow.frameTime;
+    this._cachedComboBreaker = me.getAura(A.comboBreaker);
+    return this._cachedComboBreaker;
   }
 
-  /**
-   * Auto-detect which hero talent build is active
-   */
-  detectHeroTalent() {
-    if (me.hasAura(59868)) { // Flurry Strikes
-      return WindwalkerMonkBehavior.TALENT_BUILDS.FLURRY;
-    } else if (me.hasAura(324293)) { // Shado-Pan
-      return WindwalkerMonkBehavior.TALENT_BUILDS.SHADO_PAN;
-    }
-    
-    return null;
+  comboBreakerStacks() {
+    const aura = this.getComboBreaker();
+    return aura ? aura.stacks : 0;
   }
 
-  /**
-   * Use cooldowns according to the APL
-   */
-  useCooldowns() {
+  hasComboBreaker() {
+    return this.getComboBreaker() !== null && this.getComboBreaker() !== undefined;
+  }
+
+  getDanceOfChiJi() {
+    if (this._danceFrame === wow.frameTime) return this._cachedDance;
+    this._danceFrame = wow.frameTime;
+    this._cachedDance = me.getAura(A.danceOfChiJi);
+    return this._cachedDance;
+  }
+
+  hasDanceOfChiJi() {
+    return this.getDanceOfChiJi() !== null && this.getDanceOfChiJi() !== undefined;
+  }
+
+  danceRemains() {
+    const aura = this.getDanceOfChiJi();
+    return aura ? aura.remaining : 0;
+  }
+
+  danceStacks() {
+    const aura = this.getDanceOfChiJi();
+    return aura ? aura.stacks : 0;
+  }
+
+  // Heart of the Jade Serpent aura caching (Conduit)
+  getHotJS() {
+    if (this._hotjsFrame === wow.frameTime) return this._cachedHotjs;
+    this._hotjsFrame = wow.frameTime;
+    this._cachedHotjs = me.getAura(A.heartOfJadeSerpent);
+    return this._cachedHotjs;
+  }
+
+  hasHotJS() {
+    return this.getHotJS() !== null && this.getHotJS() !== undefined;
+  }
+
+  hotjsRemains() {
+    const aura = this.getHotJS();
+    return aura ? aura.remaining : 0;
+  }
+
+  getHotJSUnity() {
+    if (this._hotjsUnityFrame === wow.frameTime) return this._cachedHotjsUnity;
+    this._hotjsUnityFrame = wow.frameTime;
+    this._cachedHotjsUnity = me.getAura(A.heartOfJadeSerpentUnity);
+    return this._cachedHotjsUnity;
+  }
+
+  hasHotJSUnity() {
+    return this.getHotJSUnity() !== null && this.getHotJSUnity() !== undefined;
+  }
+
+  hotjsUnityRemains() {
+    const aura = this.getHotJSUnity();
+    return aura ? aura.remaining : 0;
+  }
+
+  getHotJSYulon() {
+    if (this._hotjsYulonFrame === wow.frameTime) return this._cachedHotjsYulon;
+    this._hotjsYulonFrame = wow.frameTime;
+    this._cachedHotjsYulon = me.getAura(A.heartOfJadeSerpentYulon);
+    return this._cachedHotjsYulon;
+  }
+
+  hasHotJSYulon() {
+    return this.getHotJSYulon() !== null && this.getHotJSYulon() !== undefined;
+  }
+
+  // Any HotJS variant active
+  hasAnyHotJS() {
+    return this.hasHotJS() || this.hasHotJSUnity() || this.hasHotJSYulon();
+  }
+
+  getFlurryCharges() {
+    const aura = me.getAura(A.flurryCharge);
+    return aura ? aura.stacks : 0;
+  }
+
+  hasRushingWindKick() {
+    return me.hasAura(A.rushingWindKick);
+  }
+
+  hasPowerInfusion() {
+    return me.hasAura(A.powerInfusion);
+  }
+
+  hasXuen() {
+    return me.hasAura(A.invokeXuen);
+  }
+
+  // ===== Helpers =====
+  targetTTD() {
+    const target = this.getCurrentTarget();
+    if (!target || !target.timeToDeath) return 99999;
+    return target.timeToDeath();
+  }
+
+  // SimC: energy.time_to_max — energy deficit / regen rate
+  energyTimeToMax() {
+    const deficit = 100 - this.getEnergy();
+    if (deficit <= 0) return 0;
+    const regen = me.energyRegen || 10;
+    return (deficit / regen) * 1000;
+  }
+
+  // SimC: gcd.max — GCD is 1.5s base, reduced by haste
+  gcdMax() {
+    return 1500; // Could be haste-adjusted but 1.5s is safe approximation
+  }
+
+  // SimC prev_gcd.1.X — was X the last ability cast?
+  prevGcd(spellId) {
+    return spell.getTimeSinceLastCast(spellId) < 1500;
+  }
+
+  // ===== BUILD =====
+  build() {
     return new bt.Selector(
-      // Tiger Palm before Xuen if needed
-      Spell.cast("Tiger Palm", () => {
-        const target = this.getCurrentTarget();
-        return target && target.timeToDeath() > 14 && 
-               !this.hasCooldown("Invoke Xuen, the White Tiger") && 
-               (me.powerByType(PowerType.Chi) < 5 && !Spell.isSpellKnown(378082) || me.powerByType(PowerType.Chi) < 3) && 
-               this.hasComboStrike("Tiger Palm");
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // Combat check — MANDATORY
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Dead target auto-pick
+      new bt.Action(() => {
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
+        }
+        return bt.Status.Failure;
       }),
-      
-      // Invoke Xuen
-      Spell.cast("Invoke Xuen, the White Tiger", () => {
-        const target = this.getCurrentTarget();
-        const enemyCount = this.getEnemyCount();
-        return (enemyCount === 1 && ((!Spell.isSpellKnown(395152) || // Celestial Conduit
-                Spell.isSpellKnown(395152) && Spell.isSpellKnown(123904))) || // Xuen's Bond
-                enemyCount > 1) && 
-                Spell.getCooldown(137639)?.ready && // Storm, Earth, and Fire
-               (target && target.timeToDeath() > Settings.XuenThreshold);
+
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+
+      common.waitForCastOrChannel(),
+
+      // Track combat start + last cast + version + debug
+      new bt.Action(() => {
+        this._updateLastCast();
+        // Track combat start time for opener
+        if (me.inCombat() && this._combatStartTime === 0) {
+          this._combatStartTime = wow.frameTime;
+        } else if (!me.inCombat()) {
+          this._combatStartTime = 0;
+        }
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          const hero = this.isShadoPan() ? 'Shado-Pan' : 'Conduit of the Celestials';
+          console.info(`[Windwalker] Midnight 12.0.1 | Hero: ${hero} | SimC APL match`);
+        }
+        if (Settings.FWWWDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[WW] Chi:${this.getChi()}/${this.getChiMax()} Energy:${Math.round(this.getEnergy())} Zenith:${this.inZenith()}(${Math.round(this.zenithRemains())}ms) Last:${this._lastCastId} BL:${this.hasBloodlust()} CB:${this.comboBreakerStacks()} Enemies:${this.getEnemyCount()}`);
+        }
+        return bt.Status.Failure;
       }),
-      
-      // Storm, Earth and Fire
-      Spell.cast("Storm, Earth, and Fire", () => {
-        const target = this.getCurrentTarget();
-        return target && target.timeToDeath() > Settings.SEFThreshold && 
-              (this.hasCooldown("Rising Sun Kick") || this.getEnemyCount() > 2 || !Spell.isSpellKnown(378082)) && // Ordered Elements talent
-              (me.hasAura(162264) || // Xuen active
-              ((!Spell.isSpellKnown(392983) || // Last Emperor's Capacitor
-                me.getAuraStacks(325092) > 17) && // Emperor's Capacitor buff stacks
-               (this.hasCooldown("Strike of the Windlord") < 5 || 
-                !Spell.isSpellKnown(392983)))); // Strike of the Windlord
-      }),
-      
-      // Touch of Karma
-      Spell.cast("Touch of Karma", () => Settings.UseTouchOfKarma && this.getCurrentTarget())
+
+      // GCD gate
+      new bt.Decorator(
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          // Interrupt
+          spell.interrupt(S.spearHandStrike),
+
+          // Defensives
+          spell.cast(S.touchOfKarma, () => me, () => {
+            return Settings.FWWWKarma && me.inCombat() &&
+              me.effectiveHealthPercent < Settings.FWWWKarmaHP;
+          }),
+
+          // SimC: call_action_list,name=opener,if=time<2
+          this.opener(),
+
+          // SimC: call_action_list,name=big_coc,if=talent.celestial_conduit
+          new bt.Decorator(
+            () => this.isConduit(),
+            this.bigCoC(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+
+          // SimC: call_action_list,name=zenith
+          this.zenithUsage(),
+
+          // SimC: call_action_list,name=racials
+          this.racials(),
+
+          // SimC: call_action_list,name=default_st,if=active_enemies=1
+          new bt.Decorator(
+            () => this.getEnemyCount() <= 1,
+            this.singleTarget(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+
+          // SimC: call_action_list,name=multitarget,if=active_enemies>1
+          new bt.Decorator(
+            () => this.getEnemyCount() > 1,
+            this.multiTarget(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+
+          // SimC: call_action_list,name=fallback
+          this.fallback(),
+
+          // SimC: arcane_torrent,if=chi<chi.max&energy<55
+          spell.cast(S.arcaneTorrent, () => me, () => {
+            return this.getChi() < this.getChiMax() && this.getEnergy() < 55;
+          }),
+        )
+      ),
     );
   }
 
-  /**
-   * Use racial abilities
-   */
-  useRacials() {
+  // ===== OPENER — SimC actions.opener (time<2) =====
+  isInOpener() {
+    if (this._combatStartTime === 0) return false;
+    return (wow.frameTime - this._combatStartTime) < 2000;
+  }
+
+  opener() {
     return new bt.Selector(
-      // Ancestral Call
-      Spell.cast("Ancestral Call", () => {
-        const hasXuen = me.hasAura(162264); // Xuen buff
-        const xuenRemains = me.getAura(162264)?.remaining || 0;
-        return hasXuen && xuenRemains > 15000 || 
-               !Spell.isSpellKnown(123904) && // No Xuen talent
-               (!Spell.isSpellKnown(137639) && // No SEF talent
-               (Spell.getCooldown(392983)?.ready || // Strike of the Windlord ready
-                !Spell.isSpellKnown(392983) && // No Strike of the Windlord talent
-                Spell.getCooldown(113656)?.ready) || // Fists of Fury ready
-                me.hasAura(137639) && me.getAura(137639)?.remaining > 10000); // SEF remains > 10 sec
-      }),
-      
-      // Blood Fury
-      Spell.cast("Blood Fury", () => {
-        const hasXuen = me.hasAura(162264); // Xuen buff
-        const xuenRemains = me.getAura(162264)?.remaining || 0;
-        return hasXuen && xuenRemains > 15000 || 
-               !Spell.isSpellKnown(123904) && // No Xuen talent
-               (!Spell.isSpellKnown(137639) && // No SEF talent
-               (Spell.getCooldown(392983)?.ready || // Strike of the Windlord ready
-                !Spell.isSpellKnown(392983) && // No Strike of the Windlord talent
-                Spell.getCooldown(113656)?.ready) || // Fists of Fury ready
-                me.hasAura(137639) && me.getAura(137639)?.remaining > 10000); // SEF remains > 10 sec
-      }),
-      
-      // Berserking
-      Spell.cast("Berserking", () => {
-        const hasXuen = me.hasAura(162264); // Xuen buff
-        const xuenRemains = me.getAura(162264)?.remaining || 0;
-        return hasXuen && xuenRemains > 15000 || 
-               !Spell.isSpellKnown(123904) && // No Xuen talent
-               (!Spell.isSpellKnown(137639) && // No SEF talent
-               (Spell.getCooldown(392983)?.ready || // Strike of the Windlord ready
-                !Spell.isSpellKnown(392983) && // No Strike of the Windlord talent
-                Spell.getCooldown(113656)?.ready) || // Fists of Fury ready
-                me.hasAura(137639) && me.getAura(137639)?.remaining > 10000); // SEF remains > 10 sec
-      }),
-      
-      // Fireblood
-      Spell.cast("Fireblood", () => {
-        const hasXuen = me.hasAura(162264); // Xuen buff
-        const xuenRemains = me.getAura(162264)?.remaining || 0;
-        return hasXuen && xuenRemains > 15000 || 
-               !Spell.isSpellKnown(123904) && // No Xuen talent
-               (!Spell.isSpellKnown(137639) && // No SEF talent
-               (Spell.getCooldown(392983)?.ready || // Strike of the Windlord ready
-                !Spell.isSpellKnown(392983) && // No Strike of the Windlord talent
-                Spell.getCooldown(113656)?.ready) || // Fists of Fury ready
-                me.hasAura(137639) && me.getAura(137639)?.remaining > 10000); // SEF remains > 10 sec
-      })
+      // tiger_palm,if=combo_strike&chi<4 (only during opener)
+      new bt.Decorator(
+        () => this.isInOpener(),
+        this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+          if (!this.getCurrentTarget()) return false;
+          return this.getChi() < 4;
+        }),
+        new bt.Action(() => bt.Status.Failure)
+      ),
     );
   }
 
-  /**
-   * AoE Opener for 3+ targets
-   */
-  aoeOpener() {
+  // ===== CELESTIAL CONDUIT BURST — SimC actions.big_coc (11 lines) =====
+  bigCoC() {
     return new bt.Selector(
-      Spell.cast("Slicing Winds"),
-      Spell.cast("Tiger Palm", () => me.powerByType(PowerType.Chi) < 6 && (this.hasComboStrike("Tiger Palm") || !Spell.isSpellKnown(196740))) // Check Hit Combo
+      // #1: invoke_xuen,if=(ttd>25)&((zenith.up|zenith.remains>13)&!hotjs.up)
+      spell.cast(S.invokeXuen, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.targetTTD() < 25000) return false;
+        if (!((spell.getCooldown(S.zenith)?.ready || this.zenithRemains() > 13000) && !this.hasHotJS())) return false;
+        return true;
+      }),
+
+      // #2: invoke_xuen with trinket alignment (simplified — no trinket API)
+      // Covered by #1
+
+      // #3: invoke_xuen,if=dungeonslice&ttd>15&enemies>4|fight_remains<=25
+      spell.cast(S.invokeXuen, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.targetTTD() <= 25000 && this.targetTTD() > 0) return true;
+        return this.getEnemyCount() > 4 && this.targetTTD() > 15000;
+      }),
+
+      // #4: celestial_conduit,if=buff.zenith.remains<12&buff.zenith.up&(!bloodlust|pi)|fight<4
+      spell.cast(S.celestialConduit, () => me, () => {
+        if (this.targetTTD() < 4000) return true;
+        if (!this.inZenith()) return false;
+        if (this.zenithRemains() >= 12000) return false;
+        return !this.hasBloodlust() || this.hasPowerInfusion();
+      }),
+
+      // #5: whirling_dragon_punch,if=buff.power_infusion.up&(!hotjs_unity.up|hotjs_unity.remains<2)
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.hasPowerInfusion()) return false;
+        return !this.hasHotJSUnity() || this.hotjsUnityRemains() < 2000;
+      }),
+
+      // #6: blackout_kick,if=combo_strike&celestial_conduit&zenith.remains>11&chi<=2&rsk.remains&!rwk.up&obsidian_spiral&combo_breaker.up
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.zenithRemains() <= 11000) return false;
+        if (this.getChi() > 2) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (!rskCD || rskCD.ready) return false;
+        if (this.hasRushingWindKick()) return false;
+        if (!spell.isSpellKnown(T.obsidianSpiral)) return false;
+        return this.hasComboBreaker();
+      }),
+
+      // #7: tiger_palm,if=combo_strike&celestial_conduit&zenith.remains>11&chi<=2&rsk.remains&!rwk.up&(!obsidian_spiral|!combo_breaker|prev.bok)
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.zenithRemains() <= 11000) return false;
+        if (this.getChi() > 2) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (!rskCD || rskCD.ready) return false;
+        if (this.hasRushingWindKick()) return false;
+        return !spell.isSpellKnown(T.obsidianSpiral) || !this.hasComboBreaker() || this.prevGcd(S.blackoutKick);
+      }),
+
+      // #8: celestial_conduit,if=zenith.up&(rsk.remains|enemies>2)&fof.remains&(sotw.remains|WDP)&(WDP.remains|SotW)&!rwk.up&!combo_breaker.up&chi>1&(!hotjs.up|hotjs.remains<4)
+      spell.cast(S.celestialConduit, () => me, () => {
+        if (!this.inZenith()) return false;
+        if (this.getChi() <= 1) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (this.getEnemyCount() <= 2 && rskCD && rskCD.ready) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (fofCD && fofCD.ready) return false;
+        const sotwCD = spell.getCooldown(S.strikeOfWindlord);
+        const wdpCD = spell.getCooldown(S.whirlingDragonPunch);
+        if (sotwCD && sotwCD.ready && !(spell.isSpellKnown(T.whirlingDragonPunch))) return false;
+        if (wdpCD && wdpCD.ready && !(spell.isSpellKnown(T.strikeOfWindlord))) return false;
+        if (this.hasRushingWindKick()) return false;
+        if (this.hasComboBreaker()) return false;
+        return !this.hasHotJS() || this.hotjsRemains() < 4000;
+      }),
+
+      // #9: celestial_conduit,if=zenith.up&!hotjs.up&!hotjs_yulon.up&chi>1&(rsk.remains|enemies>2)&(sotw.remains|(wdp.remains|fof.remains))
+      spell.cast(S.celestialConduit, () => me, () => {
+        if (!this.inZenith()) return false;
+        if (this.hasHotJS() || this.hasHotJSYulon()) return false;
+        if (this.getChi() <= 1) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (this.getEnemyCount() <= 2 && rskCD && rskCD.ready) return false;
+        const sotwCD = spell.getCooldown(S.strikeOfWindlord);
+        if (sotwCD && sotwCD.ready) {
+          const wdpCD = spell.getCooldown(S.whirlingDragonPunch);
+          const fofCD = spell.getCooldown(S.fistsOfFury);
+          if ((wdpCD && wdpCD.ready) || (fofCD && fofCD.ready)) return false;
+        }
+        return true;
+      }),
+
+      // #10: celestial_conduit,if=zenith.up&hotjs.remains<2&prev.rsk&rsk.remains&fof.remains&hotjs.up&chi>1
+      spell.cast(S.celestialConduit, () => me, () => {
+        if (!this.inZenith()) return false;
+        if (!this.hasHotJS() || this.hotjsRemains() >= 2000) return false;
+        if (!this.prevGcd(S.risingSunKick)) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (rskCD && rskCD.ready) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (fofCD && fofCD.ready) return false;
+        return this.getChi() > 1;
+      }),
     );
   }
 
-  /**
-   * Normal Opener for 1-2 targets
-   */
-  normalOpener() {
+  // ===== ZENITH USAGE — SimC actions.zenith (14 lines) =====
+  zenithUsage() {
     return new bt.Selector(
-      Spell.cast("Tiger Palm", () => me.powerByType(PowerType.Chi) < 6 && (this.hasComboStrike("Tiger Palm") || !Spell.isSpellKnown(196740))), // Check Hit Combo
-      Spell.cast("Rising Sun Kick", () => Spell.isSpellKnown(378082)) // Ordered Elements talent
+      // #1: zenith,if=xuen.up&(!zenith.up|flurry_strikes)
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (!this.hasXuen()) return false;
+        return !this.inZenith() || this.isShadoPan();
+      }),
+
+      // #2: zenith,if=bloodlust.remains>10&(enemies>2|rsk.remains)&!zenith.up
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (!this.hasBloodlust()) return false;
+        // Check BL remaining > 10s — approximate with hasBloodlust
+        if (this.inZenith()) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        return this.getEnemyCount() > 2 || (rskCD && !rskCD.ready);
+      }),
+
+      // #3: zenith,if=ttd>25&(bloodlust&cc.remains&(rsk.remains|enemies>2)&!zenith.up&celestial_conduit)
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.targetTTD() < 25000) return false;
+        if (!this.isConduit()) return false;
+        if (!this.hasBloodlust()) return false;
+        if (this.inZenith()) return false;
+        const ccCD = spell.getCooldown(S.celestialConduit);
+        if (!ccCD || ccCD.ready) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        return this.getEnemyCount() > 2 || (rskCD && !rskCD.ready);
+      }),
+
+      // #4: zenith,if=ttd>25&flurry_strikes&(bloodlust|full_recharge<5)&(rsk.remains|enemies>2)
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.targetTTD() < 25000) return false;
+        if (!this.isShadoPan()) return false;
+        const fullRecharge = spell.getFullRechargeTime(S.zenith);
+        if (!this.hasBloodlust() && fullRecharge > 5000) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        return this.getEnemyCount() > 2 || (rskCD && !rskCD.ready);
+      }),
+
+      // #5: zenith,if=ttd>25&flurry_strikes&!trinket_buff&rsk.remains&fof.remains<5&(wdp.remains<10|sotw.remains<10)&full_recharge<40
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.targetTTD() < 25000) return false;
+        if (!this.isShadoPan()) return false;
+        const fullRecharge = spell.getFullRechargeTime(S.zenith);
+        if (fullRecharge > 40000) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (rskCD && rskCD.ready) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (!fofCD || fofCD.timeleft > 5000) return false;
+        const wdpCD = spell.getCooldown(S.whirlingDragonPunch);
+        const sotwCD = spell.getCooldown(S.strikeOfWindlord);
+        return (wdpCD && wdpCD.timeleft < 10000) || (sotwCD && sotwCD.timeleft < 10000);
+      }),
+
+      // #6-#7: Various ttd>25 conditions with trinket alignment (simplified without trinket API)
+      // Covered by charge capping prevention below
+
+      // #8-#9: Dungeon slice / large pack conditions
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.getEnemyCount() > 4 && this.targetTTD() > 15000) return true;
+        return false;
+      }),
+
+      // #10: celestial_conduit&fight_remains<xuen.remains&(rsk.remains|enemies>2)&ttd>25
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (!this.isConduit()) return false;
+        if (this.targetTTD() < 25000) return false;
+        const xuenCD = spell.getCooldown(S.invokeXuen);
+        if (!xuenCD || this.targetTTD() >= xuenCD.timeleft) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        return this.getEnemyCount() > 2 || (rskCD && !rskCD.ready);
+      }),
+
+      // #11: flurry_strikes&full_recharge<20&(rsk.remains|enemies>2)
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (!this.isShadoPan()) return false;
+        if (this.targetTTD() < 25000) return false;
+        const fullRecharge = spell.getFullRechargeTime(S.zenith);
+        if (fullRecharge > 20000) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        return this.getEnemyCount() > 2 || (rskCD && !rskCD.ready);
+      }),
+
+      // #12: fight_remains<=25&(rsk.remains|enemies>2)
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        if (this.targetTTD() > 25000) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        return this.getEnemyCount() > 2 || (rskCD && !rskCD.ready);
+      }),
+
+      // #13-#14: Patchwerk trinket conditions (simplified — charge cap prevention)
+      spell.cast(S.zenith, () => me, () => {
+        if (!Settings.FWWWUseCDs) return false;
+        // Prevent charge capping
+        return spell.getChargesFractional(S.zenith) > 1.7;
+      }),
     );
   }
 
-  /**
-   * Fallback rotation when all else fails
-   */
-  fallbackRotation() {
+  // ===== RACIALS — SimC actions.racials (4 lines, all same condition) =====
+  _racialCondition() {
+    // xuen.remains>15 | !xuen_talented & zenith.remains>14 | fight<20
+    const xuenAura = me.getAura(A.invokeXuen);
+    if (xuenAura && xuenAura.remaining > 15000) return true;
+    if (!spell.isSpellKnown(T.invokeXuen) && this.zenithRemains() > 14000) return true;
+    return this.targetTTD() < 20000;
+  }
+
+  racials() {
     return new bt.Selector(
-      Spell.cast("Spinning Crane Kick", () => me.powerByType(PowerType.Chi) > 5 && this.hasComboStrike("Spinning Crane Kick")),
-      Spell.cast("Blackout Kick", () => this.hasComboStrike("Blackout Kick") && me.powerByType(PowerType.Chi) > 3),
-      Spell.cast("Tiger Palm", () => this.hasComboStrike("Tiger Palm") && me.powerByType(PowerType.Chi) > 5)
+      spell.cast(S.berserking, () => me, () => this._racialCondition()),
+      spell.cast(S.ancestralCall, () => me, () => this._racialCondition()),
+      spell.cast(S.bloodFury, () => me, () => this._racialCondition()),
+      spell.cast(S.fireblood, () => me, () => this._racialCondition()),
     );
   }
 
-  /**
-   * AoE rotation for 5+ targets
-   */
-  aoeRotation() {
+  // ===== SINGLE TARGET — SimC actions.default_st (~30 lines) =====
+  singleTarget() {
     return new bt.Selector(
-      // Tiger Palm to build chi when needed
-      Spell.cast("Tiger Palm", () => {
-        return (me.powerByType(PowerType.Energy) > 55 && Spell.isSpellKnown(152173) || me.powerByType(PowerType.Energy) > 60 && !Spell.isSpellKnown(152173)) && // Inner Peace talent
-               this.hasComboStrike("Tiger Palm") && 
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 2 && 
-               (me.getAuraStacks(116645) < 3) && // Teachings of the Monastery stacks
-               ((Spell.isSpellKnown(196736) && !me.hasAura(116768)) || // Energy Burst talent & no BoK proc
-                !Spell.isSpellKnown(378082)); // Not Ordered Elements
+      // #1: whirling_dragon_punch,if=!hotjs_unity.up&wdp.remains<1&(zenith|xuen_cd>5|flurry|!patchwerk)
+      // !patchwerk always true in gameplay → simplifies to !hotjs_unity & wdp.remains<1
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.hasHotJSUnity()) return false;
+        const wdpAura = me.getAura(A.whirlingDragonPunch);
+        return !wdpAura || wdpAura.remaining < 1000;
       }),
-      
-      // Touch of Death
-      Spell.cast("Touch of Death", () => {
-        return !me.hasAura(395153) && !me.hasAura(395154); // Heart of the Jade Serpent CDR buffs
+
+      // #2: whirling_dragon_punch,if=pi.up&(!hotjs_unity.up|hotjs_unity.remains<2)
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.hasPowerInfusion()) return false;
+        return !this.hasHotJSUnity() || this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji and high Chi Energy
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               ((me.getAuraStacks(325069) > 29 && this.hasCooldown("Fists of Fury") < 5) || // Chi Energy stacks & FoF coming soon
-                (me.getAuraStacks(325202) === 2)); // Dance of Chi-Ji stacks
+
+      // #3: spinning_crane_kick,if=combo_strike&dance.remains<1&combo_breaker.stack<2&sequenced_strikes&dance.up&celestial_conduit
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.hasDanceOfChiJi()) return false;
+        if (this.danceRemains() >= 1000) return false;
+        if (this.comboBreakerStacks() >= 2) return false;
+        return spell.isSpellKnown(T.sequencedStrikes) && this.isConduit();
       }),
-      
-      // Whirling Dragon Punch with CDR buff
-      Spell.cast("Whirling Dragon Punch", () => {
-        return me.hasAura(395153) && me.getAuraStacks(325202) < 2; // Has CDR buff & less than 2 Dance of Chi-Ji stacks
+
+      // #4: fists_of_fury,if=hotjs.remains<1&hotjs.up|flurry_charge.stack=30&!zenith.up
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.hasHotJS() && this.hotjsRemains() < 1000) return true;
+        return this.getFlurryCharges() >= 30 && !this.inZenith();
       }),
-      
-      // Whirling Dragon Punch with < 2 Dance of Chi-Ji stacks
-      Spell.cast("Whirling Dragon Punch", () => {
-        return me.getAuraStacks(325202) < 2; // Less than 2 Dance of Chi-Ji stacks
+
+      // #5: whirling_dragon_punch,if=cc&hotjs_unity.remains<2&(zenith|xuen_cd>5|!patchwerk)|flurry
+      // !patchwerk always true → cc&hotjs_unity.remains<2 | flurry
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.isShadoPan()) return true;
+        return this.isConduit() && this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Slicing Winds with CDR buffs
-      Spell.cast("Slicing Winds", () => {
-        return me.hasAura(395153) || me.hasAura(395154); // Heart of the Jade Serpent CDR buffs
+
+      // #6: tiger_palm,if=chi<4&combo_strike&energy.time_to_max<=gcd*3&!zenith.up&(!bloodlust|chi<2)&combo_breaker.stack<2
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getChi() >= 4) return false;
+        if (this.energyTimeToMax() > this.gcdMax() * 3) return false;
+        if (this.inZenith()) return false;
+        if (this.hasBloodlust() && this.getChi() >= 2) return false;
+        return this.comboBreakerStacks() < 2;
       }),
-      
-      // Celestial Conduit
-      Spell.cast("Celestial Conduit", () => {
-        return me.hasAura(137639) && // Storm Earth and Fire up
-               this.hasCooldown("Strike of the Windlord") && 
-               (!me.hasAura(395153) || me.getAura(396222)?.remaining < 5000) && // No CDR or Gale Force expiring soon
-               (Spell.isSpellKnown(123904) || !Spell.isSpellKnown(123904) && me.hasAura(388663)); // Has Xuen's Bond or Invoker's Delight
+
+      // #7: strike_of_the_windlord,if=cc&hotjs_unity.remains<2&(zenith|xuen_cd>5|!patchwerk)|flurry
+      // !patchwerk always true → cc&hotjs_unity.remains<2 | flurry
+      this.castCombo(S.strikeOfWindlord, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.isShadoPan()) return true;
+        return this.isConduit() && this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Rising Sun Kick for Whirling Dragon Punch setup
-      Spell.cast("Rising Sun Kick", () => {
-        return this.hasCooldown("Whirling Dragon Punch") < 2 && 
-               this.hasCooldown("Fists of Fury") > 1 && 
-               me.getAuraStacks(325202) < 2 || // Dance of Chi-Ji stacks < 2
-               !me.hasAura(137639) && me.hasAura(80353); // Not in SEF but has Pressure Point buff
+
+      // #8: fists_of_fury,if=combo_strike&(hotjs)&bl|bl&flurry|!zenith&(flurry|xuen_cd>3|!patchwerk)|zenith&(flurry|!bl)&(patchwerk|ttd>5)
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        // Clause 1: hotjs & bloodlust
+        if (this.hasBloodlust() && this.hasAnyHotJS()) return true;
+        // Clause 2: bloodlust & flurry_strikes
+        if (this.hasBloodlust() && this.isShadoPan()) return true;
+        // Clause 3: !zenith & (flurry|xuen_cd>3|!patchwerk) — !patchwerk always true in gameplay
+        if (!this.inZenith()) return true;
+        // Clause 4: zenith & (flurry|!bl) & (patchwerk|ttd>5) — non-patchwerk = ttd>5 always
+        if (this.inZenith() && (this.isShadoPan() || !this.hasBloodlust()) && this.targetTTD() > 5000) return true;
+        return false;
       }),
-      
-      // Whirling Dragon Punch for AoE
-      Spell.cast("Whirling Dragon Punch", () => {
-        return !Spell.isSpellKnown(388404) || // Not Revolving Whirl talent
-               Spell.isSpellKnown(388404) && me.getAuraStacks(325202) < 2 && this.getEnemyCount() > 2; // Has Revolving Whirl with low Dance stacks and 3+ targets
+
+      // #9: rushing_wind_kick
+      this.castCombo(S.rushingWindKick, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Blackout Kick with BoK proc and low chi for Energy Burst
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && me.hasAura(116768) && me.powerByType(PowerType.Chi) < 2 && 
-               Spell.isSpellKnown(196736) && me.powerByType(PowerType.Energy) < 55; // Energy Burst talent and low energy
+
+      // #10: rising_sun_kick,if=combo_strike&bloodlust|combo_strike&(hotjs|hotjs_yulon|hotjs_unity)
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasBloodlust() || this.hasAnyHotJS();
       }),
-      
-      // Strike of the Windlord
-      Spell.cast("Strike of the Windlord", () => {
-        const combatTime = (Date.now() -CombatTimer.getCombatStartTime()) / 1000;
-        return (combatTime > 5 || me.hasAura(388663) && me.hasAura(137639)) && // 5+ sec combat time or Invoker's Delight with SEF
-               (this.hasCooldown("Invoke Xuen, the White Tiger") > 15 || Spell.isSpellKnown(59868)); // Xuen on CD or has Flurry Strikes
+
+      // #11: fists_of_fury,if=bloodlust|combo_strike&(hotjs|hotjs_yulon|hotjs_unity)
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasBloodlust() || this.hasAnyHotJS();
       }),
-      
-      // Slicing Winds
-      Spell.cast("Slicing Winds"),
-      
-      // Blackout Kick with high Teachings stacks
-      Spell.cast("Blackout Kick", () => {
-        return me.getAuraStacks(116645) === 8 && Spell.isSpellKnown(392993); // Teachings stacks at max and has Shadowboxing Treads
+
+      // #12: tiger_palm,if=zenith.up&chi<2&celestial_conduit&(hotjs|hotjs_unity)&!fof.remains&combo_strike
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.inZenith() || this.getChi() >= 2) return false;
+        if (!this.isConduit()) return false;
+        if (!this.hasHotJS() && !this.hasHotJSUnity()) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        return fofCD && fofCD.ready;
       }),
-      
-      // Crackling Jade Lightning with Emperor's Capacitor
-      Spell.cast("Crackling Jade Lightning", () => {
-        return me.getAuraStacks(325092) > 19 && // Emperor's Capacitor stacks > 19 
-               this.hasComboStrike("Crackling Jade Lightning") && 
-               Spell.isSpellKnown(408863) && // Power of the Thunder King talent
-               this.hasCooldown("Invoke Xuen, the White Tiger") > 10;
+
+      // #13: spinning_crane_kick,if=combo_strike&dance.remains<4&combo_breaker.stack<2&sequenced_strikes&dance.up
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.hasDanceOfChiJi()) return false;
+        if (this.danceRemains() >= 4000) return false;
+        if (this.comboBreakerStacks() >= 2) return false;
+        return spell.isSpellKnown(T.sequencedStrikes);
       }),
-      
-      // Fists of Fury
-      Spell.cast("Fists of Fury", () => {
-        return (Spell.isSpellKnown(59868) || // Flurry Strikes 
-                Spell.isSpellKnown(392992) && // Xuen's Battlegear
-                (this.hasCooldown("Invoke Xuen, the White Tiger") > 5 || this.hasCooldown("Invoke Xuen, the White Tiger") > 9) || 
-                this.hasCooldown("Invoke Xuen, the White Tiger") > 10);
+
+      // #14: rising_sun_kick,if=zenith.up&flurry_strikes&!fof.remains
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.inZenith() || !this.isShadoPan()) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        return fofCD && fofCD.ready;
       }),
-      
-      // Tiger Palm to build chi with Flurry Strikes and Wisdom buff
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               me.hasAura(395152) && // Wisdom of the Wall Flurry buff
-               me.powerByType(PowerType.Chi) < 6;
+
+      // #15: rising_sun_kick,if=combo_strike
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // SCK at high chi
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && me.powerByType(PowerType.Chi) > 5;
+
+      // #16: fists_of_fury,if=flurry_strikes|!zenith.up&(flurry|xuen_cd>3|!patchwerk)|bl&jadefire&cc.remains
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        // flurry_strikes — always use
+        if (this.isShadoPan()) return true;
+        // !zenith & (!patchwerk always true) — always use outside zenith
+        if (!this.inZenith()) return true;
+        // bl & jadefire & cc on CD
+        if (this.hasBloodlust() && spell.isSpellKnown(T.jadefireStomp)) {
+          const ccCD = spell.getCooldown(S.celestialConduit);
+          if (ccCD && !ccCD.ready) return true;
+        }
+        return false;
       }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji and Chi Energy for FoF
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(325202) && // Dance of Chi-Ji buff 
-               me.getAuraStacks(325069) > 29 && // Chi Energy stacks > 29
-               this.hasCooldown("Fists of Fury") < 5; // FoF coming soon
+
+      // #17: rising_sun_kick,if=hotjs|hotjs_unity|hotjs_yulon
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasAnyHotJS();
       }),
-      
-      // Rising Sun Kick with Pressure Point buff
-      Spell.cast("Rising Sun Kick", () => {
-        return me.hasAura(80353) && this.hasCooldown("Fists of Fury") > 2; // Pressure Point buff & FoF not ready soon
+
+      // #18: touch_of_death,if=!zenith|fight<5|(trinket conditions → true without trinket API)
+      // Simplifies to unconditional (trinket clause always true without trinket tracking)
+      this.castCombo(S.touchOfDeath, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Blackout Kick with Shadowboxing Treads and Courageous Impulse
-      Spell.cast("Blackout Kick", () => {
-        return Spell.isSpellKnown(392993) && // Shadowboxing Treads
-               Spell.isSpellKnown(383724) && // Courageous Impulse
-               this.hasComboStrike("Blackout Kick") && 
-               me.getAuraStacks(116768) === 2; // 2 stacks of BoK proc
+
+      // #19: strike_of_the_windlord,if=hotjs_unity.remains<2&(zenith|xuen_cd>5|!patchwerk)|flurry
+      // !patchwerk always true → hotjs_unity.remains<2 | flurry
+      this.castCombo(S.strikeOfWindlord, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.isShadoPan()) return true;
+        return this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && me.hasAura(325202); // Dance of Chi-Ji buff
+
+      // #20: rising_sun_kick,if=combo_strike&(flurry_charge.stack<30|chi>3|zenith.up|bloodlust|energy>50&chi>2)|combo_strike&hotjs.up
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.hasHotJS()) return true;
+        if (this.getFlurryCharges() < 30) return true;
+        if (this.getChi() > 3) return true;
+        if (this.inZenith()) return true;
+        if (this.hasBloodlust()) return true;
+        return this.getEnergy() > 50 && this.getChi() > 2;
       }),
-      
-      // Spinning Crane Kick with Ordered Elements and Crane Vortex
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(378082) && // Ordered Elements buff
-               Spell.isSpellKnown(388848) && // Crane Vortex talent
-               this.getEnemyCount() > 2;
+
+      // #21: tiger_palm,if=combo_strike&zenith.up&(chi<1|chi<2&!combo_breaker.up)&celestial_conduit
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.inZenith() || !this.isConduit()) return false;
+        return this.getChi() < 1 || (this.getChi() < 2 && !this.hasComboBreaker());
       }),
-      
-      // Tiger Palm for chi with Flurry Strikes and Ordered Elements
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-            //    this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               me.hasAura(378082); // Ordered Elements buff
+
+      // #22: blackout_kick,if=combo_strike&zenith.up&chi>1&(obsidian_spiral|fof.remains|combo_breaker.up)&(chi<6|combo_breaker.up)|combo_strike&bloodlust&combo_breaker.up
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.hasBloodlust() && this.hasComboBreaker()) return true;
+        if (!this.inZenith()) return false;
+        if (this.getChi() <= 1) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (!spell.isSpellKnown(T.obsidianSpiral) && (fofCD && fofCD.ready) && !this.hasComboBreaker()) return false;
+        return this.getChi() < 6 || this.hasComboBreaker();
       }),
-      
-      // Tiger Palm for chi deficit
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 2 && 
-               (!me.hasAura(378082) || this.getTimeToMaxEnergy() <= me.gcd * 3); // No Ordered Elements or about to cap energy
+
+      // #23: spinning_crane_kick,if=combo_strike&!bloodlust&zenith.up&flurry_strikes&chi>3
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.hasBloodlust()) return false;
+        if (!this.inZenith() || !this.isShadoPan()) return false;
+        return this.getChi() > 3;
       }),
-      
-      // Jadefire Stomp with Singularly Focused Jade or Jadefire Harmony
-      Spell.cast("Jadefire Stomp", () => {
-        return Spell.isSpellKnown(387356) || Spell.isSpellKnown(388859); // Singularly Focused Jade or Jadefire Harmony talents
+
+      // #24: slicing_winds
+      this.castCombo(S.slicingWinds, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Spinning Crane Kick without Ordered Elements but with Crane Vortex
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               !me.hasAura(378082) && // No Ordered Elements buff 
-               Spell.isSpellKnown(388848) && // Crane Vortex talent
-               this.getEnemyCount() > 2 && 
-               me.powerByType(PowerType.Chi) > 4;
+
+      // #25: spinning_crane_kick,if=flurry_strikes&zenith.up&chi>5&combo_strike|combo_strike&bloodlust&dance.up&combo_breaker.stack<2
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.isShadoPan() && this.inZenith() && this.getChi() > 5) return true;
+        return this.hasBloodlust() && this.hasDanceOfChiJi() && this.comboBreakerStacks() < 2;
       }),
-      
-      // Blackout Kick with combo strike benefits
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               this.hasCooldown("Fists of Fury") && 
-               (me.getAuraStacks(116645) > 3 || me.hasAura(378082)) && // High Teachings stack or Ordered Elements
-               (Spell.isSpellKnown(392993) || me.hasAura(116768)); // Shadowboxing Treads or BoK proc
+
+      // #26: blackout_kick,if=combo_strike&combo_breaker.up&(hotjs|hotjs_unity)
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.hasComboBreaker()) return false;
+        return this.hasHotJS() || this.hasHotJSUnity();
       }),
-      
-      // Blackout Kick before Fists of Fury at low chi
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               !this.hasCooldown("Fists of Fury") && me.powerByType(PowerType.Chi) < 3;
+
+      // #27: blackout_kick,if=combo_strike&combo_breaker.stack=2
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.comboBreakerStacks() >= 2;
       }),
-      
-      // Blackout Kick with Shadowboxing Treads and Courageous Impulse and BoK proc
-      Spell.cast("Blackout Kick", () => {
-        return Spell.isSpellKnown(392993) && // Shadowboxing Treads
-               Spell.isSpellKnown(383724) && // Courageous Impulse
-               this.hasComboStrike("Blackout Kick") && 
-               me.hasAura(116768); // BoK proc
+
+      // #28: spinning_crane_kick,if=combo_strike&dance.stack=2
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.danceStacks() >= 2;
       }),
-      
-      // Spinning Crane Kick with high chi or energy
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               (me.powerByType(PowerType.Chi) > 3 || me.powerByType(PowerType.Energy) > 55);
+
+      // #29: blackout_kick,if=combo_strike&combo_breaker.up
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasComboBreaker();
       }),
-      
-      // Blackout Kick with Ordered Elements or BoK proc
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               (me.hasAura(378082) || // Ordered Elements buff
-                (me.hasAura(116768) && (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 1 && Spell.isSpellKnown(196736))) && // BoK proc with chi deficit and Energy Burst
-               this.hasCooldown("Fists of Fury");
+
+      // #30: tiger_palm,if=chi<5&combo_strike&energy.time_to_max<=gcd*3&!zenith.up
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getChi() >= 5) return false;
+        if (this.energyTimeToMax() > this.gcdMax() * 3) return false;
+        return !this.inZenith();
       }),
-      
-      // Blackout Kick during FoF cooldown
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               this.hasCooldown("Fists of Fury") && 
-               (me.powerByType(PowerType.Chi) > 2 || me.powerByType(PowerType.Energy) > 60 || me.hasAura(116768)); // High chi, high energy, or BoK proc
+
+      // #31: tiger_palm,if=combo_strike&((energy>55&inner_peace|energy>60&!inner_peace)&chi_deficit>=2&(energy_burst&!combo_breaker|!energy_burst)&!zenith|(energy_burst&!combo_breaker|!energy_burst)&!zenith&!fof.remains&chi<3)
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.inZenith()) return false;
+        const energyThreshold = spell.isSpellKnown(T.innerPeace) ? 55 : 60;
+        const chiDeficit = this.getChiMax() - this.getChi();
+        const energyBurstActive = spell.isSpellKnown(T.energyBurst) && !this.hasComboBreaker();
+        const nonEnergyBurst = !spell.isSpellKnown(T.energyBurst);
+        const ebCheck = energyBurstActive || nonEnergyBurst;
+
+        // First condition: energy threshold & chi deficit & eb check
+        if (this.getEnergy() > energyThreshold && chiDeficit >= 2 && ebCheck) return true;
+
+        // Second condition: eb check & !fof.remains & chi<3
+        if (ebCheck) {
+          const fofCD = spell.getCooldown(S.fistsOfFury);
+          if (fofCD && fofCD.ready && this.getChi() < 3) return true;
+        }
+
+        return false;
       }),
-      
-      // Generic Jadefire Stomp
-      Spell.cast("Jadefire Stomp"),
-      
-      // Tiger Palm with Ordered Elements
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               me.hasAura(378082) && // Ordered Elements buff
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 1; // At least 1 Chi deficit
-      }),
-      
-      // Chi Burst without Ordered Elements
-      Spell.cast("Chi Burst", () => !me.hasAura(378082)), // No Ordered Elements buff
-      
-      // Generic Chi Burst
-      Spell.cast("Chi Burst"),
-      
-      // SCK with Ordered Elements and Hit Combo
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(378082) && // Ordered Elements buff
-               Spell.isSpellKnown(196740); // Hit Combo talent
-      }),
-      
-      // Blackout Kick with Ordered Elements but without Hit Combo
-      Spell.cast("Blackout Kick", () => {
-        return me.hasAura(378082) && // Ordered Elements buff
-               !Spell.isSpellKnown(196740) && // No Hit Combo talent
-               this.hasCooldown("Fists of Fury");
-      }),
-      
-      // Tiger Palm if not combo strike but need chi for FoF
-      Spell.cast("Tiger Palm", () => {
-        return !this.hasComboStrike("Tiger Palm") && 
-               me.powerByType(PowerType.Chi) < 3 && 
-               !this.hasCooldown("Fists of Fury"); // FoF is coming up
-      })
     );
   }
 
-  /**
-   * Cleave rotation for 2-4 targets
-   */
-  cleaveRotation() {
+  // ===== MULTI-TARGET — SimC actions.multitarget (~30 lines) =====
+  multiTarget() {
     return new bt.Selector(
-      // Spinning Crane Kick with 2 stacks of Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return me.getAuraStacks(325202) === 2 && this.hasComboStrike("Spinning Crane Kick"); // 2 stacks of Dance of Chi-Ji
+      // #1: fists_of_fury,if=hotjs.remains<1&hotjs.up
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasHotJS() && this.hotjsRemains() < 1000;
       }),
-      
-      // Rising Sun Kick with Pressure Point or for WDP setup
-      Spell.cast("Rising Sun Kick", () => {
-        return (me.hasAura(80353) && this.getEnemyCount() < 4 && this.hasCooldown("Fists of Fury") > 4) || // Pressure Point and FoF on CD
-               (this.hasCooldown("Whirling Dragon Punch") < 2 && this.hasCooldown("Fists of Fury") > 1 && me.getAuraStacks(325202) < 2); // Setting up WDP
+
+      // #2: whirling_dragon_punch,if=celestial_conduit&hotjs_unity.remains<2
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.isConduit()) return false;
+        return this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Spinning Crane Kick with 2 stacks of Dance of Chi-Ji for 4+ targets
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.getAuraStacks(325202) === 2 && 
-               this.getEnemyCount() > 3;
+
+      // #3: whirling_dragon_punch,if=!hotjs_unity.up&wdp.remains<1
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.hasHotJSUnity()) return false;
+        const wdpAura = me.getAura(A.whirlingDragonPunch);
+        return !wdpAura || wdpAura.remaining < 1000;
       }),
-      
-      // Tiger Palm for chi generation and combo with right conditions
-      Spell.cast("Tiger Palm", () => {
-        return (me.powerByType(PowerType.Energy) > 55 && Spell.isSpellKnown(152173) || me.powerByType(PowerType.Energy) > 60 && !Spell.isSpellKnown(152173)) && // Energy check with Inner Peace
-               this.hasComboStrike("Tiger Palm") && 
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 2 && 
-               me.getAuraStacks(116645) < 3 && // Low Teachings stacks
-               ((Spell.isSpellKnown(196736) && !me.hasAura(116768) || !Spell.isSpellKnown(196736)) && // Energy Burst without BoK proc
-                !me.hasAura(378082)) || // No Ordered Elements
-               ((Spell.isSpellKnown(196736) && !me.hasAura(116768) || !Spell.isSpellKnown(196736)) && 
-                !me.hasAura(378082) && // No Ordered Elements 
-                !this.hasCooldown("Fists of Fury") && me.powerByType(PowerType.Chi) < 3); // FoF ready but low chi
+
+      // #4: tiger_palm,if=zenith.up&chi<2&celestial_conduit&(hotjs|hotjs_unity)&!fof.remains&combo_strike
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.inZenith() || this.getChi() >= 2) return false;
+        if (!this.isConduit()) return false;
+        if (!this.hasHotJS() && !this.hasHotJSUnity()) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        return fofCD && fofCD.ready;
       }),
-      
-      // Touch of Death
-      Spell.cast("Touch of Death", () => {
-        return !me.hasAura(395153) && !me.hasAura(395154); // No Heart of the Jade Serpent CDR buffs
+
+      // #5: tiger_palm,if=chi<5&combo_strike&energy.time_to_max<=gcd*3&!zenith.up&!bloodlust&combo_breaker.stack<2
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getChi() >= 5) return false;
+        if (this.energyTimeToMax() > this.gcdMax() * 3) return false;
+        if (this.inZenith()) return false;
+        if (this.hasBloodlust()) return false;
+        return this.comboBreakerStacks() < 2;
       }),
-      
-      // Whirling Dragon Punch with CDR
-      Spell.cast("Whirling Dragon Punch", () => {
-        return me.hasAura(395153) && me.getAuraStacks(325202) < 2; // Heart of the Jade Serpent CDR and low Dance of Chi-Ji
+
+      // #6: strike_of_the_windlord,if=celestial_conduit&hotjs_unity.remains<2
+      this.castCombo(S.strikeOfWindlord, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.isConduit()) return false;
+        return this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Whirling Dragon Punch
-      Spell.cast("Whirling Dragon Punch", () => {
-        return me.getAuraStacks(325202) < 2; // Low Dance of Chi-Ji stacks
+
+      // #7: fists_of_fury,if=flurry_charge.stack=30&!zenith.up|hotjs|hotjs_unity|hotjs_yulon|flurry_strikes
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getFlurryCharges() >= 30 && !this.inZenith()) return true;
+        if (this.hasAnyHotJS()) return true;
+        return this.isShadoPan();
       }),
-      
-      // Slicing Winds with CDR
-      Spell.cast("Slicing Winds", () => {
-        return me.hasAura(395153) || me.hasAura(395154); // Any Heart of the Jade Serpent CDR buff
+
+      // #8: spinning_crane_kick,if=combo_strike&dance.up&combo_breaker.stack<2&sequenced_strikes&dance.remains<3
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.hasDanceOfChiJi()) return false;
+        if (this.comboBreakerStacks() >= 2) return false;
+        if (!spell.isSpellKnown(T.sequencedStrikes)) return false;
+        return this.danceRemains() < 3000;
       }),
-      
-      // Celestial Conduit
-      Spell.cast("Celestial Conduit", () => {
-        return me.hasAura(137639) && // Storm Earth and Fire up
-               this.hasCooldown("Strike of the Windlord") && 
-               (!me.hasAura(395153) || me.getAura(396222)?.remaining < 5000) && // No CDR or Gale Force expiring soon
-               (Spell.isSpellKnown(123904) || !Spell.isSpellKnown(123904) && me.hasAura(388663)); // Has Xuen's Bond or Invoker's Delight
+
+      // #9: rushing_wind_kick
+      this.castCombo(S.rushingWindKick, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Rising Sun Kick in early pull or with CDR and Pressure Point
-      Spell.cast("Rising Sun Kick", () => {
-        return (!me.hasAura(162264) && me.hasAura("Tiger Palm") && this.isOpeningPhase()) || // Opening phase
-               (me.hasAura(395154) && me.hasAura(80353) && this.hasCooldown("Fists of Fury") && 
-                (Spell.isSpellKnown(392991) || this.getEnemyCount() < 3)); // With Glory of the Dawn or few targets
+
+      // #10: rising_sun_kick,if=(enemies<5|fof.remains|zenith.up)&(rwk.up|hotjs|hotjs_unity|hotjs_yulon)
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (this.getEnemyCount() >= 5 && (fofCD && fofCD.ready) && !this.inZenith()) return false;
+        return this.hasRushingWindKick() || this.hasAnyHotJS();
       }),
-      
-      // Fists of Fury with CDR
-      Spell.cast("Fists of Fury", () => {
-        return me.hasAura(395154); // Heart of the Jade Serpent CDR Celestial
+
+      // #11: touch_of_death,if=!zenith|fight<5|(trinket → true)
+      this.castCombo(S.touchOfDeath, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Whirling Dragon Punch with CDR Celestial
-      Spell.cast("Whirling Dragon Punch", () => {
-        return me.hasAura(395154); // Heart of the Jade Serpent CDR Celestial
+
+      // #12: strike_of_the_windlord,if=zenith.up|zenith.remains>5&hotjs_unity.remains<2
+      this.castCombo(S.strikeOfWindlord, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.inZenith()) return true;
+        const zenithCD = spell.getCooldown(S.zenith);
+        return zenithCD && zenithCD.timeleft > 5000 && this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Strike of the Windlord with Gale Force
-      Spell.cast("Strike of the Windlord", () => {
-        return Spell.isSpellKnown(396228) && // Gale Force talent
-               me.hasAura(388663) && // Invoker's Delight buff
-               (me.hasAura(2825) || !me.hasAura(395154)); // Bloodlust or no CDR Celestial
+
+      // #13: whirling_dragon_punch,if=zenith.up|zenith.remains>5&hotjs_unity.remains<2
+      this.castCombo(S.whirlingDragonPunch, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.inZenith()) return true;
+        const zenithCD = spell.getCooldown(S.zenith);
+        return zenithCD && zenithCD.timeleft > 5000 && this.hotjsUnityRemains() < 2000;
       }),
-      
-      // Fists of Fury with Power Infusion and Bloodlust
-      Spell.cast("Fists of Fury", () => {
-        return me.hasAura(10060) && me.hasAura(2825); // Power Infusion and Bloodlust
+
+      // #14: fists_of_fury,if=flurry_strikes|!zenith.up|bloodlust&jadefire_stomp&cc.remains
+      this.castCombo(S.fistsOfFury, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.isShadoPan()) return true;
+        if (!this.inZenith()) return true;
+        if (this.hasBloodlust() && spell.isSpellKnown(T.jadefireStomp)) {
+          const ccCD = spell.getCooldown(S.celestialConduit);
+          if (ccCD && !ccCD.ready) return true;
+        }
+        return false;
       }),
-      
-      // Rising Sun Kick with Power Infusion and Bloodlust for few targets
-      Spell.cast("Rising Sun Kick", () => {
-        return me.hasAura(10060) && me.hasAura(2825) && this.getEnemyCount() < 3;
+
+      // #15: rising_sun_kick,if=(enemies<5|fof.remains>4|zenith.up)&(combo_strike&(flurry_charge.stack<30|chi>3|zenith.up|bloodlust|energy>50&chi>2)|combo_strike&hotjs.up)
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (this.getEnemyCount() >= 5 && (!fofCD || fofCD.timeleft <= 4000) && !this.inZenith()) return false;
+        if (this.hasHotJS()) return true;
+        if (this.getFlurryCharges() < 30) return true;
+        if (this.getChi() > 3) return true;
+        if (this.inZenith()) return true;
+        if (this.hasBloodlust()) return true;
+        return this.getEnergy() > 50 && this.getChi() > 2;
       }),
-      
-      // Blackout Kick with max Teachings and targets < 3 or Shadowboxing Treads
-      Spell.cast("Blackout Kick", () => {
-        return me.getAuraStacks(116645) === 8 && 
-               (this.getEnemyCount() < 3 || Spell.isSpellKnown(392993)); // Shadowboxing Treads
+
+      // #16: blackout_kick,if=combo_strike&zenith.up&chi>1&(obsidian_spiral|fof.remains|combo_breaker.up)&chi<6
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.inZenith() || this.getChi() <= 1) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (!spell.isSpellKnown(T.obsidianSpiral) && (fofCD && fofCD.ready) && !this.hasComboBreaker()) return false;
+        return this.getChi() < 6;
       }),
-      
-      // Whirling Dragon Punch with various conditions
-      Spell.cast("Whirling Dragon Punch", () => {
-        return !Spell.isSpellKnown(388404) || // Not Revolving Whirl
-               (Spell.isSpellKnown(388404) && me.getAuraStacks(325202) < 2 && this.getEnemyCount() > 2) || // Revolving Whirl, low Dance stacks, 3+ targets
-               this.getEnemyCount() < 3; // Few targets
+
+      // #17: spinning_crane_kick,if=combo_strike&dance.up&combo_breaker.stack<2&sequenced_strikes&dance.remains<4
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.hasDanceOfChiJi()) return false;
+        if (this.comboBreakerStacks() >= 2) return false;
+        if (!spell.isSpellKnown(T.sequencedStrikes)) return false;
+        return this.danceRemains() < 4000;
       }),
-      
-      // Strike of the Windlord 
-      Spell.cast("Strike of the Windlord", () => {
-        const combatTime = (Date.now() -CombatTimer.getCombatStartTime()) / 1000;
-        return combatTime > 5 && 
-               (this.hasCooldown("Invoke Xuen, the White Tiger") > 15 || Spell.isSpellKnown(59868)) && // Xuen on CD or Flurry Strikes
-               (this.hasCooldown("Fists of Fury") < 2 || this.hasCooldown("Celestial Conduit") < 10);
+
+      // #18: slicing_winds
+      this.castCombo(S.slicingWinds, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Slicing Winds
-      Spell.cast("Slicing Winds"),
-      
-      // Crackling Jade Lightning with Emperor's Capacitor
-      Spell.cast("Crackling Jade Lightning", () => {
-        return me.getAuraStacks(325092) > 19 && // Emperor's Capacitor stacks > 19
-               this.hasComboStrike("Crackling Jade Lightning") && 
-               Spell.isSpellKnown(408863) && // Power of the Thunder King talent
-               this.hasCooldown("Invoke Xuen, the White Tiger") > 10;
+
+      // #19: spinning_crane_kick,if=flurry_strikes&zenith.up&chi>3&combo_strike
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.isShadoPan() || !this.inZenith()) return false;
+        return this.getChi() > 3;
       }),
-      
-      // Spinning Crane Kick with 2 stacks of Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && me.getAuraStacks(325202) === 2;
+
+      // #20: blackout_kick,if=combo_strike&combo_breaker.up&(hotjs|hotjs_unity)
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!this.hasComboBreaker()) return false;
+        return this.hasHotJS() || this.hasHotJSUnity();
       }),
-      
-      // Tiger Palm with Flurry Strikes and Wisdom buff for < 5 targets
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               this.getEnemyCount() < 5 && 
-               me.hasAura(395152); // Wisdom of the Wall Flurry buff
+
+      // #21: tiger_palm,if=chi<5&combo_strike&energy.time_to_max<=gcd*3&!zenith.up&!bloodlust
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getChi() >= 5) return false;
+        if (this.energyTimeToMax() > this.gcdMax() * 3) return false;
+        if (this.inZenith()) return false;
+        return !this.hasBloodlust();
       }),
-      
-      // Fists of Fury
-      Spell.cast("Fists of Fury", () => {
-        return (Spell.isSpellKnown(59868) || // Flurry Strikes
-                Spell.isSpellKnown(392992) || // Xuen's Battlegear
-                (!Spell.isSpellKnown(392992) && 
-                 (this.hasCooldown("Strike of the Windlord") > 1 || 
-                  me.hasAura(395153) || me.hasAura(395154)))) && // SotW on CD or CDR buff
-               (Spell.isSpellKnown(59868) || // Flurry Strikes
-                Spell.isSpellKnown(392992) && 
-                (this.hasCooldown("Invoke Xuen, the White Tiger") > 5 || this.hasCooldown("Invoke Xuen, the White Tiger") > 9) || 
-                this.hasCooldown("Invoke Xuen, the White Tiger") > 10);
+
+      // #22: blackout_kick,if=combo_strike&combo_breaker.stack=2
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.comboBreakerStacks() >= 2;
       }),
-      
-      // Tiger Palm with Flurry Strikes and Wisdom buff
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               this.getEnemyCount() < 5 && 
-               me.hasAura(395152); // Wisdom of the Wall Flurry buff
+
+      // #23: spinning_crane_kick,if=combo_strike&dance.stack=2
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.danceStacks() >= 2;
       }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji and Chi Energy
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(325202) && // Dance of Chi-Ji
-               me.getAuraStacks(325069) > 29; // Chi Energy > 29
+
+      // #24: blackout_kick,if=combo_strike&combo_breaker.up
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasComboBreaker();
       }),
-      
-      // Rising Sun Kick with high chi or energy or FoF cooldown
-      Spell.cast("Rising Sun Kick", () => {
-        return (me.powerByType(PowerType.Chi) > 4 && (this.getEnemyCount() < 3 || Spell.isSpellKnown(392991))) || // High chi with Glory of the Dawn or few targets
-               (me.powerByType(PowerType.Chi) > 2 && me.powerByType(PowerType.Energy) > 50 && (this.getEnemyCount() < 3 || Spell.isSpellKnown(392991))) || // Decent chi and energy
-               (this.hasCooldown("Fists of Fury") > 2 && (this.getEnemyCount() < 3 || Spell.isSpellKnown(392991))); // FoF on cooldown
+
+      // #25: tiger_palm,if=chi<5&combo_strike&energy.time_to_max<=gcd*3&!zenith.up
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getChi() >= 5) return false;
+        if (this.energyTimeToMax() > this.gcdMax() * 3) return false;
+        return !this.inZenith();
       }),
-      
-      // Blackout Kick with Shadowboxing Treads, Courageous Impulse, and 2 BoK procs
-      Spell.cast("Blackout Kick", () => {
-        return Spell.isSpellKnown(392993) && // Shadowboxing Treads
-               Spell.isSpellKnown(383724) && // Courageous Impulse
-               this.hasComboStrike("Blackout Kick") && 
-               me.getAuraStacks(116768) === 2; // 2 stacks of BoK proc
+
+      // #26: tiger_palm,if=combo_strike&((energy>55&inner_peace|energy>60&!inner_peace)&chi_deficit>=2&(energy_burst&!combo_breaker|!energy_burst)&!zenith|(energy_burst&!combo_breaker|!energy_burst)&!zenith&!fof.remains&chi<3)
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.inZenith()) return false;
+        const energyThreshold = spell.isSpellKnown(T.innerPeace) ? 55 : 60;
+        const chiDeficit = this.getChiMax() - this.getChi();
+        const ebCheck = (spell.isSpellKnown(T.energyBurst) && !this.hasComboBreaker()) || !spell.isSpellKnown(T.energyBurst);
+
+        if (this.getEnergy() > energyThreshold && chiDeficit >= 2 && ebCheck) return true;
+
+        if (ebCheck) {
+          const fofCD = spell.getCooldown(S.fistsOfFury);
+          if (fofCD && fofCD.ready && this.getChi() < 3) return true;
+        }
+        return false;
       }),
-      
-      // Blackout Kick with 4 Teachings and right talents for < 3 targets
-      Spell.cast("Blackout Kick", () => {
-        return me.getAuraStacks(116645) === 4 && 
-               !Spell.isSpellKnown(387026) && // Not Knowledge of the Broken Temple
-               Spell.isSpellKnown(392993) && // Shadowboxing Treads
-               this.getEnemyCount() < 3;
+
+      // #27: spinning_crane_kick,if=combo_strike&(dance.up|enemies>4&(chi>2|energy>55))&crane_vortex&rsk.remains&fof.remains
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (!spell.isSpellKnown(T.craneVortex)) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (rskCD && rskCD.ready) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (fofCD && fofCD.ready) return false;
+        return this.hasDanceOfChiJi() || (this.getEnemyCount() > 4 && (this.getChi() > 2 || this.getEnergy() > 55));
       }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && me.hasAura(325202); // Dance of Chi-Ji
+
+      // #28: blackout_kick,if=combo_strike&shadowboxing_treads
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return spell.isSpellKnown(T.shadowboxingTreads);
       }),
-      
-      // Blackout Kick with Shadowboxing Treads, Courageous Impulse, and BoK proc
-      Spell.cast("Blackout Kick", () => {
-        return Spell.isSpellKnown(392993) && // Shadowboxing Treads
-               Spell.isSpellKnown(383724) && // Courageous Impulse
-               this.hasComboStrike("Blackout Kick") && 
-               me.hasAura(116768); // BoK proc
+
+      // #29: spinning_crane_kick,if=combo_strike&(chi>3|energy>55)&(!shadowboxing_treads&enemies>2|enemies>5)&rsk.remains&fof.remains
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.getChi() <= 3 && this.getEnergy() <= 55) return false;
+        const rskCD = spell.getCooldown(S.risingSunKick);
+        if (rskCD && rskCD.ready) return false;
+        const fofCD = spell.getCooldown(S.fistsOfFury);
+        if (fofCD && fofCD.ready) return false;
+        if (!spell.isSpellKnown(T.shadowboxingTreads) && this.getEnemyCount() > 2) return true;
+        return this.getEnemyCount() > 5;
       }),
-      
-      // Tiger Palm with Flurry Strikes for < 5 targets
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               this.getEnemyCount() < 5;
+
+      // #30: rising_sun_kick,if=combo_strike
+      this.castCombo(S.risingSunKick, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Tiger Palm for chi deficit
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 2 && 
-               (!me.hasAura(378082) || this.getTimeToMaxEnergy() <= me.gcd * 3); // No Ordered Elements or about to cap energy
-      }),
-      
-      // Blackout Kick with high Teachings and RSK on cooldown
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               this.hasCooldown("Fists of Fury") && 
-               me.getAuraStacks(116645) > 3 && 
-               this.hasCooldown("Rising Sun Kick");
-      }),
-      
-      // Jadefire Stomp with Singularly Focused Jade or Jadefire Harmony
-      Spell.cast("Jadefire Stomp", () => {
-        return Spell.isSpellKnown(387356) || Spell.isSpellKnown(388859); // Singularly Focused Jade or Jadefire Harmony talents
-      }),
-      
-      // Blackout Kick with combo strike during FoF cooldown
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               this.hasCooldown("Fists of Fury") && 
-               (me.getAuraStacks(116645) > 3 || me.hasAura(378082)) && // High Teachings or Ordered Elements
-               (Spell.isSpellKnown(392993) || me.hasAura(116768) || me.hasAura(378082)); // Shadowboxing, BoK proc, or Ordered Elements
-      }),
-      
-      // Spinning Crane Kick with Crane Vortex for 3+ targets
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               !me.hasAura(378082) && // No Ordered Elements
-               Spell.isSpellKnown(388848) && // Crane Vortex talent
-               this.getEnemyCount() > 2 && 
-               me.powerByType(PowerType.Chi) > 4;
-      }),
-      
-      // Chi Burst without Ordered Elements
-      Spell.cast("Chi Burst", () => !me.hasAura(378082)),
-      
-      // Blackout Kick with Ordered Elements or BoK proc during FoF cooldown
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               (me.hasAura(378082) || // Ordered Elements buff
-                (me.hasAura(116768) && (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 1 && Spell.isSpellKnown(196736))) && // BoK proc with deficit and Energy Burst
-               this.hasCooldown("Fists of Fury");
-      }),
-      
-      // Blackout Kick during FoF cooldown with various conditions
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               this.hasCooldown("Fists of Fury") && 
-               (me.powerByType(PowerType.Chi) > 2 || me.powerByType(PowerType.Energy) > 60 || me.hasAura(116768)); // High chi, high energy, or BoK proc
-      }),
-      
-      // Generic Jadefire Stomp
-      Spell.cast("Jadefire Stomp"),
-      
-      // Tiger Palm with Ordered Elements and chi deficit
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               me.hasAura(378082) && // Ordered Elements buff
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 1; // At least 1 Chi deficit
-      }),
-      
-      // Generic Chi Burst
-      Spell.cast("Chi Burst"),
-      
-      // Spinning Crane Kick with Ordered Elements and Hit Combo
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(378082) && // Ordered Elements buff
-               Spell.isSpellKnown(196740); // Hit Combo talent
-      }),
-      
-      // Blackout Kick with Ordered Elements but without Hit Combo
-      Spell.cast("Blackout Kick", () => {
-        return me.hasAura(378082) && // Ordered Elements buff
-               !Spell.isSpellKnown(196740) && // No Hit Combo talent
-               this.hasCooldown("Fists of Fury");
-      }),
-      
-      // Tiger Palm if not combo strike but need chi for FoF
-      Spell.cast("Tiger Palm", () => {
-        return !this.hasComboStrike("Tiger Palm") && 
-               me.powerByType(PowerType.Chi) < 3 && 
-               !this.hasCooldown("Fists of Fury"); // FoF is coming up
-      })
     );
   }
 
-  /**
-   * Single target rotation
-   */
-  singleTargetRotation() {
+  // ===== FALLBACK — SimC actions.fallback (4 lines) =====
+  fallback() {
     return new bt.Selector(
-      // Fists of Fury with CDR
-      Spell.cast("Fists of Fury", () => {
-        return me.hasAura(395154) || me.hasAura(395153); // Heart of the Jade Serpent CDR Celestial or regular CDR
+      // blackout_kick,if=combo_strike
+      this.castCombo(S.blackoutKick, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Rising Sun Kick with various conditions
-      Spell.cast("Rising Sun Kick", () => {
-        return (me.hasAura(80353) && !me.hasAura(395153) && me.hasAura(395154)) || // Pressure Point plus CDR Celestial
-               me.hasAura(388663) || // Invoker's Delight
-               me.hasAura(2825) || // Bloodlust
-               (me.hasAura(80353) && this.hasCooldown("Fists of Fury")) || // Pressure Point during FoF cooldown
-               me.hasAura(10060); // Power Infusion
+
+      // spinning_crane_kick,if=combo_strike&dance.up&enemies=1
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.hasDanceOfChiJi() && this.getEnemyCount() <= 1;
       }),
-      
-      // Whirling Dragon Punch with correct conditions and no Dance stacks
-      Spell.cast("Whirling Dragon Punch", () => {
-        return !me.hasAura(395154) && me.getAuraStacks(325202) !== 2;
+
+      // tiger_palm,if=combo_strike (SimC: unconditional combo_strike only)
+      this.castCombo(S.tigerPalm, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
       }),
-      
-      // Slicing Winds with CDR
-      Spell.cast("Slicing Winds", () => {
-        return me.hasAura(395153) || me.hasAura(395154); // Any Heart of the Jade Serpent CDR
+
+      // spinning_crane_kick,if=chi>5&combo_strike
+      this.castCombo(S.spinningCraneKick, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        return this.getChi() > 5;
       }),
-      
-      // Celestial Conduit
-      Spell.cast("Celestial Conduit", () => {
-        return me.hasAura(137639) && // Storm Earth and Fire up
-               (!me.hasAura(395153) || me.getAura(396222)?.remaining < 5000) && // No CDR or Gale Force expiring soon
-               this.hasCooldown("Strike of the Windlord") && 
-               (Spell.isSpellKnown(123904) || !Spell.isSpellKnown(123904) && me.hasAura(388663)); // Has Xuen's Bond or Invoker's Delight
-      }),
-      
-      // Spinning Crane Kick with 2 stacks of Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return me.getAuraStacks(325202) === 2 && this.hasComboStrike("Spinning Crane Kick");
-      }),
-      
-      // Tiger Palm in various situations
-      Spell.cast("Tiger Palm", () => {
-        return (me.powerByType(PowerType.Energy) > 55 && Spell.isSpellKnown(152173) || me.powerByType(PowerType.Energy) > 60 && !Spell.isSpellKnown(152173)) && // Energy check with Inner Peace
-               this.hasComboStrike("Tiger Palm") && 
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 2 && 
-               me.getAuraStacks(116645) < 3 && // Low Teachings stacks
-               ((Spell.isSpellKnown(196736) && !me.hasAura(116768) || !Spell.isSpellKnown(196736)) && // Energy Burst without BoK proc
-                !me.hasAura(378082)); // No Ordered Elements
-      }),
-      
-      // Tiger Palm before FoF if needed
-      Spell.cast("Tiger Palm", () => {
-        return ((Spell.isSpellKnown(196736) && !me.hasAura(116768) || !Spell.isSpellKnown(196736)) && 
-                !me.hasAura(378082) && // No Ordered Elements 
-                !this.hasCooldown("Fists of Fury") && me.powerByType(PowerType.Chi) < 3); // FoF ready but low chi
-      }),
-      
-      // Tiger Palm with combo strike and chi deficit
-      Spell.cast("Tiger Palm", () => {
-        return (this.hasCooldown("Strike of the Windlord") || !me.hasAura(395154)) && 
-               this.hasComboStrike("Tiger Palm") && 
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 2 && 
-               !me.hasAura(378082); // No Ordered Elements
-      }),
-      
-      // Touch of Death
-      Spell.cast("Touch of Death"),
-      
-      // Rising Sun Kick in early phase
-      Spell.cast("Rising Sun Kick", () => {
-        return !me.hasAura(162264) && me.hasAura("Tiger Palm") && this.isOpeningPhase() || 
-               (me.hasAura(137639) && Spell.isSpellKnown(378082)); // SEF up and Ordered Elements talent
-      }),
-      
-      // Strike of the Windlord with Celestial Conduit
-      Spell.cast("Strike of the Windlord", () => {
-        return Spell.isSpellKnown(395152) && // Celestial Conduit
-               !me.hasAura(388663) && // No Invoker's Delight
-               !me.hasAura(395154) && // No Heart of the Jade Serpent CDR Celestial
-               this.hasCooldown("Fists of Fury") < 5 && 
-               this.hasCooldown("Invoke Xuen, the White Tiger") > 15;
-      }),
-      
-      // Strike of the Windlord with Gale Force
-      Spell.cast("Strike of the Windlord", () => {
-        return Spell.isSpellKnown(396228) && // Gale Force
-               me.hasAura(388663) && // Invoker's Delight
-               (me.hasAura(2825) || !me.hasAura(395154)); // Bloodlust or no CDR Celestial
-      }),
-      
-      // Strike of the Windlord with Flurry Strikes
-      Spell.cast("Strike of the Windlord", () => {
-        const combatTime = (Date.now() -CombatTimer.getCombatStartTime()) / 1000;
-        return combatTime > 5 && Spell.isSpellKnown(59868); // 5+ sec in combat with Flurry Strikes
-      }),
-      
-      // Fists of Fury with Power Infusion and Bloodlust
-      Spell.cast("Fists of Fury", () => {
-        const combatTime = (Date.now() -CombatTimer.getCombatStartTime()) / 1000;
-        return me.hasAura(10060) && me.hasAura(2825) && combatTime > 5;
-      }),
-      
-      // Blackout Kick with Teachings and Ordered Elements
-      Spell.cast("Blackout Kick", () => {
-        return me.getAuraStacks(116645) > 3 && 
-               me.hasAura(378082) && // Ordered Elements
-               this.hasCooldown("Rising Sun Kick") > 1 && 
-               this.hasCooldown("Fists of Fury") > 2 && 
-               this.hasComboStrike("Blackout Kick");
-      }),
-      
-      // Tiger Palm with Flurry Strikes under PI and BL
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               me.hasAura(10060) && // Power Infusion
-               me.hasAura(2825); // Bloodlust
-      }),
-      
-      // Blackout Kick with high Teachings stacks
-      Spell.cast("Blackout Kick", () => {
-        return me.getAuraStacks(116645) > 4 && 
-               this.hasCooldown("Rising Sun Kick") > 1 && 
-               this.hasCooldown("Fists of Fury") > 2;
-      }),
-      
-      // Whirling Dragon Punch in various conditions
-      Spell.cast("Whirling Dragon Punch", () => {
-        return !me.hasAura(395154) && me.getAuraStacks(325202) !== 2 || // No CDR Celestial and not 2 stacks of Dance
-               me.hasAura(378082) || // Ordered Elements
-               Spell.isSpellKnown(387026); // Knowledge of the Broken Temple
-      }),
-      
-      // Crackling Jade Lightning with Emperor's Capacitor
-      Spell.cast("Crackling Jade Lightning", () => {
-        return me.getAuraStacks(325092) > 19 && 
-               !me.hasAura(395153) && // No CDR
-               !me.hasAura(395154) && // No CDR Celestial
-               this.hasComboStrike("Crackling Jade Lightning") && 
-               this.hasCooldown("Invoke Xuen, the White Tiger") > 10;
-      }),
-      
-      // Slicing Winds in longer fights
-      Spell.cast("Slicing Winds", () => {
-        const target = this.getCurrentTarget();
-        return target && target.timeToDeath() > 10;
-      }),
-      
-      // Fists of Fury with appropriate conditions
-      Spell.cast("Fists of Fury", () => {
-        return (Spell.isSpellKnown(392992) || // Xuen's Battlegear
-                !Spell.isSpellKnown(392992) && 
-                (this.hasCooldown("Strike of the Windlord") > 1 || 
-                 me.hasAura(395153) || me.hasAura(395154))) && // SotW on CD or CDR buff
-               (Spell.isSpellKnown(392992) && this.hasCooldown("Invoke Xuen, the White Tiger") > 5 || 
-                this.hasCooldown("Invoke Xuen, the White Tiger") > 10) && 
-               (!me.hasAura(388663) || me.hasAura(388663) && 
-                this.hasCooldown("Strike of the Windlord") > 4 && 
-                this.hasCooldown("Celestial Conduit")) || 
-               Spell.isSpellKnown(59868); // Flurry Strikes
-      }),
-      
-      // Rising Sun Kick with high chi or energy
-      Spell.cast("Rising Sun Kick", () => {
-        return me.powerByType(PowerType.Chi) > 4 || me.powerByType(PowerType.Chi) > 2 && me.powerByType(PowerType.Energy) > 50 || this.hasCooldown("Fists of Fury") > 2;
-      }),
-      
-      // Tiger Palm with Flurry Strikes and Wisdom buff
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868) && // Flurry Strikes
-               me.hasAura(395152); // Wisdom of the Wall Flurry buff
-      }),
-      
-      // Blackout Kick with Energy Burst, BoK proc and low chi
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               Spell.isSpellKnown(196736) && // Energy Burst
-               me.hasAura(116768) && // BoK proc
-               me.powerByType(PowerType.Chi) < 5 && 
-               (me.hasAura(395153) || me.hasAura(395154)); // Has CDR
-      }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji and special conditions
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(2825) && // Bloodlust
-               me.hasAura(395153) && // Heart of the Jade Serpent CDR
-               me.hasAura(325202); // Dance of Chi-Ji buff
-      }),
-      
-      // Tiger Palm with Flurry Strikes
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868); // Flurry Strikes
-      }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return (me.getAuraStacks(325202) === 2 || me.hasAura(325202) && me.getAura(325202).remaining < me.gcd * 3) && 
-               this.hasComboStrike("Spinning Crane Kick") && 
-               !me.hasAura(378082); // No Ordered Elements
-      }),
-      
-      // Whirling Dragon Punch
-      Spell.cast("Whirling Dragon Punch"),
-      
-      // Spinning Crane Kick with 2 stacks of Dance of Chi-Ji
-      Spell.cast("Spinning Crane Kick", () => {
-        return me.getAuraStacks(325202) === 2 && this.hasComboStrike("Spinning Crane Kick");
-      }),
-      
-      // Blackout Kick with Courageous Impulse and 2 BoK proc stacks
-      Spell.cast("Blackout Kick", () => {
-        return Spell.isSpellKnown(383724) && // Courageous Impulse
-               this.hasComboStrike("Blackout Kick") && 
-               me.getAuraStacks(116768) === 2; // 2 stacks of BoK proc
-      }),
-      
-      // Blackout Kick with Ordered Elements and cooldowns
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               me.hasAura(378082) && // Ordered Elements
-               this.hasCooldown("Rising Sun Kick") > 1 && 
-               this.hasCooldown("Fists of Fury") > 2;
-      }),
-      
-      // Tiger Palm for energy capping with Flurry Strikes
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868); // Flurry Strikes
-      }),
-      
-      // Spinning Crane Kick with Dance of Chi-Ji and various conditions
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(325202) && // Dance of Chi-Ji
-               (me.hasAura(378082) || // Ordered Elements
-                this.getTimeToMaxEnergy() >= me.gcd * 3 && 
-                Spell.isSpellKnown(386444) && // Sequenced Strikes
-                Spell.isSpellKnown(196736) || // Energy Burst
-                !Spell.isSpellKnown(386444) || // Not Sequenced Strikes
-                !Spell.isSpellKnown(196736) || // Not Energy Burst
-                me.getAura(325202).remaining <= me.gcd * 3); // Dance about to expire
-      }),
-      
-      // Tiger Palm with Flurry Strikes energy capping
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               this.getTimeToMaxEnergy() <= me.gcd * 3 && 
-               Spell.isSpellKnown(59868); // Flurry Strikes
-      }),
-      
-      // Jadefire Stomp with specific talents
-      Spell.cast("Jadefire Stomp", () => {
-        return Spell.isSpellKnown(387356) || Spell.isSpellKnown(388859); // Singularly Focused Jade or Jadefire Harmony
-      }),
-      
-      // Chi Burst without Ordered Elements
-      Spell.cast("Chi Burst", () => !me.hasAura(378082)),
-      
-      // Blackout Kick with Ordered Elements or BoK proc during FoF cooldown
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               (me.hasAura(378082) || // Ordered Elements
-                (me.hasAura(116768) && (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 1 && Spell.isSpellKnown(196736))) && // BoK proc with deficit and Energy Burst
-               this.hasCooldown("Fists of Fury");
-      }),
-      
-      // Blackout Kick during FoF cooldown with various conditions
-      Spell.cast("Blackout Kick", () => {
-        return this.hasComboStrike("Blackout Kick") && 
-               this.hasCooldown("Fists of Fury") && 
-               (me.powerByType(PowerType.Chi) > 2 || me.powerByType(PowerType.Energy) > 60 || me.hasAura(116768)); // High chi, high energy, or BoK proc
-      }),
-      
-      // Generic Jadefire Stomp
-      Spell.cast("Jadefire Stomp"),
-      
-      // Tiger Palm with Ordered Elements and chi deficit
-      Spell.cast("Tiger Palm", () => {
-        return this.hasComboStrike("Tiger Palm") && 
-               me.hasAura(378082) && // Ordered Elements
-               (me.maxPowerByType(PowerType.Chi) - me.powerByType(PowerType.Chi)) >= 1; // Chi deficit
-      }),
-      
-      // Generic Chi Burst
-      Spell.cast("Chi Burst"),
-      
-      // Spinning Crane Kick with Ordered Elements and Hit Combo
-      Spell.cast("Spinning Crane Kick", () => {
-        return this.hasComboStrike("Spinning Crane Kick") && 
-               me.hasAura(378082) && // Ordered Elements
-               Spell.isSpellKnown(196740); // Hit Combo
-      }),
-      
-      // Blackout Kick with Ordered Elements but without Hit Combo
-      Spell.cast("Blackout Kick", () => {
-        return me.hasAura(378082) && // Ordered Elements
-               !Spell.isSpellKnown(196740) && // No Hit Combo
-               this.hasCooldown("Fists of Fury");
-      }),
-      
-      // Tiger Palm to build chi before FoF
-      Spell.cast("Tiger Palm", () => {
-        return me.powerByType(PowerType.Chi) < 3 && !this.hasCooldown("Fists of Fury");
-      })
     );
   }
 }

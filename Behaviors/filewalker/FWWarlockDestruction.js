@@ -1,1535 +1,898 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
-import Common from '@/Core/Common';
-import Spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import Settings from "@/Core/Settings";
-import CommandListener from "@/Core/CommandListener";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
 /**
- * Behavior implementation for Destruction Warlock
- * Follows Diabolist Hero talent build
+ * Destruction Warlock Behavior - Midnight 12.0.1
+ * SimC APL: simc/midnight/warlock_destruction.simc (50+ APL lines)
+ * Sources: SimC APL + Wowhead + class theorycraft
+ *
+ * Auto-detects: Hellcaller (Wither) vs Diabolist (Diabolic Ritual)
+ * Dispatches to: ST rotation / aoe_hc / aoe_dia (at 2+ targets)
+ *
+ * Resource: Soul Shards (PowerType 7), max 5 (fractional — 10 fragments = 1 shard)
+ * Burst: Summon Infernal → Malevolence (HC) / Ritual cycle (Dia) → Chaos Bolt dump
+ *
+ * Hellcaller: Wither (instant, replaces Immolate), Malevolence 1min burst,
+ *   Blackened Soul (shard spending adds Wither stacks)
+ * Diabolist: Ritual cycle (Overlord → Mother → Pit Lord),
+ *   Infernal Bolt (instant 2 shards), Ruination (AoE meteor)
+ *
+ * Key SimC variables replicated:
+ *   infernal_active = pet.infernal.active | (CD duration - CD remains) < 20
+ *   ritual_length = sum of ritual buff remains
+ *   demonic_art = any art proc active
+ *
+ * SimC conditions matched:
+ *   - Internal Combustion DoT refresh (remains-5 if CB in flight)
+ *   - Havoc target_if targeting
+ *   - active_dot tracking for Immolate/Wither spread
+ *   - Backdraft stack management
+ *   - Ritual length gating for Chaos Bolt timing
  */
+
+const S = {
+  // Core
+  chaosBolt:          116858,
+  incinerate:         29722,
+  immolate:           348,
+  conflagrate:        17962,
+  rainOfFire:         5740,
+  shadowburn:         17877,
+  soulFire:           6353,
+  // CDs
+  summonInfernal:     1122,
+  channelDemonfire:   196447,
+  cataclysm:          152108,
+  havoc:              80240,
+  dimensionalRift:    196586,
+  // Hellcaller
+  wither:             445468,
+  malevolence:        442726,
+  // Diabolist
+  infernalBolt:       434506,
+  ruination:          434635,
+  // Defensives
+  unendingResolve:    104773,
+  darkPact:           108416,
+  // Utility
+  summonPet:          688,
+  grimoireOfSac:      108503,
+  // Interrupt
+  spellLock:          119910,
+  // Racials
+  berserking:         26297,
+};
+
+const A = {
+  // Core procs
+  backdraft:          196406,
+  flashpoint:         387263,
+  ritualOfRuin:       364349,
+  impendingRuin:      364348,
+  fiendishCruelty:    1245633,
+  conflagOfChaos:     387108,
+  chaoticInferno:     387275,
+  // DoT debuffs
+  immolate:           348,
+  witherDebuff:       445465,
+  // Hellcaller
+  malevolence:        442726,
+  // Diabolist ritual phases
+  ritualOverlord:     431944,
+  ritualMotherChaos:  432815,
+  ritualPitLord:      432816,
+  artOverlord:        428524,
+  artMotherChaos:     432794,
+  artPitLord:         432795,
+  ruinationProc:      433885,
+  infernalBoltProc:   433891,
+  // Havoc
+  havoc:              80240,
+  // Hero detection
+  witherKnown:        445468,
+  diabolicRitual:     428514,
+  // Talents
+  internalCombustion: 266134,
+  lakeOfFire:         452102,
+  backdraftTalent:    196406,
+  avatarOfDestruction: 432056,
+  destructiveRapidity: 446988,
+  fireAndBrimstone:   196408,
+};
+
 export class DestructionWarlockBehavior extends Behavior {
-  // Define context, specialization, name, and version
+  name = 'FW Destruction Warlock';
   context = BehaviorContext.Any;
   specialization = Specialization.Warlock.Destruction;
-  name = "FW Destruction Warlock";
-  version = 1;
-  
-  // Define talent build options
-  static TALENT_BUILDS = {
-    DIABOLIST: 'diabolist',
-    HELLCALLER: 'hellcaller'
-  };
-  
-  /**
-   * Settings for the behavior
-   * These will appear in the UI settings panel
-   */
+  version = wow.GameVersion.Retail;
+
+  // Per-tick caches
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _shardFrame = 0;
+  _cachedShards = 0;
+  _bdFrame = 0;
+  _cachedBackdraft = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _ritualFrame = 0;
+  _cachedRitualLength = 0;
+  _infFrame = 0;
+  _cachedInfernalActive = false;
+  _versionLogged = false;
+  _lastDebug = 0;
+
   static settings = [
     {
-      header: "Destruction Warlock Configuration",
+      header: 'General',
       options: [
-        {
-          uid: "UseTrinkets",
-          text: "Use Trinkets",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "UseRacials",
-          text: "Use Racial Abilities",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "AllowRoF2TSpender",
-          text: "Use Rain of Fire for 2 targets",
-          type: "checkbox",
-          default: true,
-          description: "Use Rain of Fire as a spender with 2 targets"
-        },
-        {
-          uid: "DisableCB2T",
-          text: "Disable Chaos Bolt at 2 targets",
-          type: "checkbox",
-          default: false,
-          description: "Don't cast Chaos Bolt when fighting 2 targets"
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWDestUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'checkbox', uid: 'FWDestDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWDestUnending', text: 'Use Unending Resolve', default: true },
+        { type: 'slider', uid: 'FWDestUnendingHP', text: 'Unending Resolve HP %', default: 35, min: 10, max: 60 },
+        { type: 'checkbox', uid: 'FWDestDarkPact', text: 'Use Dark Pact', default: true },
+        { type: 'slider', uid: 'FWDestDarkPactHP', text: 'Dark Pact HP %', default: 50, min: 15, max: 70 },
+      ],
+    },
   ];
 
-  // Inside build() method where AoE detection occurs
-  build() {
-    return new bt.Selector(
-      Common.waitForCastOrChannel(),
-      Common.waitForNotMounted(),
-      Common.waitForTarget(),
-      Common.waitForFacing(),
-      this.preCombat(),
-      // Process queued spells from CommandListener
-      new bt.Action(() => {
-        const queuedSpell = CommandListener.getNextQueuedSpell();
-        if (queuedSpell) {
-          CommandListener.processQueuedSpell();
-          return bt.Status.Success;
-        }
-        return bt.Status.Failure;
-      }),
-      // Main rotation selector
-      new bt.Selector(
-        // AoE rotation for 3+ targets
-        new bt.Decorator(
-          () => {
-            // Use 8 yards for Rain of Fire range check (standard AoE radius)
-            const enemyCount = this.getEnemyCount(8);
-            return enemyCount >= 3;
-          },
-          this.aoeRotation(),
-          "AoE Rotation (3+ targets)"
-        ),
-        // Cleave rotation for 2 targets or with cleave_apl variable set
-        new bt.Decorator(
-          () => {
-            // Use 8 yards for cleave/AoE detection
-            const enemyCount = this.getEnemyCount(8);
-            return enemyCount === 2 || this.isCleaveModeActive();
-          },
-          this.cleaveRotation(),
-          "Cleave Rotation"
-        ),
-        // Single-target rotation
-        this.singleTargetRotation()
-      )
-    );
+  // ===== Hero Talent Detection =====
+  isHellcaller() {
+    return spell.isSpellKnown(S.wither);
   }
 
-  /**
-   * Pre-combat sequence
-   */
-  preCombat() {
-    return new bt.Sequence("Pre-Combat",
-      new bt.Decorator(
-        () => !me.inCombat(),
-        new bt.Selector(
-          // Summon demon if needed
-          Spell.cast("Summon Imp", () => !me.pet),
-          // Grimoire of Sacrifice if talented
-          Spell.cast("Grimoire of Sacrifice", () => Spell.isSpellKnown("Grimoire of Sacrifice") && me.pet),
-          // Cataclysm as pre-pull for AoE
-          Spell.cast("Cataclysm", () => this.getEnemyCount() >= 2 && Spell.isSpellKnown("Cataclysm")),
-          // Soul Fire pre-pull
-          Spell.cast("Soul Fire", () => Spell.isSpellKnown("Soul Fire") && me.target)
-        )
-      )
-    );
+  isDiabolist() {
+    return !this.isHellcaller();
   }
 
-  /**
-   * Single-target rotation following SIMC APL
-   */
-  singleTargetRotation() {
-    return new bt.Selector("Single Target Rotation",
-      // Use on-GCD trinkets and racials
-    //   this.useItems(),
-      this.useOGCDs(),
-      
-      // Malevolence if Summon Infernal cooldown is high
-      Spell.cast("Malevolence", () => me.hasAura("Malevolance") && Spell.isSpellKnown("Malevolence") && 
-                 Spell.getCooldown("Summon Infernal").timeleft >= 55000),
-      
-      // Wait for Diabolic Ritual if active and almost done
-      new bt.Action(() => {
-        if (Spell.isSpellKnown("Diabolic Ritual")) {
-          const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-          const overlord = me.getAura("Diabolic Ritual: Overlord");
-          const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-          
-          const motherRemains = motherOfChaos ? motherOfChaos.remaining : 0;
-          const overlordRemains = overlord ? overlord.remaining : 0;
-          const pitLordRemains = pitLord ? pitLord.remaining : 0;
-          
-          const totalRemains = motherRemains + overlordRemains + pitLordRemains;
-          
-          if (totalRemains > 0 && totalRemains < me.gcdMax * 0.25 && me.soul_shard > 2) {
-            return bt.Status.Success;
-          }
-        }
-        return bt.Status.Failure;
-      }),
-      
-      // Demonic Art priority
-      Spell.cast("Chaos Bolt", () => me.hasAura("Demonic Art")),
-      
-      // Soul Fire with Decimation proc
-      Spell.cast("Soul Fire", () => {
-        const decimation = me.getAura("Decimation");
-        if (!decimation) return false;
-        
-        const conflagrate = this.getCurrentTarget().getAuraByMe("Conflagrate");
-        const conflagrateRemains = conflagrate ? conflagrate.remaining : 0;
-        
-        return decimation && 
-               (me.soul_shard <= 4 || decimation.remaining <= me.gcdMax * 2) && 
-               conflagrateRemains >= Spell.getSpell("Soul Fire").castTime;
-      }),
-      
-      // Wither with Internal Combustion
-      Spell.cast("Wither", () => {
-        if (!Spell.isSpellKnown("Internal Combustion")) return false;
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const wither = target.getAuraByMe("Wither");
-        const witherRemains = wither ? wither.remaining : 0;
-        const witherDuration = wither ? wither.duration : 0;
-        
-        const chaosBoltInFlight = this.isActionInFlight("Chaos Bolt");
-        const adjustedRemains = witherRemains - (chaosBoltInFlight ? 5000 : 0);
-        
-        // Check if we need to refresh Wither based on conditions from APL
-        if ((adjustedRemains < witherDuration * 0.4) || 
-            witherRemains < 3000 || 
-            (witherRemains - Spell.getSpell("Chaos Bolt").castTime < 5000 && 
-             Spell.getSpell("Chaos Bolt").isUsable)) {
-            
-          // Additional Soul Fire check
-          if (Spell.isSpellKnown("Soul Fire")) {
-            const soulFireCd = Spell.getCooldown("Soul Fire");
-            if (soulFireCd.timeleft + Spell.getSpell("Soul Fire").castTime <= (witherRemains - 5000)) {
-              return false;
-            }
-          }
-          
-          return target.timeToDeath() > 8 && !this.isActionInFlight("Soul Fire", target);
-        }
-        
-        return false;
-      }),
-      
-      // Conflagrate with Roaring Blaze or about to cap charges
-      Spell.cast("Conflagrate", () => {
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const conflagrate = target.getAuraByMe("Conflagrate");
-        const conflagrateRemains = conflagrate ? conflagrate.remaining : 0;
-        
-        const hasDiabolicRitual = Spell.isSpellKnown("Diabolic Ritual");
-        
-        // Check ritual buff remains if talented
-        let ritualRemains = 0;
-        if (hasDiabolicRitual) {
-          const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-          const overlord = me.getAura("Diabolic Ritual: Overlord");
-          const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-          
-          ritualRemains = (motherOfChaos ? motherOfChaos.remaining : 0) + 
-                          (overlord ? overlord.remaining : 0) + 
-                          (pitLord ? pitLord.remaining : 0);
-        }
-        
-        return (Spell.isSpellKnown("Roaring Blaze") && conflagrateRemains < 1500) || 
-               Spell.getCooldown("Conflagrate").fullRechargeTime <= me.gcdMax * 2 || 
-               (Spell.getCooldown("Conflagrate").timeleft <= 8000 && 
-                hasDiabolicRitual && ritualRemains < me.gcdMax && 
-                me.soul_shard >= 1.5);
-      }),
-      
-      // Shadowburn for special conditions
-      Spell.cast("Shadowburn", () => {
-        if (!Spell.isSpellKnown("Shadowburn")) return false;
-        
-        const cooldown = Spell.getCooldown("Shadowburn");
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const eradication = target.getAuraByMe("Eradication");
-        const eradicationRemains = eradication ? eradication.remaining : 0;
-        
-        const hasConflagrationOfChaos = Spell.isSpellKnown("Conflagration of Chaos");
-        const hasBlisteringAtrophy = Spell.isSpellKnown("Blistering Atrophy");
-        const hasDiabolicRitual = Spell.isSpellKnown("Diabolic Ritual");
-        
-        // Main condition from APL
-        const condition = (cooldown.fullRechargeTime <= me.gcdMax * 3 || 
-                          (eradicationRemains <= me.gcdMax && 
-                           Spell.isSpellKnown("Eradication") && 
-                           !this.isActionInFlight("Chaos Bolt") && 
-                           !hasDiabolicRitual)) && 
-                          (hasConflagrationOfChaos || hasBlisteringAtrophy) && 
-                          !me.hasAura("Demonic Art");
-        
-        return condition || this.getFightRemains() <= 8;
-      }),
-      
-      // Chaos Bolt with Ritual of Ruin
-      Spell.cast("Chaos Bolt", () => me.hasAura("Ritual of Ruin")),
-      
-      // Shadowburn or Chaos Bolt with Malevolence or Rain of Chaos condition
-      Spell.cast("Shadowburn", () => {
-        if (!Spell.isSpellKnown("Shadowburn")) return false;
-        
-        return (Spell.getCooldown("Summon Infernal").timeleft >= 90000 && 
-                Spell.isSpellKnown("Rain of Chaos")) || 
-               me.hasAura("Malevolence");
-      }),
-      
-      Spell.cast("Chaos Bolt", () => {
-        return (Spell.getCooldown("Summon Infernal").timeleft >= 90000 && 
-                Spell.isSpellKnown("Rain of Chaos")) || 
-               me.hasAura("Malevolence");
-      }),
-      
-      // Ruination with Eradication check
-      Spell.cast("Ruination", () => {
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        if (!me.hasAura("Ruination")) return false;
-        const eradication = target.getAuraByMe("Eradication");
-        const eradicationRemains = eradication ? eradication.remaining : 0;
-        
-        return eradicationRemains >= Spell.getSpell("Ruination").castTime || 
-               !Spell.isSpellKnown("Eradication") || 
-               !Spell.isSpellKnown("Shadowburn");
-      }),
-      
-      // Cataclysm for refreshing Wither
-      Spell.cast("Cataclysm", () => {
-        if (!Spell.isSpellKnown("Cataclysm")) return false;
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const wither = target.getAuraByMe("Wither");
-        
-        return Spell.isSpellKnown("Wither") && (!wither || wither.refreshable);
-      }),
-      
-      // Channel Demonfire with Raging Demonfire
-      Spell.cast("Channel Demonfire", () => {
-        if (!Spell.isSpellKnown("Channel Demonfire") || !Spell.isSpellKnown("Raging Demonfire")) {
-          return false;
-        }
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const immolate = target.getAuraByMe("Immolate");
-        const immolateRemains = immolate ? immolate.remaining : 0;
-        
-        const wither = target.getAuraByMe("Wither");
-        const witherRemains = wither ? wither.remaining : 0;
-        
-        const chaosBoltInFlight = this.isActionInFlight("Chaos Bolt");
-        const icReduction = chaosBoltInFlight && Spell.isSpellKnown("Internal Combustion") ? 5000 : 0;
-        
-        return (immolateRemains + witherRemains - icReduction) > Spell.getSpell("Channel Demonfire").castTime;
-      }),
-      
-      // Wither without Internal Combustion
-      Spell.cast("Wither", () => {
-        if (!Spell.isSpellKnown("Wither") || Spell.isSpellKnown("Internal Combustion")) {
-          return false;
-        }
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const wither = target.getAuraByMe("Wither");
-        const witherRemains = wither ? wither.remaining : 0;
-        const witherDuration = wither ? wither.duration : 0;
-        
-        const chaosBoltInFlight = this.isActionInFlight("Chaos Bolt");
-        const adjustedRemains = witherRemains - (chaosBoltInFlight ? 5000 : 0);
-        
-        // Don't refresh if Cataclysm will handle it
-        if (Spell.isSpellKnown("Cataclysm") && 
-            Spell.getCooldown("Cataclysm").timeleft <= witherRemains) {
-          return false;
-        }
-        
-        // Additional Soul Fire check
-        if (Spell.isSpellKnown("Soul Fire")) {
-          const soulFireCd = Spell.getCooldown("Soul Fire");
-          if (soulFireCd.timeleft + Spell.getSpell("Soul Fire").castTime <= witherRemains) {
-            return false;
-          }
-        }
-        
-        return ((adjustedRemains < witherDuration * 0.3) || witherRemains < 3000) && 
-               target.timeToDeath() > 8 && 
-               !this.isActionInFlight("Soul Fire", target);
-      }),
-      
-      // Immolate refresh
-      Spell.cast("Immolate", () => {
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const immolate = target.getAuraByMe("Immolate");
-        const immolateRemains = immolate ? immolate.remaining : 0;
-        const immolateDuration = immolate ? immolate.duration : 0;
-        
-        const chaosBoltInFlight = this.isActionInFlight("Chaos Bolt");
-        const icReduction = chaosBoltInFlight && Spell.isSpellKnown("Internal Combustion") ? 5000 : 0;
-        const adjustedRemains = immolateRemains - icReduction;
-        
-        const cbExecuteTime = Spell.getSpell("Chaos Bolt").castTime;
-        
-        // Special case for Internal Combustion
-        if (Spell.isSpellKnown("Internal Combustion") && 
-            (adjustedRemains < immolateDuration * 0.3 || 
-             immolateRemains < 3000 || 
-             (immolateRemains - cbExecuteTime < 5000 && 
-              Spell.getSpell("Chaos Bolt").isUsable))) {
-          
-          // Additional Soul Fire check
-          if (Spell.isSpellKnown("Soul Fire")) {
-            const soulFireCd = Spell.getCooldown("Soul Fire");
-            if (soulFireCd.timeleft + Spell.getSpell("Soul Fire").castTime <= (immolateRemains - 5000 * (Spell.isSpellKnown("Internal Combustion") ? 1 : 0))) {
-              return false;
-            }
-          }
-          
-          return target.timeToDeath() > 8 && !this.isActionInFlight("Soul Fire", target);
-        }
-        
-        return false;
-      }),
-      
-      // Summon Infernal on cooldown
-      Spell.cast("Summon Infernal"),
-      
-      // Incinerate for Diabolic Ritual timing
-      Spell.cast("Incinerate", () => {
-        if (!Spell.isSpellKnown("Diabolic Ritual")) return false;
-        
-        // Check ritual buff remains
-        const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-        const overlord = me.getAura("Diabolic Ritual: Overlord");
-        const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-        
-        const totalRemains = (motherOfChaos ? motherOfChaos.remaining : 0) + 
-                             (overlord ? overlord.remaining : 0) + 
-                             (pitLord ? pitLord.remaining : 0);
-        
-        // Calculate timing adjustment based on disabling CB at 2T
-        const disableCB2T = Settings.DisableCB2T || false;
-        const cbCastTime = !disableCB2T ? Spell.getSpell("Chaos Bolt").castTime : 0;
-        const gcdAdjustment = !disableCB2T ? me.gcdMax : 0;
-        
-        return totalRemains - 2000 - cbCastTime - gcdAdjustment <= 0;
-      }),
-      
-      // Chaos Bolt when pooling
-      Spell.cast("Chaos Bolt", () => {
-        // Check pooling condition
-        const poolingCondition = this.getPoolingConditionCB();
-        
-        // Check cooldown on Infernal
-        const infernalCd = Spell.getCooldown("Summon Infernal");
-        
-        return poolingCondition && 
-               (infernalCd.timeleft >= me.gcdMax * 3 || 
-                me.soul_shard > 4 || 
-                !Spell.isSpellKnown("Rain of Chaos"));
-      }),
-      
-      // Channel Demonfire
-      Spell.cast("Channel Demonfire"),
-      
-      // Dimensional Rift
-      Spell.cast("Dimensional Rift"),
-      
-      // Infernal Bolt
-      Spell.cast("Infernal Bolt"),
-      
-      // Conflagrate to avoid capping charges
-      Spell.cast("Conflagrate", () => {
-        const charges = Spell.getCharges("Conflagrate");
-        const maxCharges = Spell.getSpell("Conflagrate").charges?.maxCharges || 0;
-        
-        return charges > (maxCharges - 1) || this.getFightRemains() < me.gcdMax * charges;
-      }),
-      
-      // Soul Fire with Backdraft
-      Spell.cast("Soul Fire", () => me.hasAura("Backdraft")),
-      
-      // Incinerate as filler
-      Spell.cast("Incinerate")
-    );
-  }
-
-  /**
-   * AoE rotation for 3+ targets
-   */
-  aoeRotation() {
-    return new bt.Selector("AoE Rotation",
-      // Use OGCDs and items
-      this.useOGCDs(),
-    //   this.useItems(),
-      
-      // Malevolence in AoE with conditions
-      Spell.cast("Malevolence", () => {
-        if (!Spell.isSpellKnown("Malevolence")) return false;
-        
-        return Spell.getCooldown("Summon Infernal").timeleft >= 55000 && 
-               me.soul_shard < 4.7 && 
-               (this.getEnemyCount() <= 3 + this.getActiveDotCount("Wither") || 
-                wow.frameTime > 30000);
-      }),
-      
-      // Rain of Fire with Demonic Art
-      Spell.cast("Rain of Fire", () => me.hasAura("Demonic Art")),
-      
-      // Wait for Diabolic Ritual if active and almost done
-      new bt.Action(() => {
-        if (Spell.isSpellKnown("Diabolic Ritual")) {
-          const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-          const overlord = me.getAura("Diabolic Ritual: Overlord");
-          const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-          
-          const motherRemains = motherOfChaos ? motherOfChaos.remaining : 0;
-          const overlordRemains = overlord ? overlord.remaining : 0;
-          const pitLordRemains = pitLord ? pitLord.remaining : 0;
-          
-          const totalRemains = motherRemains + overlordRemains + pitLordRemains;
-          
-          if (totalRemains > 0 && totalRemains < me.gcdMax * 0.25 && me.soul_shard > 2) {
-            return bt.Status.Success;
-          }
-        }
-        return bt.Status.Failure;
-      }),
-      
-      // Incinerate during Diabolic Ritual
-      Spell.cast("Incinerate", () => {
-        if (!Spell.isSpellKnown("Diabolic Ritual")) return false;
-        
-        // Check ritual buff remains
-        const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-        const overlord = me.getAura("Diabolic Ritual: Overlord");
-        const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-        
-        const motherRemains = motherOfChaos ? motherOfChaos.remaining : 0;
-        const overlordRemains = overlord ? overlord.remaining : 0;
-        const pitLordRemains = pitLord ? pitLord.remaining : 0;
-        
-        const totalRemains = motherRemains + overlordRemains + pitLordRemains;
-        
-        const castTime = Spell.getSpell("Incinerate").castTime;
-        
-        return totalRemains <= castTime && totalRemains > me.gcdMax * 0.25;
-      }),
-      
-      // Rain of Fire for soul shard dumps
-      Spell.cast("Rain of Fire", () => {
-        if (!Spell.isSpellKnown("Inferno")) {
-          const activeDots = this.getActiveDotCount("Immolate") + this.getActiveDotCount("Wither");
-          return me.soul_shard >= (4.5 - 0.1 * activeDots) || 
-                 me.soul_shard >= (3.5 - 0.1 * activeDots) || 
-                 me.hasAura("Ritual of Ruin");
-        }
-        return false;
-      }),
-      
-      // Wither on highest priority target without Wither
-      Spell.cast("Wither", () => {
-        if (!Spell.isSpellKnown("Wither")) return false;
-        
-        const target = this.getBestDotTarget("Wither");
-        if (!target) return false;
-        
-        const wither = target.getAuraByMe("Wither");
-        
-        // Don't cast if Cataclysm is coming up soon
-        if (Spell.isSpellKnown("Cataclysm") && 
-            Spell.getCooldown("Cataclysm").timeleft <= (wither ? wither.remaining : 0)) {
-          return false;
-        }
-        
-        // Check Channel Demonfire conditions
-        if (Spell.isSpellKnown("Raging Demonfire") && 
-            Spell.isSpellKnown("Channel Demonfire") && 
-            Spell.getCooldown("Channel Demonfire").timeleft <= (wither ? wither.remaining : 0) && 
-            wow.frameTime < 5000) {
-          return false;
-        }
-        
-        // Limit number of targets with Wither
-        const activeDots = this.getActiveDotCount("Wither");
-        if (activeDots > 4 && wow.frameTime <= 15000) {
-          return false;
-        }
-        
-        return (!wither || wither.refreshable) && target.timeToDeath() > 18;
-      }),
-      
-      // Channel Demonfire with Raging Demonfire
-      Spell.cast("Channel Demonfire", () => {
-        if (!Spell.isSpellKnown("Channel Demonfire") || !Spell.isSpellKnown("Raging Demonfire")) {
-          return false;
-        }
-        
-        // Need at least one target with Immolate or Wither
-        let hasValidTarget = false;
-        combat.targets.forEach(target => {
-          const immolate = target.getAuraByMe("Immolate");
-          const wither = target.getAuraByMe("Wither");
-          
-          if ((immolate && immolate.remaining > Spell.getSpell("Channel Demonfire").castTime) || 
-              (wither && wither.remaining > Spell.getSpell("Channel Demonfire").castTime)) {
-            hasValidTarget = true;
-          }
-        });
-        
-        return hasValidTarget;
-      }),
-      
-      // Ruination
-      Spell.cast("Ruination", () => me.hasAura("Ruination")),
-      
-      // Rain of Fire during Infernal with Rain of Chaos
-      Spell.cast("Rain of Fire", () => {
-        return me.hasAura("Infernal") && Spell.isSpellKnown("Rain of Chaos");
-      }),
-      
-      // Cataclysm
-      Spell.cast("Cataclysm", () => Spell.isSpellKnown("Wither") || true),
-      
-      // Summon Infernal
-      Spell.cast("Summon Infernal", () => {
-        // Check for PI/External cooldowns
-        // Since we don't have direct access to those in the code framework, simplify
-        return true;
-      }),
-      
-      // Immolate maintenance on targets
-      Spell.cast("Immolate", () => {
-        const target = this.getBestDotTarget("Immolate");
-        if (!target) return false;
-        
-        const immolate = target.getAuraByMe("Immolate");
-        
-        // Don't cast if Cataclysm is coming up soon
-        if (Spell.isSpellKnown("Cataclysm") && 
-            Spell.getCooldown("Cataclysm").timeleft <= (immolate ? immolate.remaining : 0)) {
-          return false;
-        }
-        
-        // Channel Demonfire conditions
-        if (Spell.isSpellKnown("Raging Demonfire") && 
-            Spell.isSpellKnown("Channel Demonfire") && 
-            Spell.getCooldown("Channel Demonfire").timeleft <= (immolate ? immolate.remaining : 0) && 
-            wow.frameTime < 5000) {
-          return false;
-        }
-        
-        // Limit number of targets with Immolate based on talents
-        const limit = (Spell.isSpellKnown("Diabolic Ritual") && Spell.isSpellKnown("Inferno")) ? 6 : 4;
-        const activeDots = this.getActiveDotCount("Immolate");
-        
-        return (!immolate || immolate.refreshable) && 
-               activeDots <= limit && 
-               target.timeToDeath() > 18;
-      }),
-      
-      // Dimensional Rift
-      Spell.cast("Dimensional Rift", () => me.soul_shard < 4.7),
-      
-      // Soul Fire with Decimation
-      Spell.cast("Soul Fire", () => {
-        if (!Spell.isSpellKnown("Soul Fire")) return false;
-        
-        return me.hasAura("Decimation") && 
-               this.getActiveDotCount("Immolate") <= 4;
-      }),
-      
-      // Infernal Bolt for shard generation
-      Spell.cast("Infernal Bolt", () => me.soul_shard < 2.5),
-      
-      // Conflagrate for Backdraft in AoE
-      Spell.cast("Conflagrate", () => {
-        if (!Spell.isSpellKnown("Backdraft")) return false;
-        
-        const backdraft = me.getAura("Backdraft");
-        return !backdraft || backdraft.stacks < 2;
-      }),
-      
-      // Incinerate with Fire and Brimstone and Backdraft
-      Spell.cast("Incinerate", () => {
-        return Spell.isSpellKnown("Fire and Brimstone") && me.hasAura("Backdraft");
-      }),
-      
-      // Conflagrate as filler
-      Spell.cast("Conflagrate"),
-      
-      // Incinerate as filler
-      Spell.cast("Incinerate")
-    );
-  }
-
-  /**
-   * Cleave rotation (2 targets)
-   */
-  cleaveRotation() {
-    return new bt.Selector("Cleave Rotation",
-      // Use items and OGCDs
-    //   this.useItems(),
-      this.useOGCDs(),
-      
-      // Handle Havoc if active
-      this.havocRotation(),
-      
-      // Variable to track soul shard pooling
-      new bt.Action(() => {
-        this.poolSoulShards = Spell.getCooldown("Havoc").timeleft <= 5000 || Spell.isSpellKnown("Mayhem");
-        return bt.Status.Failure;
-      }),
-      
-      // Malevolence if not during Infernal
-      Spell.cast("Malevolence", () => {
-        if (!Spell.isSpellKnown("Malevolence")) return false;
-        
-        return !me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal");
-      }),
-      
-      // Havoc setup on non-primary target
-      Spell.cast("Havoc", () => {
-        if (!Spell.isSpellKnown("Havoc")) return false;
-        
-        const currentTarget = this.getCurrentTarget();
-        if (!currentTarget) return false;
-        
-        // Find best Havoc target that isn't current target
-        let bestTarget = null;
-        let highestPriority = -99999;
-        
-        combat.targets.forEach(target => {
-          if (target !== currentTarget) {
-            // Calculate priority based on time to die and DoT status
-            const timeToLive = target.timeToDeath() || -15;
-            const immolate = target.getAuraByMe("Immolate");
-            const immolateRemains = immolate ? immolate.remaining : 0;
-            
-            // Priority formula from APL
-            const priority = (-timeToLive) + immolateRemains + (currentTarget === target ? 99 : 0);
-            
-            if (priority > highestPriority) {
-              highestPriority = priority;
-              bestTarget = target;
-            }
-          }
-        });
-        
-        if (!bestTarget) return false;
-        
-        // Check conditions from APL
-        return (!me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal")) && 
-               bestTarget.timeToDeath() > 8;
-      }),
-      
-      // Demonic Art priority
-      Spell.cast("Chaos Bolt", () => me.hasAura("Demonic Art")),
-      
-      // Soul Fire with Decimation during cooldown
-      Spell.cast("Soul Fire", () => {
-        if (!Spell.isSpellKnown("Soul Fire") || !me.hasAura("Decimation")) return false;
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const conflagrate = target.getAuraByMe("Conflagrate");
-        
-        return me.hasAura("Decimation") && 
-               (me.soul_shard <= 4 || me.getAura("Decimation").remaining <= me.gcdMax * 2) && 
-               conflagrate && conflagrate.remaining >= Spell.getSpell("Soul Fire").castTime && 
-               Spell.getCooldown("Havoc").timeleft > 0;
-      }),
-      
-      // DoT maintenance through the rest of the cleave rotation
-      Spell.cast("Wither", () => {
-        if (!Spell.isSpellKnown("Wither")) return false;
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const wither = target.getAuraByMe("Wither");
-        const witherRemains = wither ? wither.remaining : 0;
-        const witherDuration = wither ? wither.duration : 0;
-        
-        const chaosBoltInFlight = this.isActionInFlight("Chaos Bolt");
-        const adjustedRemains = witherRemains - (chaosBoltInFlight ? 5000 : 0);
-        
-        // This covers both Internal Combustion and non-IC cases from the APL
-        if (Spell.isSpellKnown("Internal Combustion")) {
-          // Internal Combustion logic
-          if ((adjustedRemains < witherDuration * 0.4) || 
-              witherRemains < 3000 || 
-              (witherRemains - Spell.getSpell("Chaos Bolt").castTime < 5000 && 
-               Spell.getSpell("Chaos Bolt").isUsable)) {
-            
-            // Additional Soul Fire check
-            if (Spell.isSpellKnown("Soul Fire")) {
-              const soulFireCd = Spell.getCooldown("Soul Fire");
-              if (soulFireCd.timeleft + Spell.getSpell("Soul Fire").castTime <= (witherRemains - 5000)) {
-                return false;
-              }
-            }
-            
-            return target.timeToDeath() > 8 && !this.isActionInFlight("Soul Fire", target);
-          }
-        } else {
-          // Non-Internal Combustion logic
-          if ((adjustedRemains < witherDuration * 0.3) || witherRemains < 3000) {
-            // Additional Soul Fire check
-            if (Spell.isSpellKnown("Soul Fire")) {
-              const soulFireCd = Spell.getCooldown("Soul Fire");
-              if (soulFireCd.timeleft + Spell.getSpell("Soul Fire").castTime <= witherRemains) {
-                return false;
-              }
-            }
-            
-            return target.timeToDeath() > 8 && !this.isActionInFlight("Soul Fire", target);
-          }
-        }
-        
-        return false;
-      }),
-      
-      // Conflagrate with Roaring Blaze
-      Spell.cast("Conflagrate", () => {
-        if (this.poolSoulShards) return false; // Don't use if pooling for Havoc
-        
-        if (Spell.isSpellKnown("Roaring Blaze")) {
-          return Spell.getCooldown("Conflagrate").fullRechargeTime <= me.gcdMax * 2;
-        }
-        
-        // Check for Diabolic Ritual timing
-        if (Spell.isSpellKnown("Diabolic Ritual")) {
-          const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-          const overlord = me.getAura("Diabolic Ritual: Overlord");
-          const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-          
-          const totalRemains = (motherOfChaos ? motherOfChaos.remaining : 0) + 
-                               (overlord ? overlord.remaining : 0) + 
-                               (pitLord ? pitLord.remaining : 0);
-          
-          if (Spell.getCooldown("Conflagrate").timeleft <= 8000 && 
-              totalRemains < me.gcdMax && me.soul_shard >= 1.5) {
-            return true;
-          }
-        }
-        
-        return false;
-      }),
-      
-      // Shadowburn with talent conditions
-      Spell.cast("Shadowburn", () => {
-        if (!Spell.isSpellKnown("Shadowburn")) return false;
-        
-        const cooldown = Spell.getCooldown("Shadowburn");
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const eradication = target.getAuraByMe("Eradication");
-        const eradicationRemains = eradication ? eradication.remaining : 0;
-        
-        const hasConflagrationOfChaos = Spell.isSpellKnown("Conflagration of Chaos");
-        const hasBlisteringAtrophy = Spell.isSpellKnown("Blistering Atrophy");
-        const hasDiabolicRitual = Spell.isSpellKnown("Diabolic Ritual");
-        
-        // Main condition from APL
-        const condition = (cooldown.fullRechargeTime <= me.gcdMax * 3 || 
-                          (eradicationRemains <= me.gcdMax && 
-                           Spell.isSpellKnown("Eradication") && 
-                           !this.isActionInFlight("Chaos Bolt") && 
-                           !hasDiabolicRitual)) && 
-                          (hasConflagrationOfChaos || hasBlisteringAtrophy);
-        
-        return condition || this.getFightRemains() <= 8;
-      }),
-      
-      // Chaos Bolt with Ritual of Ruin
-      Spell.cast("Chaos Bolt", () => me.hasAura("Ritual of Ruin")),
-      
-      // Rain of Fire with Rain of Chaos
-      Spell.cast("Rain of Fire", () => {
-        return Spell.getCooldown("Summon Infernal").timeleft >= 90000 && 
-               Spell.isSpellKnown("Rain of Chaos");
-      }),
-      
-      // Shadowburn with Rain of Chaos
-      Spell.cast("Shadowburn", () => {
-        if (!Spell.isSpellKnown("Shadowburn")) return false;
-        
-        return Spell.getCooldown("Summon Infernal").timeleft >= 90000 && 
-               Spell.isSpellKnown("Rain of Chaos");
-      }),
-      
-      // Chaos Bolt with Rain of Chaos
-      Spell.cast("Chaos Bolt", () => {
-        return Spell.getCooldown("Summon Infernal").timeleft >= 90000 && 
-               Spell.isSpellKnown("Rain of Chaos");
-      }),
-      
-      // Ruination with Eradication check
-      Spell.cast("Ruination", () => {
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        if (!me.hasAura("Ruination")) return false;
-        
-        const eradication = target.getAuraByMe("Eradication");
-        const eradicationRemains = eradication ? eradication.remaining : 0;
-        
-        return eradicationRemains >= Spell.getSpell("Ruination").castTime || 
-               !Spell.isSpellKnown("Eradication") || 
-               !Spell.isSpellKnown("Shadowburn");
-      }),
-      
-      // Cataclysm for AoE DoT application
-      Spell.cast("Cataclysm"),
-      
-      // Immolate maintenance that considers Havoc timing
-      Spell.cast("Immolate", () => {
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const immolate = target.getAuraByMe("Immolate");
-        const immolateRefreshable = immolate ? immolate.refreshable : true;
-        
-        // Only refresh if Immolate will expire before Havoc is ready
-        if (immolateRefreshable && 
-            (immolate ? immolate.remaining : 0) < Spell.getCooldown("Havoc").timeleft) {
-          
-          // Don't cast if Cataclysm will handle it
-          if (Spell.isSpellKnown("Cataclysm") && 
-              Spell.getCooldown("Cataclysm").timeleft <= (immolate ? immolate.remaining : 0)) {
-            return false;
-          }
-          
-          // Additional Soul Fire check
-          if (Spell.isSpellKnown("Soul Fire") && !Spell.isSpellKnown("Mayhem")) {
-            const soulFireCd = Spell.getCooldown("Soul Fire");
-            if (soulFireCd.timeleft + Spell.getSpell("Soul Fire").castTime <= (immolate ? immolate.remaining : 0)) {
-              return false;
-            }
-          }
-          
-          return target.timeToDeath() > 15;
-        }
-        
-        return false;
-      }),
-      
-      // Summon Infernal
-      Spell.cast("Summon Infernal"),
-      
-      // Incinerate for Diabolic Ritual
-      Spell.cast("Incinerate", () => {
-        if (!Spell.isSpellKnown("Diabolic Ritual")) return false;
-        
-        // Check ritual buff remains
-        const motherOfChaos = me.getAura("Diabolic Ritual: Mother of Chaos");
-        const overlord = me.getAura("Diabolic Ritual: Overlord");
-        const pitLord = me.getAura("Diabolic Ritual: Pit Lord");
-        
-        const totalRemains = (motherOfChaos ? motherOfChaos.remaining : 0) + 
-                             (overlord ? overlord.remaining : 0) + 
-                             (pitLord ? pitLord.remaining : 0);
-        
-        // Calculate timing adjustment based on disabling CB at 2T
-        const disableCB2T = Settings.DisableCB2T || false;
-        const cbCastTime = !disableCB2T ? Spell.getSpell("Chaos Bolt").castTime : 0;
-        const gcdAdjustment = !disableCB2T ? me.gcdMax : 0;
-        
-        return totalRemains - 2000 - cbCastTime - gcdAdjustment <= 0;
-      }),
-      
-      // Rain of Fire with Rain of Chaos buff or when appropriate for AoE
-      Spell.cast("Rain of Fire", () => {
-        // Get enemy count specifically for this decision
-        const enemyCount = this.getEnemyCount(8);
-        
-        if (enemyCount >= 3) {
-          return true; // Always use Rain of Fire with 3+ targets
-        } else if (enemyCount === 2 && this.shouldDoRoF2T()) {
-          console.info("Using Rain of Fire for 2 targets because shouldDoRoF2T() returned true");
-          return this.getPoolingCondition() && 
-                 (Spell.getCooldown("Summon Infernal").timeleft >= me.gcdMax * 3 || 
-                  !Spell.isSpellKnown("Rain of Chaos"));
-        }
-        
-        // Use for single target only if we have Rain of Chaos proc
-        return !Spell.isSpellKnown("Wither") && me.hasAura("Rain of Chaos") && this.getPoolingCondition();
-      }),
-      
-      // Rain of Fire with Pyrogenics about to expire
-      Spell.cast("Rain of Fire", () => {
-        if (!this.allowRoF2TSpender() || Spell.isSpellKnown("Wither")) return false;
-        
-        const target = this.getCurrentTarget();
-        if (!target) return false;
-        
-        const pyrogenics = target.getAuraByMe("Pyrogenics");
-        const pyrogenicsRemains = pyrogenics ? pyrogenics.remaining : 0;
-        
-        const poolingCondition = this.getPoolingCondition();
-        
-        return Spell.isSpellKnown("Pyrogenics") && 
-               pyrogenicsRemains <= me.gcdMax && 
-               (!Spell.isSpellKnown("Rain of Chaos") || 
-                Spell.getCooldown("Summon Infernal").timeleft >= me.gcdMax * 3) && 
-               poolingCondition;
-      }),
-      
-      // Rain of Fire for 2T when appropriate
-      Spell.cast("Rain of Fire", () => {
-        return this.shouldDoRoF2T() && 
-               this.getPoolingCondition() && 
-               (Spell.getCooldown("Summon Infernal").timeleft >= me.gcdMax * 3 || 
-                !Spell.isSpellKnown("Rain of Chaos"));
-      }),
-      
-      // Soul Fire with Mayhem
-      Spell.cast("Soul Fire", () => {
-        return Spell.isSpellKnown("Soul Fire") && 
-               me.soul_shard <= 4 && 
-               Spell.isSpellKnown("Mayhem");
-      }),
-      
-      // Chaos Bolt when appropriate
-      Spell.cast("Chaos Bolt", () => {
-        if (this.shouldDisableCB2T()) return false;
-        
-        const poolingCondition = this.getPoolingConditionCB();
-        
-        return poolingCondition && 
-               (Spell.getCooldown("Summon Infernal").timeleft >= me.gcdMax * 3 || 
-                me.soul_shard > 4 || 
-                !Spell.isSpellKnown("Rain of Chaos"));
-      }),
-      
-      // Channel Demonfire
-      Spell.cast("Channel Demonfire"),
-      
-      // Dimensional Rift
-      Spell.cast("Dimensional Rift"),
-      
-      // Infernal Bolt
-      Spell.cast("Infernal Bolt"),
-      
-      // Conflagrate to avoid capping charges
-      Spell.cast("Conflagrate", () => {
-        const charges = Spell.getCharges("Conflagrate");
-        const maxCharges = Spell.getSpell("Conflagrate").charges?.maxCharges || 0;
-        
-        return charges > (maxCharges - 1) || this.getFightRemains() < me.gcdMax * charges;
-      }),
-      
-      // Incinerate as filler
-      Spell.cast("Incinerate")
-    );
-  }
-
-  /**
-   * Havoc-specific rotation
-   */
-  havocRotation() {
-    return new bt.Decorator(
-      () => this.isHavocActive() && this.getHavocRemains() > me.gcdMax,
-      new bt.Selector("Havoc Rotation",
-        // Conflagrate for Backdraft generation
-        Spell.cast("Conflagrate", () => {
-          return Spell.isSpellKnown("Backdraft") && 
-                 !me.hasAura("Backdraft") && 
-                 me.soul_shard >= 1 && 
-                 me.soul_shard <= 4;
-        }),
-        
-        // Soul Fire if it will complete during Havoc
-        Spell.cast("Soul Fire", () => {
-          if (!Spell.isSpellKnown("Soul Fire")) return false;
-          
-          const castTime = Spell.getSpell("Soul Fire").castTime;
-          
-          return castTime < this.getHavocRemains() && me.soul_shard < 2.5;
-        }),
-        
-        // Cataclysm for mass AoE
-        Spell.cast("Cataclysm", () => {
-          if (!Spell.isSpellKnown("Cataclysm")) return false;
-          
-          // Check if we have Wither and it needs refreshing
-          if (Spell.isSpellKnown("Wither")) {
-            const target = this.getCurrentTarget();
-            if (target) {
-              const wither = target.getAuraByMe("Wither");
-              if (wither && wither.remains < wither.duration * 0.3) {
-                return true;
-              }
-            }
-          }
-          
-          return true;
-        }),
-        
-        // DoT maintenance with Havoc priority checks
-        Spell.cast("Immolate", () => {
-          // Find best target for Immolate during Havoc
-          let bestTarget = null;
-          let lowestRemaining = 99999;
-          
-          combat.targets.forEach(target => {
-            const immolate = target.getAuraByMe("Immolate");
-            const immolateRemains = immolate ? immolate.remaining : 0;
-            const hasHavoc = target.hasAuraByMe("Havoc");
-            
-            // Calculate havoc_immo_time calculation from APL
-            const havocImmoTime = hasHavoc ? immolateRemains : 0;
-            
-            if ((!immolate || immolate.refreshable) && havocImmoTime < 5400 && target.timeToDeath() > 5) {
-              if (immolateRemains < lowestRemaining) {
-                lowestRemaining = immolateRemains;
-                bestTarget = target;
-              }
-            } else if ((immolateRemains < 2000 && immolateRemains < this.getHavocRemains()) || 
-                      !immolate || havocImmoTime < 2000) {
-              if (target.timeToDeath() > 11 && me.soul_shard < 4.5) {
-                if (immolateRemains < lowestRemaining) {
-                  lowestRemaining = immolateRemains;
-                  bestTarget = target;
-                }
-              }
-            }
-          });
-          
-          return bestTarget !== null;
-        }),
-        
-        // Wither maintenance with similar logic
-        Spell.cast("Wither", () => {
-          if (!Spell.isSpellKnown("Wither")) return false;
-          
-          // Find best target for Wither during Havoc
-          let bestTarget = null;
-          let lowestRemaining = 99999;
-          
-          combat.targets.forEach(target => {
-            const wither = target.getAuraByMe("Wither");
-            const witherRemains = wither ? wither.remaining : 0;
-            const hasHavoc = target.hasAuraByMe("Havoc");
-            
-            // Calculate havoc_immo_time calculation from APL
-            const havocImmoTime = hasHavoc ? witherRemains : 0;
-            
-            if ((!wither || wither.refreshable) && havocImmoTime < 5400 && target.timeToDeath() > 5) {
-              if (witherRemains < lowestRemaining) {
-                lowestRemaining = witherRemains;
-                bestTarget = target;
-              }
-            } else if ((witherRemains < 2000 && witherRemains < this.getHavocRemains()) || 
-                      !wither || havocImmoTime < 2000) {
-              if (target.timeToDeath() > 11 && me.soul_shard < 4.5) {
-                if (witherRemains < lowestRemaining) {
-                  lowestRemaining = witherRemains;
-                  bestTarget = target;
-                }
-              }
-            }
-          });
-          
-          return bestTarget !== null;
-        }),
-        
-        // Shadowburn during Havoc
-        Spell.cast("Shadowburn", () => {
-          if (!Spell.isSpellKnown("Shadowburn")) return false;
-          
-          // Check for the conditions in APL
-          if (this.getEnemyCount() <= 4) {
-            const cooldown = Spell.getCooldown("Shadowburn");
-            const target = this.getCurrentTarget();
-            if (!target) return false;
-            
-            const eradication = target.getAuraByMe("Eradication");
-            const eradicationRemains = eradication ? eradication.remaining : 0;
-            
-            const hasConflagrationOfChaos = Spell.isSpellKnown("Conflagration of Chaos");
-            const hasBlisteringAtrophy = Spell.isSpellKnown("Blistering Atrophy");
-            const hasDiabolicRitual = Spell.isSpellKnown("Diabolic Ritual");
-            
-            // Main condition from APL
-            const condition = (cooldown.fullRechargeTime <= me.gcdMax * 3 || 
-                              (eradicationRemains <= me.gcdMax && 
-                               Spell.isSpellKnown("Eradication") && 
-                               !this.isActionInFlight("Chaos Bolt") && 
-                               !hasDiabolicRitual)) && 
-                              (hasConflagrationOfChaos || hasBlisteringAtrophy);
-            
-            // Also cast if Havoc is about to fade
-            const havocEndingSoon = this.getHavocRemains() <= me.gcdMax * 3;
-            
-            return condition || havocEndingSoon;
-          }
-          
-          return false;
-        }),
-        
-        // Chaos Bolt during Havoc with target count checks
-        Spell.cast("Chaos Bolt", () => {
-          const castTime = Spell.getSpell("Chaos Bolt").castTime;
-          if (castTime >= this.getHavocRemains()) return false;
-          
-          // Check enemy count conditions from APL
-          if (!Spell.isSpellKnown("Improved Chaos Bolt") && this.getEnemyCount() <= 2) {
-            return true;
-          } else if (Spell.isSpellKnown("Improved Chaos Bolt")) {
-            if (Spell.isSpellKnown("Wither") && Spell.isSpellKnown("Inferno") && this.getEnemyCount() <= 2) {
-              return true;
-            } else if ((Spell.isSpellKnown("Wither") && Spell.isSpellKnown("Cataclysm")) || 
-                       (!Spell.isSpellKnown("Wither") && Spell.isSpellKnown("Inferno"))) {
-              return this.getEnemyCount() <= 3;
-            } else if (!Spell.isSpellKnown("Wither") && Spell.isSpellKnown("Cataclysm")) {
-              return this.getEnemyCount() <= 5;
-            }
-          }
-          
-          return false;
-        }),
-        
-        // Rain of Fire for 3+ targets during Havoc
-        Spell.cast("Rain of Fire", () => this.getEnemyCount() >= 3),
-        
-        // Channel Demonfire during Havoc
-        Spell.cast("Channel Demonfire", () => me.soul_shard < 4.5),
-        
-        // Conflagrate if not using Backdraft
-        Spell.cast("Conflagrate", () => !Spell.isSpellKnown("Backdraft")),
-        
-        // Dimensional Rift
-        Spell.cast("Dimensional Rift", () => {
-          return me.soul_shard < 4.7 && 
-                 (Spell.getCharges("Dimensional Rift") > 2 || 
-                  this.getFightRemains() < Spell.getCooldown("Dimensional Rift").duration);
-        }),
-        
-        // Incinerate as filler during Havoc
-        Spell.cast("Incinerate", () => {
-          const castTime = Spell.getSpell("Incinerate").castTime;
-          return castTime < this.getHavocRemains();
-        })
-      ),
-      "Active Havoc Handler"
-    );
-  }
-
-  /**
-   * Use trinkets and on-use items
-   */
-  useItems() {
-    return new bt.Selector("Use Items",
-      // Spymaster's Web with specific conditions
-      Common.useEquippedItemByName("Spymaster's Web", () => {
-        const infernalRemains = this.getInfernalRemains();
-        const hasSpymastersReport = me.getAura("Spymaster's Report");
-        const spymastersStack = hasSpymastersReport ? hasSpymastersReport.stacks : 0;
-        
-        return (infernalRemains >= 10000 && 
-                infernalRemains <= 20000 && 
-                spymastersStack >= 38 && 
-                (this.getFightRemains() > 240000 || this.getFightRemains() <= 140000)) || 
-               this.getFightRemains() <= 30000;
-      }),
-      
-      // Handle trinket slot 1
-      Common.useEquippedItemByName("Trinket1", () => {
-        if (!Settings.UseTrinkets) return false;
-        
-        // For simplified implementation, use with Infernal if talented
-        return me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal");
-      }),
-      
-      // Handle trinket slot 2
-      Common.useEquippedItemByName("Trinket2", () => {
-        if (!Settings.UseTrinkets) return false;
-        
-        // For simplified implementation, use with Infernal if talented
-        return me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal");
-      })
-    );
-  }
-
-  /**
-   * Use potion and racial abilities
-   */
-  useOGCDs() {
-    return new bt.Selector("Use OGCDs",
-      // Potion with Infernal
-      new bt.Action(() => {
-        // Would use potion here if implemented
-        return bt.Status.Failure;
-      }),
-      
-      // Racials if enabled
-      new bt.Decorator(
-        () => Settings.UseRacials,
-        new bt.Selector(
-          Spell.cast("Berserking", () => me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal")),
-          Spell.cast("Blood Fury", () => me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal")),
-          Spell.cast("Fireblood", () => me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal")),
-          Spell.cast("Ancestral Call", () => me.hasAura("Infernal") || !Spell.isSpellKnown("Summon Infernal"))
-        ),
-        "Use Racial Abilities"
-      )
-    );
-  }
-
-  /**
-   * Helper function to get the current target, preferring player's target if valid
-   * @returns {CGUnit} The current target or null if none
-   */
+  // ===== Per-Tick Caching =====
   getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
     const target = me.target;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 40 && me.isFacing(target)) {
+      this._cachedTarget = target;
       return target;
     }
-    return combat.bestTarget;
+    const t = combat.bestTarget || (combat.targets && combat.targets[0]) || null;
+    this._cachedTarget = (t && me.isFacing(t)) ? t : null;
+    return this._cachedTarget;
   }
 
-  /**
-   * Helper to check if an action is in flight to a target
-   * @param {string} spellName - The name of the spell to check
-   * @param {CGUnit} [target] - Optional target to check against
-   * @returns {boolean} Whether the action is in flight
-   */
-  isActionInFlight(spellName, target = null) {
-    // This is a simplified implementation since we don't have direct access to in_flight tracking
-    // In a real implementation, we would check if the spell is being cast or in flight
+  getShards() {
+    if (this._shardFrame === wow.frameTime) return this._cachedShards;
+    this._shardFrame = wow.frameTime;
+    this._cachedShards = me.powerByType(PowerType.SoulShards);
+    return this._cachedShards;
+  }
+
+  getBackdraftStacks() {
+    if (this._bdFrame === wow.frameTime) return this._cachedBackdraft;
+    this._bdFrame = wow.frameTime;
+    const aura = me.getAura(A.backdraft);
+    this._cachedBackdraft = aura ? aura.stacks : 0;
+    return this._cachedBackdraft;
+  }
+
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const target = this.getCurrentTarget();
+    this._cachedEnemyCount = target ? target.getUnitsAroundCount(10) + 1 : 1;
+    return this._cachedEnemyCount;
+  }
+
+  // SimC: variable.ritual_length = sum of ritual buff remains
+  getRitualLength() {
+    if (this._ritualFrame === wow.frameTime) return this._cachedRitualLength;
+    this._ritualFrame = wow.frameTime;
+    let total = 0;
+    const r1 = me.getAura(A.ritualOverlord);
+    const r2 = me.getAura(A.ritualMotherChaos);
+    const r3 = me.getAura(A.ritualPitLord);
+    if (r1) total += r1.remaining;
+    if (r2) total += r2.remaining;
+    if (r3) total += r3.remaining;
+    this._cachedRitualLength = total;
+    return total;
+  }
+
+  // SimC: variable.infernal_active = pet.infernal.active|(cooldown.summon_infernal.duration-cooldown.summon_infernal.remains)<20
+  isInfernalActive() {
+    if (this._infFrame === wow.frameTime) return this._cachedInfernalActive;
+    this._infFrame = wow.frameTime;
+    // Method 1: pet was recently summoned (30s duration)
+    const timeSince = spell.getTimeSinceLastCast(S.summonInfernal);
+    if (timeSince < 30000) {
+      this._cachedInfernalActive = true;
+      return true;
+    }
+    // Method 2: SimC (cd_duration - cd_remains) < 20 — i.e. we recently used it
+    const cd = spell.getCooldown(S.summonInfernal);
+    if (cd && cd.duration > 0) {
+      const elapsed = cd.duration - cd.timeleft;
+      if (elapsed < 20000) {
+        this._cachedInfernalActive = true;
+        return true;
+      }
+    }
+    this._cachedInfernalActive = false;
     return false;
   }
 
-  /**
-   * Helper to get the remaining time on Havoc
-   * @returns {number} The remaining time on Havoc in milliseconds
-   */
-  getHavocRemains() {
-    // Find a target with Havoc
-    let havocRemains = 0;
-    
-    combat.targets.forEach(target => {
-      const havoc = target.getAuraByMe("Havoc");
-      if (havoc && havoc.remaining > havocRemains) {
-        havocRemains = havoc.remaining;
-      }
-    });
-    
-    return havocRemains;
+  // ===== Helpers =====
+  targetTTD() {
+    const target = this.getCurrentTarget();
+    if (!target || !target.timeToDeath) return 99999;
+    return target.timeToDeath();
   }
 
-  /**
-   * Check if Havoc is currently active on any target
-   * @returns {boolean} Whether Havoc is active
-   */
-  isHavocActive() {
-    return this.getHavocRemains() > 0;
+  hasDemonicArt() {
+    return me.hasAura(A.artOverlord) || me.hasAura(A.artMotherChaos) || me.hasAura(A.artPitLord);
   }
 
-  /**
-   * Get the number of valid enemies in range for AoE abilities
-   * @param {number} [range=10] - The range to check for enemies (default is 10 yards for most AoE)
-   * @returns {number} The number of valid enemies in range
-   */
-  getEnemyCount(range = 10) {
-    // For Rain of Fire and other AoE spells, we typically want a smaller range
-    let count = 0;
-    const currentTarget = this.getCurrentTarget();
-    
-    if (!currentTarget) return 0;
-    
-    // Count enemies around the current target within range
-    combat.targets.forEach(target => {
-      if (target && !target.deadOrGhost && me.canAttack(target)) {
-        // Check if the target is within range of the current target
-        if (currentTarget.distanceTo(target) <= range) {
-          count++;
-        }
-      }
-    });
-    
-    // Debug log the enemy count for troubleshooting
-    if (count > 1) {
-      console.info(`AoE Detection: Found ${count} enemies within ${range} yards of target`);
+  hasRuinationProc() {
+    return me.hasAura(A.artPitLord) || me.hasAura(A.ruinationProc);
+  }
+
+  hasInfernalBoltProc() {
+    return me.hasAura(A.artMotherChaos) || me.hasAura(A.infernalBoltProc);
+  }
+
+  getDoTId() {
+    return this.isHellcaller() ? A.witherDebuff : A.immolate;
+  }
+
+  getDoTCastId() {
+    return this.isHellcaller() ? S.wither : S.immolate;
+  }
+
+  // DoT remaining on target
+  getDoTRemaining(target) {
+    if (!target) target = this.getCurrentTarget();
+    if (!target) return 0;
+    const debuff = target.getAuraByMe(this.getDoTId());
+    return debuff ? debuff.remaining : 0;
+  }
+
+  // SimC: refreshable with Internal Combustion awareness
+  // (dot.X.remains - 5*(chaos_bolt.in_flight & talent.internal_combustion)) < dot.X.duration*0.3
+  // Also: (dot.X.remains - CB.execute_time) < 5 & talent.internal_combustion & CB.usable
+  isDoTRefreshable(target) {
+    if (!target) target = this.getCurrentTarget();
+    if (!target) return false;
+    if (this.targetTTD() < 8000) return false;
+    const dotId = this.getDoTId();
+    const debuff = target.getAuraByMe(dotId);
+    if (!debuff) return true;
+    let remains = debuff.remaining;
+    // Internal Combustion: CB in flight consumes 5s of DoT
+    if (spell.isSpellKnown(A.internalCombustion)) {
+      const cbTimeSince = spell.getTimeSinceLastCast(S.chaosBolt);
+      if (cbTimeSince < 2000) remains -= 5000; // CB recently cast, likely in flight
     }
-    
-    return count;
+    if (remains < debuff.duration * 0.3) return true;
+    // Also: if IC talented and CB usable, check if remains-execute_time < 5s
+    if (spell.isSpellKnown(A.internalCombustion) && !spell.isOnCooldown(S.chaosBolt) && this.getShards() >= 2) {
+      if ((remains - 2500) < 5000) return true; // CB execute time ~2.5s
+    }
+    return false;
   }
 
-  /**
-   * Get the count of active DoTs of the specified type
-   * @param {string} dotName - The name of the DoT to check
-   * @returns {number} The number of targets with the DoT active
-   */
-  getActiveDotCount(dotName) {
+  // Soul Fire / Cataclysm gating for DoT refresh
+  // !talent.soul_fire | cooldown.soul_fire.remains + cast_time > dot.remains - 5*IC
+  shouldNotWaitForSoulFire(target) {
+    if (!spell.isSpellKnown(S.soulFire)) return true;
+    const sfCD = spell.getCooldown(S.soulFire);
+    const sfRemains = sfCD ? sfCD.timeleft : 0;
+    const dotRemains = this.getDoTRemaining(target);
+    const icAdj = spell.isSpellKnown(A.internalCombustion) ? 5000 : 0;
+    return (sfRemains + 2000) > (dotRemains - icAdj);
+  }
+
+  shouldNotWaitForCataclysm(target) {
+    if (!spell.isSpellKnown(S.cataclysm)) return true;
+    const catCD = spell.getCooldown(S.cataclysm);
+    const catRemains = catCD ? catCD.timeleft : 0;
+    const dotRemains = this.getDoTRemaining(target);
+    return (catRemains + 1500) > dotRemains;
+  }
+
+  // Active DoT count for multi-target spread
+  getActiveDoTCount() {
+    if (!combat.targets) return 0;
     let count = 0;
-    
-    combat.targets.forEach(target => {
-      if (target.getAuraByMe(dotName)) {
-        count++;
-      }
-    });
-    
+    const dotId = this.getDoTId();
+    for (let i = 0; i < combat.targets.length; i++) {
+      const unit = combat.targets[i];
+      if (unit && common.validTarget(unit) && unit.hasAuraByMe(dotId)) count++;
+    }
     return count;
   }
 
-  /**
-   * Get the best target for applying a DoT
-   * @param {string} dotName - The name of the DoT to check
-   * @returns {CGUnit|null} The best target or null if none found
-   */
-  getBestDotTarget(dotName) {
+  // Havoc target: secondary target with longest DoT remaining, not current target
+  getHavocTarget() {
+    if (!combat.targets) return null;
+    const currentTarget = this.getCurrentTarget();
     let bestTarget = null;
-    let lowestRemaining = 99999;
-    
-    combat.targets.forEach(target => {
-      const dot = target.getAuraByMe(dotName);
-      const dotRemains = dot ? dot.remaining : 0;
-      const hasHavoc = target.hasAuraByMe("Havoc");
-      
-      // Prioritize targets without the DoT or with low remaining time
-      // And give higher priority to Havoc targets
-      if ((!dot || dot.refreshable) && target.timeToDeath() > 15) {
-        if (hasHavoc) {
-          if (bestTarget === null || dotRemains < lowestRemaining) {
-            bestTarget = target;
-            lowestRemaining = dotRemains;
-          }
-        } else if (!bestTarget || (bestTarget && !bestTarget.hasAuraByMe("Havoc") && dotRemains < lowestRemaining)) {
-          bestTarget = target;
-          lowestRemaining = dotRemains;
-        }
+    let bestScore = -999999;
+    for (let i = 0; i < combat.targets.length; i++) {
+      const unit = combat.targets[i];
+      if (!unit || !common.validTarget(unit) || me.distanceTo(unit) > 40) continue;
+      if (unit === currentTarget) continue;
+      if (unit.timeToDeath && unit.timeToDeath() < 8000) continue;
+      // SimC: target_if=min:((-target.time_to_die)<?-15)+dot.X.remains+99*(self.target=target)
+      const ttd = unit.timeToDeath ? unit.timeToDeath() : 99999;
+      const dotRem = this.getDoTRemaining(unit);
+      const score = Math.min(-ttd, -15000) + dotRem;
+      if (score > bestScore || !bestTarget) {
+        bestTarget = unit;
+        bestScore = score;
       }
-    });
-    
+    }
     return bestTarget;
   }
 
-  /**
-   * Get the remaining time on Infernal
-   * @returns {number} The remaining time on Infernal in milliseconds
-   */
-  getInfernalRemains() {
-    const infernal = me.getAura("Infernal");
-    return infernal ? infernal.remaining : 0;
-  }
-
-  /**
-   * Check if we should pool soul shards
-   * @returns {boolean} Whether to pool soul shards
-   */
-  getPoolingCondition() {
-    // From SIMC: variable,name=pooling_condition,value=(soul_shard>=3|(talent.secrets_of_the_coven&buff.infernal_bolt.up|buff.decimation.up)&soul_shard>=3)
-    return me.soul_shard >= 3 || 
-           ((Spell.isSpellKnown("Secrets of the Coven") && me.hasAura("Infernal Bolt")) || 
-            me.hasAura("Decimation")) && me.soul_shard >= 3;
-  }
-
-  /**
-   * Check if we should pool soul shards for Chaos Bolt
-   * @returns {boolean} Whether to pool soul shards for CB
-   */
-  getPoolingConditionCB() {
-    // From SIMC: variable,name=pooling_condition_cb,value=variable.pooling_condition|pet.infernal.active&soul_shard>=3
-    return this.getPoolingCondition() || (me.hasAura("Infernal") && me.soul_shard >= 3);
-  }
-
-  /**
-   * Check if we are in cleave mode
-   * @returns {boolean} Whether cleave mode is active
-   */
-  isCleaveModeActive() {
-    // This is a placeholder for the cleave_apl variable in SIMC
-    // In a real implementation, this would check the variable or setting
+  // Is havoc active on any target?
+  isHavocActive() {
+    if (!combat.targets) return false;
+    for (let i = 0; i < combat.targets.length; i++) {
+      const unit = combat.targets[i];
+      if (unit && unit.hasAuraByMe(A.havoc)) return true;
+    }
     return false;
   }
 
-  /**
-   * Check if we should use Rain of Fire for 2 targets
-   * @returns {boolean} Whether to use RoF for 2T
-   */
-  allowRoF2TSpender() {
-    return Settings.AllowRoF2TSpender || true;
-  }
-
-  /**
-   * Check if we should disable Chaos Bolt for 2 targets
-   * @returns {boolean} Whether to disable CB for 2T
-   */
-  shouldDisableCB2T() {
-    return Settings.DisableCB2T || this.shouldDoRoF2T();
-  }
-
-  /**
-   * Check if should use Rain of Fire for 2 targets
-   * @returns {boolean} Whether to use RoF for 2T
-   */
-  shouldDoRoF2T() {
-    // Log a detailed message showing what's influencing the decision
-    const allowRoF = this.allowRoF2TSpender();
-    const hasCataclysm = Spell.isSpellKnown("Cataclysm");
-    const hasImprovedChaosBolt = Spell.isSpellKnown("Improved Chaos Bolt");
-    
-    const shouldUseRoF = allowRoF > 1.99 && !(hasCataclysm && hasImprovedChaosBolt);
-    
-    console.info(`Rain of Fire 2T Decision: allowRoF=${allowRoF}, hasCataclysm=${hasCataclysm}, hasImprovedCB=${hasImprovedChaosBolt}, decision=${shouldUseRoF}`);
-    
-    return shouldUseRoF;
-  }
-
-  /**
-   * Get the estimated remaining time in the fight
-   * @returns {number} The estimated fight remaining time in milliseconds
-   */
-  getFightRemains() {
-    // This is a simplified implementation
-    // In a real implementation, this would estimate based on boss health or other factors
-    return 999999;
-  }
-
-  /**
-   * Improved helper specifically for Rain of Fire decisions
-   * @returns {boolean} Whether to use Rain of Fire
-   */
-shouldUseRainOfFire() {
-    const enemyCount = this.getEnemyCount(8); // Standard AoE radius
-    
-    if (enemyCount >= 3) {
-      return true;
-    } else if (enemyCount === 2) {
-      return this.shouldDoRoF2T();
+  // Conflagrate target for DoT spread (target with most DoT remaining that has refreshable targets nearby)
+  getConflagSpreadTarget() {
+    if (!combat.targets) return this.getCurrentTarget();
+    const dotId = this.getDoTId();
+    let bestTarget = null;
+    let bestRemains = -1;
+    for (let i = 0; i < combat.targets.length; i++) {
+      const unit = combat.targets[i];
+      if (!unit || !common.validTarget(unit) || me.distanceTo(unit) > 40) continue;
+      if (unit.hasAuraByMe(A.havoc)) continue; // skip havoc targets
+      const debuff = unit.getAuraByMe(dotId);
+      const rem = debuff ? debuff.remaining : 0;
+      if (rem > bestRemains) {
+        bestTarget = unit;
+        bestRemains = rem;
+      }
     }
-    
-    return false;
-  }  /**
-   * Additional helper to improve AoE detection in Chaos Bolt vs. Rain of Fire decisions
-   * @param {number} [range=8] - The range to check for enemies
-   * @returns {boolean} Whether to use AoE abilities
-   */
-  shouldUseAoE(range = 8) {
-    const enemyCount = this.getEnemyCount(range);
-    
-    // Log decision for debugging
-    if (enemyCount > 1) {
-      console.info(`AoE Decision: ${enemyCount} enemies found, using ${enemyCount >= 3 ? 'AoE' : (enemyCount === 2 ? 'Cleave' : 'ST')} rotation`);
+    return bestTarget;
+  }
+
+  // Number of refreshable DoTs (for Conflag spread gating)
+  getRefreshableDoTCount() {
+    if (!combat.targets) return 0;
+    let count = 0;
+    const dotId = this.getDoTId();
+    for (let i = 0; i < combat.targets.length; i++) {
+      const unit = combat.targets[i];
+      if (!unit || !common.validTarget(unit) || me.distanceTo(unit) > 40) continue;
+      const debuff = unit.getAuraByMe(dotId);
+      if (!debuff || debuff.remaining < debuff.duration * 0.3) count++;
     }
-    
-    return enemyCount >= 3;
+    return count;
+  }
+
+  // ===== BUILD =====
+  build() {
+    return new bt.Selector(
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // OOC: Summon pet (if not using Grimoire of Sacrifice)
+      spell.cast(S.summonPet, () => me, () => {
+        return (!me.pet || me.pet.deadOrGhost) && !spell.isSpellKnown(S.grimoireOfSac);
+      }),
+
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Dead target → auto-pick
+      new bt.Action(() => {
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const newTarget = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (newTarget) wow.GameUI.setTarget(newTarget);
+        }
+        return bt.Status.Failure;
+      }),
+
+      // Null target bail
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+
+      common.waitForCastOrChannel(),
+
+      // Version + debug
+      new bt.Action(() => {
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          const hero = this.isHellcaller() ? 'Hellcaller' : 'Diabolist';
+          console.info(`[DestroLock] Midnight 12.0.1 | Hero: ${hero}`);
+        }
+        if (Settings.FWDestDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[DestroLock] Shards:${this.getShards()} BD:${this.getBackdraftStacks()} Inf:${this.isInfernalActive()} Ritual:${this.getRitualLength()} Enemies:${this.getEnemyCount()}`);
+        }
+        return bt.Status.Failure;
+      }),
+
+      // GCD gate
+      new bt.Decorator(
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          // Interrupt
+          spell.interrupt(S.spellLock),
+
+          // Defensives
+          this.defensives(),
+
+          // Movement block
+          this.movementRotation(),
+
+          // SimC: ogcd (racials + Berserking during Infernal)
+          this.ogcd(),
+
+          // AoE routing: 2+ targets → aoe_hc or aoe_dia
+          new bt.Decorator(
+            () => this.getEnemyCount() >= 2 && this.isHellcaller(),
+            this.aoeHellcaller()
+          ),
+          new bt.Decorator(
+            () => this.getEnemyCount() >= 2 && this.isDiabolist(),
+            this.aoeDiabolist()
+          ),
+
+          // ST rotation
+          this.stRotation(),
+        )
+      ),
+    );
+  }
+
+  // ===== DEFENSIVES =====
+  defensives() {
+    return new bt.Selector(
+      spell.cast(S.unendingResolve, () => me, () => {
+        return Settings.FWDestUnending && me.effectiveHealthPercent < Settings.FWDestUnendingHP;
+      }),
+      spell.cast(S.darkPact, () => me, () => {
+        return Settings.FWDestDarkPact && me.effectiveHealthPercent < Settings.FWDestDarkPactHP;
+      }),
+    );
+  }
+
+  // ===== MOVEMENT =====
+  movementRotation() {
+    return new bt.Decorator(
+      () => me.isMoving(),
+      new bt.Selector(
+        // Wither (instant — Hellcaller)
+        spell.cast(S.wither, () => this.getCurrentTarget(), () => {
+          return this.isHellcaller() && this.getCurrentTarget() !== null &&
+            this.isDoTRefreshable();
+        }),
+        // Conflagrate (instant, 2+ charges)
+        spell.cast(S.conflagrate, () => this.getCurrentTarget(), () => {
+          return this.getCurrentTarget() !== null && this.getShards() < 4.5;
+        }),
+        // Shadowburn (instant)
+        spell.cast(S.shadowburn, () => this.getCurrentTarget(), () => {
+          const target = this.getCurrentTarget();
+          if (!target) return false;
+          return me.hasAura(A.fiendishCruelty) || target.effectiveHealthPercent < 20;
+        }),
+        // Dimensional Rift (instant, 3 charges)
+        spell.cast(S.dimensionalRift, () => this.getCurrentTarget(), () => {
+          return this.getCurrentTarget() !== null;
+        }),
+        // Infernal Bolt (Diabolist, instant)
+        spell.cast(S.infernalBolt, () => this.getCurrentTarget(), () => {
+          return this.isDiabolist() && this.getCurrentTarget() !== null;
+        }),
+        // Ruination (Diabolist, instant)
+        spell.cast(S.ruination, () => this.getCurrentTarget(), () => {
+          return this.isDiabolist() && this.getCurrentTarget() !== null;
+        }),
+        // Summon Infernal (off-GCD / instant)
+        spell.cast(S.summonInfernal, () => me, () => {
+          return Settings.FWDestUseCDs && this.targetTTD() > 15000;
+        }),
+        // Malevolence (instant, Hellcaller)
+        spell.cast(S.malevolence, () => me, () => {
+          return this.isHellcaller() && Settings.FWDestUseCDs;
+        }),
+        // Block cast-time spells
+        new bt.Action(() => bt.Status.Success),
+      ),
+      new bt.Action(() => bt.Status.Failure)
+    );
+  }
+
+  // ===== SimC: actions.ogcd =====
+  ogcd() {
+    return new bt.Selector(
+      // SimC: berserking,if=variable.infernal_active|!talent.summon_infernal|(fight_remains<(cooldown.summon_infernal.remains_expected+cooldown.berserking.duration)&(fight_remains>cooldown.berserking.duration))|fight_remains<cooldown.summon_infernal.remains_expected
+      spell.cast(S.berserking, () => me, () => {
+        if (this.isInfernalActive()) return true;
+        if (!spell.isSpellKnown(S.summonInfernal)) return true;
+        const infCD = spell.getCooldown(S.summonInfernal);
+        const infRemains = infCD ? infCD.timeleft : 0;
+        const berskDur = 10000;
+        const ttd = this.targetTTD();
+        // fight_remains<(infernal_cd+berserking_dur)&fight_remains>berserking_dur
+        if (ttd < (infRemains + berskDur) && ttd > berskDur) return true;
+        // fight_remains<infernal_cd
+        if (ttd < infRemains) return true;
+        return false;
+      }),
+    );
+  }
+
+  // ===== ST ROTATION (SimC: actions — 14 lines) =====
+  stRotation() {
+    return new bt.Selector(
+      // 1. soul_fire,if=soul_shard<=4
+      spell.cast(S.soulFire, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null && this.getShards() <= 4;
+      }),
+
+      // 2. chaos_bolt,if=talent.diabolic_ritual&(demonic_art|(variable.ritual_length<action.chaos_bolt.execute_time))&target.health.pct>20
+      spell.cast(S.chaosBolt, () => this.getCurrentTarget(), () => {
+        if (!this.isDiabolist()) return false;
+        const target = this.getCurrentTarget();
+        if (!target || target.effectiveHealthPercent <= 20) return false;
+        if (this.hasDemonicArt()) return true;
+        const ritualLen = this.getRitualLength();
+        return ritualLen > 0 && ritualLen < 2500; // < CB execute time ~2.5s
+      }),
+
+      // 3. conflagrate,if=soul_shard<=4.2&buff.backdraft.stack<1
+      spell.cast(S.conflagrate, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null &&
+          this.getShards() <= 4.2 && this.getBackdraftStacks() < 1;
+      }),
+
+      // 4. summon_infernal (self-cast, unconditional in SimC)
+      spell.cast(S.summonInfernal, () => me, () => {
+        return Settings.FWDestUseCDs && this.targetTTD() > 15000;
+      }),
+
+      // 5. malevolence
+      spell.cast(S.malevolence, () => me, () => {
+        return this.isHellcaller() && Settings.FWDestUseCDs &&
+          me.inCombat() && this.targetTTD() > 10000;
+      }),
+
+      // 6. incinerate,if=buff.chaotic_inferno_buff.up&soul_shard<=4.6
+      spell.cast(S.incinerate, () => this.getCurrentTarget(), () => {
+        return me.hasAura(A.chaoticInferno) && this.getShards() <= 4.6 &&
+          this.getCurrentTarget() !== null;
+      }),
+
+      // 7. shadowburn,if=((!demonic_art&(variable.ritual_length>2|talent.wither))|target.health.pct<=20)
+      //    &(buff.fiendish_cruelty.up|talent.conflagration_of_chaos)
+      //    &(!talent.wither|soul_shard>=4|buff.malevolence.up|pet.infernal.active|fight_remains<=15)
+      spell.cast(S.shadowburn, () => this.getCurrentTarget(), () => {
+        const target = this.getCurrentTarget();
+        if (!target) return false;
+        // First condition: (!demonic_art & (ritual>2 | wither)) | hp<=20
+        const cond1 = (!this.hasDemonicArt() && (this.getRitualLength() > 2000 || this.isHellcaller())) ||
+          target.effectiveHealthPercent <= 20;
+        if (!cond1) return false;
+        // Second condition: fiendish_cruelty or conflag_of_chaos talented
+        if (!me.hasAura(A.fiendishCruelty) && !spell.isSpellKnown(A.conflagOfChaos)) return false;
+        // Third condition: !wither | shards>=4 | malevolence | infernal | fight<=15
+        if (this.isHellcaller()) {
+          return this.getShards() >= 4 || me.hasAura(A.malevolence) ||
+            this.isInfernalActive() || this.targetTTD() <= 15000;
+        }
+        return true;
+      }),
+
+      // 8. wither (Hellcaller DoT refresh with IC awareness + Soul Fire/Cataclysm gating)
+      spell.cast(S.wither, () => this.getCurrentTarget(), () => {
+        if (!this.isHellcaller()) return false;
+        const target = this.getCurrentTarget();
+        if (!target) return false;
+        if (!this.isDoTRefreshable(target)) return false;
+        if (!this.shouldNotWaitForSoulFire(target)) return false;
+        if (!this.shouldNotWaitForCataclysm(target)) return false;
+        return true;
+      }),
+
+      // 9. immolate (Diabolist DoT refresh with IC awareness + Soul Fire/Cataclysm gating)
+      spell.cast(S.immolate, () => this.getCurrentTarget(), () => {
+        if (this.isHellcaller()) return false;
+        const target = this.getCurrentTarget();
+        if (!target) return false;
+        if (spell.getTimeSinceLastCast(S.immolate) < 3000) return false;
+        if (!this.isDoTRefreshable(target)) return false;
+        if (!this.shouldNotWaitForSoulFire(target)) return false;
+        if (!this.shouldNotWaitForCataclysm(target)) return false;
+        return true;
+      }),
+
+      // 10. ruination (unconditional in SimC)
+      spell.cast(S.ruination, () => this.getCurrentTarget(), () => {
+        return this.isDiabolist() && this.getCurrentTarget() !== null;
+      }),
+
+      // 11. cataclysm,if=talent.lake_of_fire
+      spell.cast(S.cataclysm, () => this.getCurrentTarget(), () => {
+        return spell.isSpellKnown(A.lakeOfFire) && this.getCurrentTarget() !== null;
+      }),
+
+      // 12. chaos_bolt — Hellcaller: shards>=4|malevolence|infernal|fight<=15
+      //                  Diabolist: ritual_length>4
+      spell.cast(S.chaosBolt, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        if (this.isHellcaller()) {
+          return this.getShards() >= 4 || me.hasAura(A.malevolence) ||
+            this.isInfernalActive() || this.targetTTD() <= 15000;
+        }
+        return this.getRitualLength() > 4000;
+      }),
+
+      // 13. infernal_bolt,if=soul_shard<=3 (no proc check — normal Diabolist spell)
+      spell.cast(S.infernalBolt, () => this.getCurrentTarget(), () => {
+        return this.isDiabolist() && this.getShards() <= 3 &&
+          this.getCurrentTarget() !== null;
+      }),
+
+      // 14. channel_demonfire
+      spell.cast(S.channelDemonfire, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null && this.getDoTRemaining() > 3000;
+      }),
+
+      // 15. incinerate filler
+      spell.cast(S.incinerate, () => this.getCurrentTarget()),
+    );
+  }
+
+  // ===== AoE HELLCALLER (SimC: actions.aoe_hc — 14 lines) =====
+  aoeHellcaller() {
+    return new bt.Selector(
+      // 1. summon_infernal (self-cast)
+      spell.cast(S.summonInfernal, () => me, () => {
+        return Settings.FWDestUseCDs && this.targetTTD() > 15000;
+      }),
+
+      // 2. malevolence (self-cast)
+      spell.cast(S.malevolence, () => me, () => {
+        return Settings.FWDestUseCDs && me.inCombat();
+      }),
+
+      // 3. rain_of_fire,if=(soul_shard>=(4.0-0.1*active_dot.wither))&active_enemies>=4
+      spell.cast(S.rainOfFire, () => this.getCurrentTarget(), () => {
+        if (this.getEnemyCount() < 4) return false;
+        const threshold = 4.0 - 0.1 * this.getActiveDoTCount();
+        return this.getShards() >= threshold;
+      }),
+
+      // 4. conflagrate,target_if=max:(dot.wither.remains-99*debuff.havoc.remains),if=dot_refreshable_count.wither>0&!dot.wither.refreshable
+      spell.cast(S.conflagrate, () => this.getConflagSpreadTarget(), () => {
+        if (this.getRefreshableDoTCount() <= 0) return false;
+        const target = this.getCurrentTarget();
+        return target !== null && !this.isDoTRefreshable(target);
+      }),
+
+      // 5. shadowburn,target_if=min:(time_to_die+999*debuff.havoc.remains),if=buff.malevolence.up|buff.fiendish_cruelty.up|active_enemies<=3|
+      //    (talent.conflagration_of_chaos&((active_enemies<=5&talent.destructive_rapidity)|(active_enemies<=6&!talent.destructive_rapidity)))
+      spell.cast(S.shadowburn, () => this.getCurrentTarget(), () => {
+        if (me.hasAura(A.malevolence)) return true;
+        if (me.hasAura(A.fiendishCruelty)) return true;
+        if (this.getEnemyCount() <= 3) return true;
+        if (spell.isSpellKnown(A.conflagOfChaos)) {
+          const enemies = this.getEnemyCount();
+          if (spell.isSpellKnown(A.destructiveRapidity) && enemies <= 5) return true;
+          if (!spell.isSpellKnown(A.destructiveRapidity) && enemies <= 6) return true;
+        }
+        return false;
+      }),
+
+      // 6. cataclysm (unconditional in AoE — raid_event.adds.in>15 not trackable)
+      spell.cast(S.cataclysm, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
+      }),
+
+      // 7. havoc,target_if=...,if=(!cooldown.summon_infernal.up|!talent.summon_infernal)&target.time_to_die>8&(cooldown.malevolence.remains>15|!talent.malevolence)|time<5
+      spell.cast(S.havoc, () => this.getHavocTarget(), () => {
+        const havocTarget = this.getHavocTarget();
+        if (!havocTarget) return false;
+        // SimC: (!cooldown.summon_infernal.up|!talent.summon_infernal)
+        if (spell.isSpellKnown(S.summonInfernal) && !spell.isOnCooldown(S.summonInfernal)) return false;
+        // SimC: (cooldown.malevolence.remains>15|!talent.malevolence)
+        if (spell.isSpellKnown(S.malevolence)) {
+          const malCD = spell.getCooldown(S.malevolence);
+          const malRemains = malCD ? malCD.timeleft : 99999;
+          if (malRemains <= 15000) return false;
+        }
+        return true;
+      }),
+
+      // 8. rain_of_fire,if=active_enemies>=4 (unconditional — shard gate only)
+      spell.cast(S.rainOfFire, () => this.getCurrentTarget(), () => {
+        return this.getEnemyCount() >= 4 && this.getShards() >= 3;
+      }),
+
+      // 9. chaos_bolt,if=active_enemies<=(3+(havoc_active*!talent.destructive_rapidity))
+      spell.cast(S.chaosBolt, () => this.getCurrentTarget(), () => {
+        let maxEnemies = 3;
+        if (this.isHavocActive() && !spell.isSpellKnown(A.destructiveRapidity)) maxEnemies++;
+        return this.getEnemyCount() <= maxEnemies && this.getShards() >= 2;
+      }),
+
+      // 10. soul_fire,target_if=min:...,if=soul_shard<4&(active_enemies<=8|talent.avatar_of_destruction)
+      spell.cast(S.soulFire, () => this.getCurrentTarget(), () => {
+        if (this.getShards() >= 4) return false;
+        return this.getEnemyCount() <= 8 || spell.isSpellKnown(A.avatarOfDestruction);
+      }),
+
+      // 11. wither,target_if=min:dot.wither.remains,if=dot.wither.refreshable&(!talent.cataclysm|cooldown.cataclysm.remains>dot.wither.remains)&active_dot.wither<=active_enemies&target.time_to_die>8
+      spell.cast(S.wither, () => {
+        if (!combat.targets) return this.getCurrentTarget();
+        let bestTarget = null;
+        let bestRemains = 999999;
+        for (let i = 0; i < combat.targets.length; i++) {
+          const unit = combat.targets[i];
+          if (!unit || !common.validTarget(unit) || me.distanceTo(unit) > 40) continue;
+          if (unit.timeToDeath && unit.timeToDeath() < 8000) continue;
+          const debuff = unit.getAuraByMe(A.witherDebuff);
+          const rem = debuff ? debuff.remaining : 0;
+          if (this.isDoTRefreshable(unit) && rem < bestRemains) {
+            bestTarget = unit;
+            bestRemains = rem;
+          }
+        }
+        return bestTarget;
+      }, () => {
+        if (!this.shouldNotWaitForCataclysm()) return false;
+        return this.getActiveDoTCount() <= this.getEnemyCount();
+      }),
+
+      // 12. incinerate,if=talent.fire_and_brimstone&buff.backdraft.up
+      spell.cast(S.incinerate, () => this.getCurrentTarget(), () => {
+        return spell.isSpellKnown(A.fireAndBrimstone) && this.getBackdraftStacks() >= 1;
+      }),
+
+      // 13. conflagrate,target_if=max:(dot.wither.remains-99*debuff.havoc.remains),if=buff.backdraft.stack<2|!talent.backdraft
+      spell.cast(S.conflagrate, () => this.getConflagSpreadTarget(), () => {
+        return this.getBackdraftStacks() < 2 || !spell.isSpellKnown(A.backdraftTalent);
+      }),
+
+      // 14. incinerate filler
+      spell.cast(S.incinerate, () => this.getCurrentTarget()),
+    );
+  }
+
+  // ===== AoE DIABOLIST (SimC: actions.aoe_dia — 14 lines) =====
+  aoeDiabolist() {
+    return new bt.Selector(
+      // 1. summon_infernal (self-cast)
+      spell.cast(S.summonInfernal, () => me, () => {
+        return Settings.FWDestUseCDs && this.targetTTD() > 15000;
+      }),
+
+      // 2. chaos_bolt,if=talent.diabolic_ritual&(demonic_art|(variable.ritual_length<CB.execute_time))&target.health.pct>20&active_enemies<=4
+      spell.cast(S.chaosBolt, () => this.getCurrentTarget(), () => {
+        if (this.getEnemyCount() > 4) return false;
+        const target = this.getCurrentTarget();
+        if (!target || target.effectiveHealthPercent <= 20) return false;
+        if (this.hasDemonicArt()) return true;
+        const ritualLen = this.getRitualLength();
+        return ritualLen > 0 && ritualLen < 2500;
+      }),
+
+      // 3. rain_of_fire,if=((soul_shard>=(3.5-0.1*active_dot.immolate))|buff.alythesss_ire.up)&active_enemies>=4
+      spell.cast(S.rainOfFire, () => this.getCurrentTarget(), () => {
+        if (this.getEnemyCount() < 4) return false;
+        const threshold = 3.5 - 0.1 * this.getActiveDoTCount();
+        return this.getShards() >= threshold;
+      }),
+
+      // 4. conflagrate,target_if=max:(dot.immolate.remains-99*debuff.havoc.remains),if=dot_refreshable_count.immolate>0&!dot.immolate.refreshable
+      spell.cast(S.conflagrate, () => this.getConflagSpreadTarget(), () => {
+        if (this.getRefreshableDoTCount() <= 0) return false;
+        const target = this.getCurrentTarget();
+        return target !== null && !this.isDoTRefreshable(target);
+      }),
+
+      // 5. shadowburn,target_if=min:(time_to_die+999*debuff.havoc.remains),if=(active_enemies<=(3+buff.fiendish_cruelty.up))|
+      //    (talent.conflagration_of_chaos&active_enemies<=(6-talent.destructive_rapidity+buff.fiendish_cruelty.up))
+      spell.cast(S.shadowburn, () => this.getCurrentTarget(), () => {
+        const enemies = this.getEnemyCount();
+        const hasCruelty = me.hasAura(A.fiendishCruelty) ? 1 : 0;
+        if (enemies <= 3 + hasCruelty) return true;
+        if (spell.isSpellKnown(A.conflagOfChaos)) {
+          const drTalent = spell.isSpellKnown(A.destructiveRapidity) ? 1 : 0;
+          if (enemies <= 6 - drTalent + hasCruelty) return true;
+        }
+        return false;
+      }),
+
+      // 6. ruination (unconditional in SimC)
+      spell.cast(S.ruination, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
+      }),
+
+      // 7. cataclysm,if=raid_event.adds.in>15|talent.lake_of_fire (unconditional in AoE)
+      spell.cast(S.cataclysm, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
+      }),
+
+      // 8. havoc,target_if=...,if=(!cooldown.summon_infernal.up|!talent.summon_infernal)&target.time_to_die>8|time<5
+      spell.cast(S.havoc, () => this.getHavocTarget(), () => {
+        const havocTarget = this.getHavocTarget();
+        if (!havocTarget) return false;
+        // SimC: (!cooldown.summon_infernal.up|!talent.summon_infernal)
+        if (spell.isSpellKnown(S.summonInfernal) && !spell.isOnCooldown(S.summonInfernal)) return false;
+        return true;
+      }),
+
+      // 9. infernal_bolt,if=soul_shard<3 (no proc check)
+      spell.cast(S.infernalBolt, () => this.getCurrentTarget(), () => {
+        return this.getShards() < 3 && this.getCurrentTarget() !== null;
+      }),
+
+      // 10. chaos_bolt,if=active_enemies<=3&variable.ritual_length>4
+      spell.cast(S.chaosBolt, () => this.getCurrentTarget(), () => {
+        return this.getEnemyCount() <= 3 && this.getRitualLength() > 4000 && this.getShards() >= 2;
+      }),
+
+      // 11. soul_fire,target_if=min:...,if=soul_shard<4&(talent.avatar_of_destruction&active_enemies<=10|active_enemies<=5)
+      spell.cast(S.soulFire, () => this.getCurrentTarget(), () => {
+        if (this.getShards() >= 4) return false;
+        const enemies = this.getEnemyCount();
+        if (spell.isSpellKnown(A.avatarOfDestruction) && enemies <= 10) return true;
+        return enemies <= 5;
+      }),
+
+      // 12. immolate,target_if=min:dot.immolate.remains,if=dot.immolate.refreshable&(!talent.cataclysm|cooldown.cataclysm.remains>dot.immolate.remains)&active_dot.immolate<=5&!talent.cataclysm&target.time_to_die>18
+      spell.cast(S.immolate, () => {
+        if (!combat.targets) return this.getCurrentTarget();
+        let bestTarget = null;
+        let bestRemains = 999999;
+        for (let i = 0; i < combat.targets.length; i++) {
+          const unit = combat.targets[i];
+          if (!unit || !common.validTarget(unit) || me.distanceTo(unit) > 40) continue;
+          if (unit.timeToDeath && unit.timeToDeath() < 18000) continue;
+          const debuff = unit.getAuraByMe(A.immolate);
+          const rem = debuff ? debuff.remaining : 0;
+          if (this.isDoTRefreshable(unit) && rem < bestRemains) {
+            bestTarget = unit;
+            bestRemains = rem;
+          }
+        }
+        return bestTarget;
+      }, () => {
+        if (spell.getTimeSinceLastCast(S.immolate) < 3000) return false;
+        if (this.getActiveDoTCount() > 5) return false;
+        if (spell.isSpellKnown(S.cataclysm)) return false; // !talent.cataclysm
+        return true;
+      }),
+
+      // 13. conflagrate,target_if=max:(dot.immolate.remains-99*debuff.havoc.remains),if=buff.backdraft.stack<2|!talent.backdraft
+      spell.cast(S.conflagrate, () => this.getConflagSpreadTarget(), () => {
+        return this.getBackdraftStacks() < 2 || !spell.isSpellKnown(A.backdraftTalent);
+      }),
+
+      // 14. incinerate filler
+      spell.cast(S.incinerate, () => this.getCurrentTarget()),
+    );
   }
 }

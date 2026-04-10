@@ -1,1064 +1,738 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
-import * as bt from "@/Core/BehaviorTree";
-import common from "@/Core/Common";
-import spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
-import Settings from "@/Core/Settings";
-import EvokerCommon from "@/Behaviors/EvokerCommon";
-import { defaultCombatTargeting as Combat, defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
+import * as bt from '@/Core/BehaviorTree';
+import Specialization from '@/Enums/Specialization';
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import Specialization from "@/Enums/Specialization";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
+import { DispelPriority } from '@/Data/Dispels';
+import { WoWDispelType } from '@/Enums/Auras';
 
-// Aura IDs based on latest data
-const auras = {
-  dragonRage: 375087,
-  essenceBurst: 359618,
-  burnout: 375802,
-  massDisintegrate: 436336,
-  leapingFlames: 370901,
-  iridescenceBlue: 386399,
-  iridescenceRed: 386283,
-  shatteringStar: 370452,
-  tipTheScales: 370553,
-  snapfire: 370783,
-  ancientFlame: 369458,
-  scarletAdaptation: 372469,
-  immediatDestruction: 370455,
-  jackpot: 417910, // TWW2 4pc bonus
-  bombardments: 386288,
-  maneuverability: 370665,
-  meltArmor: 370452,
-  feed_the_flames: 369439,
-  enkindle: 370842,
-  volatility: 369089,
-  imminentDestruction: 370621,
-  power_swell: 376788,
-  font_of_magic: 375783,
-  arcane_vigor: 386342,
-  eternitys_span: 375534,
-  animosity: 375797,
-  engulf: 357212,
-  engulfing_blaze: 370837,
-  ruby_embers: 365937,
-  charged_blast: 370455,
-  raging_inferno: 369846, // in_firestorm debuff
-  scorching_embers: 370454,
-  emerald_trance: 382778,
-  mass_disintegrate_stacks: 383823,
-  hover: 358267,
-  blessing_of_the_bronze: 381748
+/**
+ * Devastation Evoker Behavior - Midnight 12.0.1
+ * Sources: SimC Midnight APL (evoker_devastation.simc line-by-line) + Method + Wowhead
+ *
+ * Auto-detects: Scalecommander (Mass Disintegrate 436335) vs Flameshaper (Consume Flame 444088)
+ * SimC sub-lists: st_sc (14), st_fs (14), aoe_sc (13), aoe_fs (15), es (4), green (2) — ALL matched
+ *
+ * Empower: Fire Breath R1 + Eternity Surge R1-R4 — handleEmpoweredSpell()
+ * ES empower sub-list: R1 (ST/Mass Disint/DR), R2 (2-4 targets), R3 (3-6), R4 (4-8 w/ Font)
+ * Burst: Dragonrage (18s, 100% EB, Rising Fury haste)
+ * Movement: Hover (cast-while-moving 6s) + Azure Strike/Pyre/Azure Sweep instants
+ *
+ * Resource: Essence (PowerType 19), max 5-6
+ */
+
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'SimC Midnight APL (line-by-line) + Method + Wowhead',
 };
 
-// Additional spell IDs that might be needed
-const spells = {
-  dragonrage: 375087,
-  fire_breath: 357208,
-  eternity_surge: 359073,
-  living_flame: 361469,
-  azure_strike: 362969,
-  shattering_star: 370452,
-  disintegrate: 356995,
-  deep_breath: 357210,
-  tip_the_scales: 370553,
-  hover: 358267,
-  pyre: 357211,
-  firestorm: 368847,
-  engulf: 357212,
-  emerald_blossom: 359816,
-  verdant_embrace: 360995,
-  renewing_blaze: 374348,
-  obsidian_scales: 363916,
-  quell: 351338
+const S = {
+  livingFlame:        361469,
+  azureStrike:        362969,
+  azureSweep:         1265872,   // Castable spell (talent passive is 1265867)
+  disintegrate:       356995,
+  pyre:               357211,
+  fireBreath:         357208,
+  eternitySurge:      359073,
+  dragonrage:         375087,
+  deepBreath:         357210,   // Corrected — 433874 was wrong
+  tipTheScales:       370553,
+  hover:              358267,
+  quell:              351338,
+  cauterizingFlame:   374251,   // Dispel: Bleed, Poison, Curse, Disease from ally
+  expunge:            365585,   // Dispel: Poison from ally
+  obsidianScales:     363916,
+  verdantEmbrace:     360995,
+  emeraldBlossom:     355913,
+  berserking:         26297,
 };
 
-export class EvokerDevastationBehavior extends Behavior {
-  name = "FW Devastation Evoker 2";
+const T = {
+  massDisintegrate:   436335,
+  consumeFlame:       444088,
+  eternitysSpan:      375757,
+  fontOfMagic:        375783,
+  feedTheFlames:      369846,   // Correct talent (214893 doesn't exist)
+  volatility:         369089,   // Talent passive (393568 is Pyre damage sub-spell)
+  animosity:          375797,
+  immDestruction:     370781,   // Correct talent (411164 is Event Horizon)
+  strafingRun:        1266151,
+  burnout:            375801,
+  engulfingBlaze:     370837,
+  ancientFlame:       369990,
+  scarletAdapt:       372469,
+  slipstream:         441257,   // Scalecommander talent (388268 doesn't exist)
+  leapingFlames:      369939,
+  azureSweep:         1265867,
+  legacyLifebinder:   1264269,
+};
+
+const A = {
+  dragonrage:         375087,
+  essenceBurst:       359618,
+  burnout:            375802,
+  chargedBlast:       370454,   // Stacking buff (370455 is hidden passive)
+  ancientFlame:       375583,
+  leapingFlames:      370901,   // Stacking buff (4 stacks from FB empower). 369939 is talent passive.
+  scarletAdaptation:  372470,   // Buff aura (372469 is talent passive)
+  tipTheScales:       370553,
+  hover:              358267,
+  massDisintStacks:   436336,   // Stacking buff (436335 is talent passive)
+  bombardments:       434473,
+  strafingRun:        1266165,   // Buff aura (1266151 is talent passive)
+  fireBreathDot:      357209,
+  azureSweepBuff:     1265871,   // Buff aura (1265867 is talent passive)
+  risingFury:         1271783,   // Stacking haste buff (1271687 is hidden passive)
+  powerSwell:         376850,
+};
+
+export class DevastationEvokerBehavior extends Behavior {
+  name = 'FW Devastation Evoker';
   context = BehaviorContext.Any;
   specialization = Specialization.Evoker.Devastation;
   version = wow.GameVersion.Retail;
 
+  _desiredEmpowerLevel = undefined;
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _essFrame = 0;
+  _cachedEssence = 0;
+  _essDefFrame = 0;
+  _cachedEssDef = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _ebFrame = 0;
+  _cachedEB = null;
+  _cbFrame = 0;
+  _cachedCB = 0;
+  _versionLogged = false;
+  _lastDebug = 0;
+
   static settings = [
     {
-      header: "Defensives",
+      header: 'General',
       options: [
-        { type: "checkbox", uid: "EvokerDevastationUseRenewingBlaze", text: "Use Renewing Blaze", default: true },
-        { type: "checkbox", uid: "EvokerDevastationUseObsidianScales", text: "Use Obsidian Scales", default: true },
-      ]
+        { type: 'checkbox', uid: 'FWDevEAutoCDs', text: 'Auto Cooldowns (ignore burst keybind)', default: false },
+        { type: 'slider', uid: 'FWDevEAoECount', text: 'AoE Target Count', default: 3, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWDevEDebug', text: 'Debug Logging', default: false },
+        { type: 'checkbox', uid: 'FWDevEHover', text: 'Auto Hover', default: false },
+      ],
     },
     {
-      header: "Damage",
+      header: 'Defensives',
       options: [
-        { type: "checkbox", uid: "EvokerDevastationUseDeepBreath", text: "Use Deep Breath", default: true },
-        { type: "slider", uid: "EvokerDevastationDeepBreathMinTargets", text: "Deep Breath Minimum Targets", min: 1, max: 10, default: 3 },
-        { type: "checkbox", uid: "EvokerDevastationEnableBurst", text: "Enable Burst Mode", default: true },
-        { type: "checkbox", uid: "EvokerDevastationUseFirestorm", text: "Use Firestorm", default: true },
-        { type: "checkbox", uid: "EvokerDevastationUseEngulf", text: "Use Engulf", default: true },
-      ]
+        { type: 'checkbox', uid: 'FWDevEScales', text: 'Use Obsidian Scales', default: true },
+        { type: 'slider', uid: 'FWDevEScalesHP', text: 'Obsidian Scales HP %', default: 50, min: 15, max: 70 },
+      ],
     },
-    {
-      header: "Set Bonuses",
-      options: [
-        { type: "checkbox", uid: "EvokerDevastation4PreviousSet", text: "Use Last Tier (TWW S1) 4 Set Bonuses", default: true },
-        { type: "checkbox", uid: "EvokerDevastation4Set", text: "Use 4 Set Bonuses", default: true },
-      ]
-    },
-    {
-      header: "Advanced Settings",
-      options: [
-        { type: "checkbox", uid: "EvokerDevastationUseHover", text: "Use Hover for Movement", default: true },
-        { type: "checkbox", uid: "EvokerDevastationEarlyChainDisintegrate", text: "Early Chain Disintegrate", default: true },
-        { type: "checkbox", uid: "EvokerDevastationClipDisintegrate", text: "Clip Disintegrate During Dragonrage", default: true },
-        { type: "checkbox", uid: "EvokerDevastationPoolResourcesForDR", text: "Pool Resources Before Dragonrage", default: true },
-        { type: "slider", uid: "EvokerDevastationDRPrepTimeAOE", text: "AoE Dragonrage Prep Time (seconds)", min: 1, max: 10, default: 4 },
-        { type: "slider", uid: "EvokerDevastationDRPrepTimeST", text: "ST Dragonrage Prep Time (seconds)", min: 1, max: 15, default: 8 },
-        { type: "slider", uid: "EvokerDevastationESSendThreshold", text: "ES Send Threshold", min: 1, max: 20, default: 8 },
-      ]
-    },
-    {
-      header: "Trinkets",
-      options: [
-        { type: "checkbox", uid: "EvokerDevastationUseTrinkets", text: "Use Trinkets", default: true },
-        { type: "checkbox", uid: "EvokerDevastationAlignTrinkets", text: "Align Trinkets with Dragonrage", default: true },
-      ]
-    }
   ];
-  
-  build() {
-    
-    if (!this._variables) {
-      this.initializeVariables();
-    }
-    
-    return new bt.Selector(
-      common.waitForNotSitting(),
-      common.waitForNotMounted(),
-      new bt.Action(() => EvokerCommon.handleEmpoweredSpell()),
-      spell.cast("Blessing of the Bronze", on => me,
-        req => !me.hasAura(auras.blessing_of_the_bronze)
-      ),
-      common.waitForCastOrChannel(),
-      // Update variable states before decision making
-      this.updateVariables(),
-      this.defensives(),
-      spell.interrupt("Quell"),
-      common.waitForTarget(),
-      common.waitForFacing(),
-      this.hover(),
-      // Call trinket action list first as per APL
-      //this.trinkets(),
-      new bt.Decorator(
-        ret => combat.targets.length >= 3,
-        this.aoeRotation()
-      ),
-      new bt.Decorator(
-        ret => combat.targets.length <= 3,
-        this.singleTargetRotation()
-      ),
-      this.singleTargetRotation()
+
+  // =============================================
+  // EMPOWERMENT SYSTEM
+  // =============================================
+  castEmpowered(spellId, level, targetFn, conditionFn) {
+    return new bt.Sequence(
+      spell.cast(spellId, targetFn, conditionFn),
+      new bt.Action(() => { this._desiredEmpowerLevel = level; return bt.Status.Success; })
     );
   }
 
-  updateVariables() {
-    
-      // Calculate next dragonrage timing (in ms)
-      const drRemains = spell.getCooldown("Dragonrage").timeleft;
-      const fbRemains = Math.max(0, spell.getCooldown("Fire Breath").timeleft - 8000);
-      const esRemains = Math.max(0, spell.getCooldown("Eternity Surge").timeleft - 8000);
-      this.setVariable("next_dragonrage", Math.min(drRemains, Math.max(fbRemains, esRemains)));
-
-      // Update can_extend_dr variable for Animosity talent
-      if (me.hasAura("Animosity") && me.hasAura(auras.dragonRage)) {
-        const drRemaining = this.getAuraRemainingTime(auras.dragonRage);
-        // Check if we can still extend dragonrage
-        this.setVariable("can_extend_dr", drRemaining > 0);
-      } else {
-        this.setVariable("can_extend_dr", false);
+  handleEmpoweredSpell() {
+    return new bt.Action(() => {
+      if (this._desiredEmpowerLevel === undefined) return bt.Status.Failure;
+      if (!me.isCastingOrChanneling) { this._desiredEmpowerLevel = undefined; return bt.Status.Failure; }
+      if (me.spellInfo && me.spellInfo.empowerLevel >= this._desiredEmpowerLevel) {
+        const s = spell.getSpell(me.spellInfo.spellChannelId);
+        if (s) { s.cast(me.targetUnit); this._desiredEmpowerLevel = undefined; }
+        return bt.Status.Success;
       }
-
-      // Update pool_for_id for Imminent Destruction
-      if (me.hasAura("Imminent Destruction")) {
-        const dbRemains = spell.getCooldown("Deep Breath").timeleft;
-        const shouldPool = dbRemains < 7000 && 
-                          this.getEssenceDeficit() >= 1 && 
-                          !me.hasAura(auras.essenceBurst) && 
-                          (combat.targets.length >= 3 || (me.hasAura(auras.meltArmor) && me.hasAura(auras.maneuverability)));
-        this.setVariable("pool_for_id", shouldPool);
-      }
-
       return bt.Status.Success;
-    
+    });
   }
 
-  defensives() {
+  // =============================================
+  // BUILD
+  // =============================================
+  build() {
     return new bt.Selector(
-      spell.cast("Renewing Blaze", on => me,
-        req => Settings.EvokerDevastationUseRenewingBlaze && 
-              (me.pctHealth < 50 || combat.targets.length > 2)
-      ),
-      spell.cast("Obsidian Scales", on => me,
-        req => Settings.EvokerDevastationUseObsidianScales && 
-              (me.pctHealth < 40 || combat.targets.length > 3) && 
-              !me.hasAura("Renewing Blaze")
-      )
-    );
-  }
-
-  hover() {
-    return new bt.Selector(
-      spell.cast("Hover", on => me,
-        req => Settings.EvokerDevastationUseHover && 
-              !me.hasAura(auras.hover) && 
-              (me.hasAura(auras.massDisintegrate) || combat.targets.length <= 4)
-      )
-    );
-  }
-
-  trinkets() {
-    if (!Settings.EvokerDevastationUseTrinkets) {
-      return new bt.Action(() => bt.Status.Failure);
-    }
-    
-    return new bt.Selector(
-      // // Use trinket slot 1 with Dragonrage
-      // spell.useItem("Trinket1",
-      //   req => Settings.EvokerDevastationAlignTrinkets && 
-      //         me.hasAura(auras.dragonRage) && 
-      //         Combat.burstToggle && 
-      //         !spell.getCooldown("Fire Breath").timeleft && 
-      //         !spell.getCooldown("Shattering Star").timeleft
-      // ),
-      
-      // // Use trinket slot 2 with Dragonrage
-      // spell.useItem("Trinket2",
-      //   req => Settings.EvokerDevastationAlignTrinkets && 
-      //         me.hasAura(auras.dragonRage) && 
-      //         Combat.burstToggle && 
-      //         !spell.getCooldown("Fire Breath").timeleft && 
-      //         !spell.getCooldown("Shattering Star").timeleft
-      // ),
-      
-      // // Use trinket slot 1 on cooldown if not aligning
-      // spell.useItem("Trinket1",
-      //   req => !Settings.EvokerDevastationAlignTrinkets || 
-      //         (this.getVariable("next_dragonrage") > 20000 || 
-      //         !me.hasAura("Dragonrage"))
-      // ),
-      
-      // // Use trinket slot 2 on cooldown if not aligning
-      // spell.useItem("Trinket2",
-      //   req => !Settings.EvokerDevastationAlignTrinkets || 
-      //         (this.getVariable("next_dragonrage") > 20000 || 
-      //         !me.hasAura("Dragonrage"))
-      // )
-    );
-  }
-
-  singleTargetRotation() {
-    const drPrepST = () => Settings.EvokerDevastationDRPrepTimeST * 1000;
-    
-    return new bt.Selector(
-      // Use Kharnalex trinket (special handling)
-      // spell.useItem("Kharnalex the First Light",
-      //   req => !me.hasAura(auras.dragonRage) && 
-      //         !me.target.hasAura("Shattering Star Debuff")
-      // ),
-      
-      // Call Eternity Surge with specific conditions for Imminent Destruction
-      this.callEternitySurge(
-        req => spell.getCooldown("Dragonrage").timeleft <= 0 && 
-              me.hasAura(auras.imminentDestruction) && 
-              me.hasAura(auras.massDisintegrate)
-      ),
-      
-      // Hover for movement
-      spell.cast("Hover", on => me,
-        req => Settings.EvokerDevastationUseHover && 
-              !me.hasAura(auras.hover)
-      ),
-      
-      // Tip the Scales optimally
-      spell.cast("Tip the Scales", on => me,
-        req => (!me.hasAura("Dragonrage") || me.hasAura(auras.dragonRage)) && 
-              (spell.getCooldown("Fire Breath").timeleft <= spell.getCooldown("Eternity Surge").timeleft || 
-              (spell.getCooldown("Eternity Surge").timeleft <= spell.getCooldown("Fire Breath").timeleft && 
-              me.hasAura(auras.font_of_magic)) && !me.hasAura(auras.engulf))
-      ),
-      
-      // Deep Breath with Maneuverability and Melt Armor
-      spell.cast("Deep Breath", 
-        on => {
-          const bestTarget = EvokerCommon.findBestDeepBreathTarget();
-          return bestTarget.unit ? bestTarget.unit.position : null;
-        },
-        req => Settings.EvokerDevastationUseDeepBreath && 
-              me.hasAura(auras.maneuverability) && 
-              me.hasAura(auras.meltArmor)
-      ),
-      // Dragonrage with cooldown alignment
-      spell.cast("Dragonrage", on => me.target,
-        req => me.target && 
-              Combat.burstToggle && 
-              Settings.EvokerDevastationEnableBurst && 
-              (spell.getCooldown("Fire Breath").timeleft < 4000 || 
-              (spell.getCooldown("Eternity Surge").timeleft < 4000 && 
-              (!me.hasAura(auras.massDisintegrate) || this.hasSetBonus(2, 4)))) &&
-              ((spell.getCooldown("Fire Breath").timeleft < 8000 || !me.hasAura("Animosity")) && 
-              (spell.getCooldown("Eternity Surge").timeleft < 8000 || 
-              me.hasAura(auras.massDisintegrate) || 
-              !me.hasAura("Animosity") || 
-              this.hasSetBonus(2, 4))) && 
-              (me.target.timeToDie >= 32000 || me.target.timeToDie < 32000)
-      ),
-      
-      // Call Eternity Surge for Dragonrage with specific conditions
-      this.callEternitySurge(
-        req => me.hasAura(auras.dragonRage) && 
-              me.hasAura("Animosity") && 
-              me.hasAura(auras.engulf) && 
-              this.hasSetBonus(2, 4) && 
-              !me.hasAura("Jackpot") && 
-              this.hasVariable("can_extend_dr") && 
-              !spell.getCooldown("Engulf").timeleft <= 0
-      ),
-      
-      // Shattering Star without overcapping Essence Burst
-      spell.cast("Shattering Star", on => me.target,
-        req => me.target && (this.getEssenceBurstStacks() < this.getEssenceBurstMaxStacks() || 
-              !me.hasAura(auras.arcane_vigor))
-      ),
-      // Engulf with detailed conditions
-      spell.cast("Engulf", on => me.target,
-        req => Settings.EvokerDevastationUseEngulf && 
-              me.target && 
-              me.target.hasAura("Fire Breath Damage") && 
-              me.target.getDotRemaining("Fire Breath Damage") >= spell.travelTime("Engulf") + 
-              spell.isInFlightTo("Engulf", me.target) * 1.5 && 
-              (!me.hasAura("Enkindle") || me.target.hasAura("Enkindle")) && 
-              (!me.hasAura("Ruby Embers") || me.target.hasAura("Living Flame Damage")) && 
-              // Star/Iridescence logic
-              ((!me.hasAura("Shattering Star") && !me.hasAura("Iridescence")) || 
-              (me.target.hasAura("Shattering Star Debuff") && 
-              (!me.hasAura("Iridescence") || spell.fullRechargeTime("Engulf") <= 
-              spell.getCooldown("Fire Breath").timeleft + 4000 || me.hasAura(auras.dragonRage))) || 
-              // Red Iridescence logic
-              (me.hasAura(auras.iridescenceRed) && 
-              (me.target.hasAura("Shattering Star Debuff") || 
-              !me.hasAura("Shattering Star") || 
-              spell.fullRechargeTime("Engulf") <= spell.getCooldown("Shattering Star").timeleft)) || 
-              // Scorching embers logic
-              (me.hasAura("Scorching Embers") && 
-              me.target.getDotDuration("Fire Breath Damage") <= 10000 && 
-              me.target.getDotRemaining("Fire Breath Damage") <= 5000)) && 
-              // Dragonrage timing logic
-              (this.getVariable("next_dragonrage") >= spell.cooldown("Engulf") * 1.2 || 
-              !me.hasAura("Dragonrage") || 
-              spell.fullRechargeTime("Engulf") <= this.getVariable("next_dragonrage")) && 
-              // Tip the Scales logic
-              (spell.getCooldown("Tip the Scales").timeleft >= 4000 || 
-              spell.getCooldown("Fire Breath").timeleft >= 8000 || 
-              !me.hasAura("Scorching Embers") || 
-              !me.hasAura("Tip the Scales")) && 
-              // Iridescence timing logic
-              (!me.hasAura("Iridescence") || 
-              me.hasAura(auras.iridescenceRed) && 
-              (me.target.getDotRemaining("Shattering Star Debuff") >= spell.travelTime("Engulf") || 
-              spell.getCooldown("Shattering Star").timeleft + spell.getGCD() > this.getAuraRemainingTime(auras.iridescenceRed) || 
-              this.getEssence() < 3 && this.getAuraStacks(auras.iridescenceRed) == 1 || 
-              spell.fullRechargeTime("Engulf") < spell.getCooldown("Fire Breath").timeleft && 
-              (me.target.getDotRemaining("Shattering Star Debuff") >= spell.travelTime("Engulf")) || 
-              !me.hasAura("Shattering Star"))) || 
-              me.target.timeToDie <= 10000
-      ),
-      // Fire Breath logic with appropriate conditions
-      this.callFireBreath(
-        req => (!me.hasAura("Dragonrage") || this.getVariable("next_dragonrage") > drPrepST() || 
-              !me.hasAura("Animosity")) && 
-              (!spell.getCooldown("Eternity Surge").timeleft <= 0 || 
-              !me.hasAura("Event Horizon") || me.hasAura(auras.massDisintegrate) || 
-              !me.hasAura(auras.dragonRage) || (me.hasAura("Flame Siphon") && me.hasAura("Causality")) || 
-              this.hasSetBonus(2, 4)) && 
-              (me.target.timeToDie >= 8000 || !me.hasAura(auras.massDisintegrate)) && 
-              ((me.target.hasAura("Shattering Star Debuff") || 
-              !spell.getCooldown("Shattering Star").timeleft <= 0) && 
-              me.hasAura(auras.dragonRage) && me.hasAura(auras.tipTheScales) || 
-              !me.hasAura(auras.tipTheScales) || !me.hasAura("Dragonrage") || 
-              !me.hasAura("Animosity") || !me.hasAura(auras.dragonRage) || !me.hasAura(auras.engulf))
-      ),
-      
-      // Deep Breath with Imminent Destruction or Melt Armor
-      spell.cast("Deep Breath", 
-        on => {
-          const bestTarget = EvokerCommon.findBestDeepBreathTarget();
-          return bestTarget.unit ? bestTarget.unit.position : null;
-        },
-        req => Settings.EvokerDevastationUseDeepBreath && 
-               (me.hasAura(auras.imminentDestruction) && !me.target.hasAura("Shattering Star Debuff") || 
-                me.hasAura(auras.meltArmor) && me.hasAura(auras.maneuverability)) && 
-               (me.hasAura(auras.meltArmor) && me.hasAura(auras.maneuverability) || !me.hasAura(auras.dragonRage))
-      ),
-      
-      // Eternity Surge call with standard conditions
-      this.callEternitySurge(
-        req => (!me.hasAura("Dragonrage") || this.getVariable("next_dragonrage") > drPrepST() || 
-                !me.hasAura("Animosity") || me.hasAura(auras.massDisintegrate)) && 
-               (!this.hasSetBonus(2, 4) || !me.hasAura("Jackpot") || 
-                Settings.EvokerDevastationESSendThreshold <= spell.getCooldown("Fire Breath").timeleft || 
-                me.hasAura(auras.massDisintegrate)) && 
-               (!me.hasAura("Power Swell") || this.getAuraRemainingTime("Power Swell") <= this.getGcdMax())
-      ),
-
-      // Wait logic for Fire Breath to extend Dragonrage
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
       new bt.Action(() => {
-        if (this.hasVariable("can_extend_dr") && me.hasAura("Animosity") && me.hasAura(auras.dragonRage)) {
-          const drRemaining = this.getAuraRemainingTime(auras.dragonRage);
-          const fbRemaining = spell.getCooldown("Fire Breath").timeleft;
-          const r1CastTime = 1.0 * (1 / (1 + me.modSpellHaste / 100)) * 1000;
-          
-          if (drRemaining < this.getGcdMax() + r1CastTime * (me.hasAura(auras.tipTheScales) ? 0 : 1) && 
-              drRemaining - fbRemaining >= r1CastTime * (me.hasAura(auras.tipTheScales) ? 0 : 1)) {
-            return bt.Status.Running; // Wait for Fire Breath
-          }
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
         }
         return bt.Status.Failure;
       }),
-      
-      // Wait logic for Eternity Surge to extend Dragonrage
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      this.handleEmpoweredSpell(),
+      common.waitForCastOrChannel(),
+
       new bt.Action(() => {
-        if (this.hasVariable("can_extend_dr") && me.hasAura("Animosity") && me.hasAura(auras.dragonRage)) {
-          const drRemaining = this.getAuraRemainingTime(auras.dragonRage);
-          const esRemaining = spell.getCooldown("Eternity Surge").timeleft;
-          const r1CastTime = 1.0 * (1 / (1 + me.modSpellHaste / 100)) * 1000;
-          
-          if (drRemaining < this.getGcdMax() + r1CastTime && 
-              drRemaining - esRemaining > r1CastTime * (me.hasAura(auras.tipTheScales) ? 0 : 1)) {
-            return bt.Status.Running; // Wait for Eternity Surge
-          }
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[Dev] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | ${this.isSC() ? 'Scalecommander' : 'Flameshaper'} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWDevEDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[Dev] Ess:${this.getEss()} EB:${this.getEB()} DR:${this.inDR()} CB:${this.getCBStacks()} MD:${me.hasAura(A.massDisintStacks)} E:${this.getEnemyCount()}`);
         }
         return bt.Status.Failure;
       }),
-      
-      // Living Flame to exit Dragonrage with full Essence Burst stacks
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && me.hasAura(auras.dragonRage) && 
-               this.getAuraRemainingTime(auras.dragonRage) < 
-               (this.getEssenceBurstMaxStacks() - this.getEssenceBurstStacks()) * 
-               this.getGcdMax() && me.hasAura(auras.burnout)
-      ),
-      
-      // Azure Strike as alternative to exit Dragonrage with full Essence Burst stacks
-      spell.cast("Azure Strike", on => me.target,
-        req => me.target && me.hasAura(auras.dragonRage) && 
-               this.getAuraRemainingTime(auras.dragonRage) < 
-               (this.getEssenceBurstMaxStacks() - this.getEssenceBurstStacks()) * 
-               this.getGcdMax()
-      ),
-      // Firestorm with Snapfire
-      spell.cast("Firestorm", on => me.target,
-        req => Settings.EvokerDevastationUseFirestorm && 
-               me.target && me.hasAura(auras.snapfire)
-      ),
-      
-      // Living Flame with Burnout/Leaping Flames
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && 
-               (me.hasAura(auras.burnout) || me.hasAura("Flame Siphon") && 
-                spell.getCooldown("Fire Breath").timeleft <= this.getGcdMax() * 3) && 
-               me.hasAura(auras.leapingFlames) && !me.hasAura(auras.essenceBurst) && 
-               (this.getEssenceDeficit() >= 1 || spell.getCooldown("Fire Breath").timeleft <= this.getGcdMax() * 3)
-      ),
-      
-      // Living Flame for Ruby Embers/Engulf upkeep
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && me.hasAura("Ruby Embers") && me.hasAura(auras.engulf) && 
-               (me.hasAura(auras.burnout) && me.target.getDotRemaining("Living Flame Damage") <= this.getGcdMax() * 3 || 
-                me.target.getDotRemaining("Living Flame Damage") <= this.getGcdMax()) && 
-               !spell.isInFlightTo("Living Flame", me.target) && 
-               (spell.getCooldown("Engulf").timeleft <= 0 || spell.getRechargeTime("Engulf") < this.getGcdMax() * 3)
-      ),
-      
-      // Pyre for Feed the Flames in Firestorm with 20 CB stacks in 2T+
-      spell.cast("Pyre", on => me.target,
-        req => me.target && me.target.hasAura("In Firestorm") && 
-               me.hasAura("Feed the Flames") && this.getAuraStacks("Charged Blast") === 20 && 
-               combat.targets.length >= 2
-      ),
-      // Another Eternity Surge check with different conditions
-      this.callEternitySurge(
-        req => (!me.hasAura("Dragonrage") || this.getVariable("next_dragonrage") > drPrepST() || 
-                !me.hasAura("Animosity") || me.hasAura(auras.massDisintegrate)) && 
-               (!this.hasSetBonus(2, 4) || !me.hasAura("Jackpot") || me.hasAura(auras.massDisintegrate))
-      ),
-      
-      // Mass Disintegrate
-      spell.cast("Disintegrate", on => me.target,
-        req => me.target && me.hasAura("Mass Disintegrate Stacks") && 
-               me.hasAura(auras.massDisintegrate) && !this.hasVariable("pool_for_id")
-      ),
-      
-      // Deep Breath on 2T+ or with Imminent Destruction
-      spell.cast("Deep Breath", 
-        on => {
-          const bestTarget = EvokerCommon.findBestDeepBreathTarget();
-          return bestTarget.unit ? bestTarget.unit.position : null;
-        },
-        req => Settings.EvokerDevastationUseDeepBreath && !me.hasAura(auras.dragonRage) && 
-               (combat.targets.length >= 2 || me.hasAura(auras.imminentDestruction) && 
-                !me.target.hasAura("Shattering Star Debuff") || me.hasAura(auras.meltArmor) || 
-                me.hasAura(auras.maneuverability))
-      ),
-      
-      // Pyre with variable conditions
-      spell.cast("Pyre", on => me.target,
-        req => me.target && (this.hasVariable("pyre_st") || combat.targets.length > 1 && 
-                            me.hasAura(auras.snapfire)) && !this.hasVariable("pool_for_id")
-      ),
-      
-      // Disintegrate with early chain/clip conditions
-      spell.cast("Disintegrate", on => me.target,
-        req => me.target && Settings.EvokerDevastationEarlyChainDisintegrate && 
-               Settings.EvokerDevastationClipDisintegrate && 
-               !this.hasVariable("pool_for_id") && !this.hasVariable("pool_for_cb") && 
-               !this.hasVariable("pyre_st")
-      ),
-      
-      // Firestorm on 2T+
-      spell.cast("Firestorm", on => me.target,
-        req => Settings.EvokerDevastationUseFirestorm && me.target && combat.targets.length > 1
-      ),
 
-      // Green spells for Ancient Flame
-      this.callGreenSpells(
-        req => me.hasAura("Ancient Flame") && !me.hasAura(auras.ancientFlame) && 
-               !me.target.hasAura("Shattering Star Debuff") && me.hasAura(auras.scarletAdaptation) && 
-               !me.hasAura(auras.dragonRage) && !me.hasAura(auras.burnout) && me.hasAura("Engulfing Blaze")
+      new bt.Decorator(
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          spell.interrupt(S.quell),
+
+          // Dispels: Cauterizing Flame (Bleed, Poison, Curse, Disease) + Expunge (Poison)
+          spell.dispel(S.cauterizingFlame, true, DispelPriority.High, false, WoWDispelType.Curse),
+          spell.dispel(S.cauterizingFlame, true, DispelPriority.High, false, WoWDispelType.Poison),
+          spell.dispel(S.cauterizingFlame, true, DispelPriority.High, false, WoWDispelType.Disease),
+          spell.dispel(S.cauterizingFlame, true, DispelPriority.Medium, false, WoWDispelType.Curse),
+          spell.dispel(S.cauterizingFlame, true, DispelPriority.Medium, false, WoWDispelType.Poison),
+          spell.dispel(S.cauterizingFlame, true, DispelPriority.Medium, false, WoWDispelType.Disease),
+
+          spell.cast(S.obsidianScales, () => me, () =>
+            Settings.FWDevEScales && me.effectiveHealthPercent < Settings.FWDevEScalesHP
+          ),
+
+          // SimC: hover off-GCD — movement or Slipstream (optional, default OFF)
+          spell.cast(S.hover, () => me, () => {
+            if (!Settings.FWDevEHover) return false;
+            if (me.hasAura(A.hover)) return false;
+            if (me.isMoving() && spell.getChargesFractional(S.hover) > 0.3) return true;
+            return spell.isSpellKnown(T.slipstream) && !me.hasAura(A.hover);
+          }),
+
+          // Movement block — FULL instant rotation (all off-GCD CDs + instants)
+          new bt.Decorator(
+            () => me.isMoving() && !me.hasAura(A.hover),
+            new bt.Selector(
+              // Off-GCD CDs: Dragonrage, Tip the Scales, Berserking
+              spell.cast(S.dragonrage, () => this.getCurrentTarget(), () =>
+                (this.useCDs() || this.getEnemyCount() >= 3) && (this.getEnemyCount() >= 3 || this.targetTTD() >= 15000)
+              ),
+              spell.cast(S.tipTheScales, () => me, () => this.inDR()),
+              spell.cast(S.berserking, () => me, () => this.inDR()),
+              // Deep Breath (works while moving for all hero trees)
+              spell.cast(S.deepBreath, () => this.getCurrentTarget()),
+              // Pyre: 3+ targets with resources
+              spell.cast(S.pyre, () => this.getCurrentTarget(), () =>
+                (this.getEB() >= 1 || this.getEss() >= 3) && this.getEnemyCount() >= 3
+              ),
+              // Burnout Living Flame (instant via Burnout proc)
+              spell.cast(S.livingFlame, () => this.getCurrentTarget(), () =>
+                me.hasAura(A.burnout)
+              ),
+              // Azure Sweep
+              spell.cast(S.azureSweep, () => this.getCurrentTarget()),
+              // Azure Strike
+              spell.cast(S.azureStrike, () => this.getCurrentTarget()),
+              new bt.Action(() => bt.Status.Success)
+            ),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+
+          // SimC: Dispatch by hero talent + enemy count
+          // SC uses one unified list (Pyre gated by use_pyre variable inline)
+          new bt.Decorator(() => this.isFS() && this.getEnemyCount() >= Settings.FWDevEAoECount,
+            this.aoeFS(), new bt.Action(() => bt.Status.Failure)),
+          new bt.Decorator(() => this.isSC(), this.scRotation(), new bt.Action(() => bt.Status.Failure)),
+          this.stFS(),
+        )
       ),
-      
-      // Living Flame outside Dragonrage or with specific buffs in Dragonrage
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && 
-               (!me.hasAura(auras.dragonRage) || 
-                (this.getAuraRemainingTime(auras.iridescenceRed) > spell.executeTime("Living Flame") || 
-                 !me.hasAura("Engulfing Blaze") || me.hasAura(auras.iridescenceBlue) || 
-                 me.hasAura(auras.burnout) || me.hasAura(auras.leapingFlames) && 
-                 spell.getCooldown("Fire Breath").timeleft <= 5000) && combat.targets.length === 1)
-      ),
-      
-      // Azure Strike as fallback
-      spell.cast("Azure Strike", on => me.target,
-        req => me.target
-      )
     );
   }
 
-  aoeRotation() {
-    const drPrepAOE = () => Settings.EvokerDevastationDRPrepTimeAOE * 1000;
-    
+  // =============================================
+  // ETERNITY SURGE SUB-LIST (SimC actions.es, 4 empower tiers)
+  // SimC: R1 if enemies<=1+span OR enemies>4+4*span OR mass_disintegrate OR dragonrage.up
+  // R2 if enemies<=2+2*span, R3 if enemies<=3+3*span, R4 if enemies<=4+4*span
+  // =============================================
+  es() {
+    const e = this.getEnemyCount();
+    const span = spell.isSpellKnown(T.eternitysSpan) ? 1 : 0;
     return new bt.Selector(
-      // Shattering Star before Dragonrage (without Engulf)
-      spell.cast("Shattering Star", on => me.target,
-        req => me.target && 
-               ((spell.getCooldown("Dragonrage").timeleft <= 0 && me.hasAura(auras.arcane_vigor)) || 
-               (me.hasAura(auras.eternitys_span) && combat.targets.length <= 3)) && 
-               !me.hasAura(auras.engulf)
+      // R1: ST / Mass Disint / DR / too many targets (overflow)
+      this.castEmpowered(S.eternitySurge, 1, () => this.getCurrentTarget(), () =>
+        e <= 1 + span || e > 4 + 4 * span || this.isSC() || this.inDR()
       ),
-      
-      // Hover for movement in AoE
-      spell.cast("Hover", on => me,
-        req => Settings.EvokerDevastationUseHover && 
-               !me.hasAura(auras.hover) && 
-               (me.hasAura(auras.massDisintegrate) && me.hasAura("Mass Disintegrate") || 
-                combat.targets.length <= 4)
+      // R2
+      this.castEmpowered(S.eternitySurge, 2, () => this.getCurrentTarget(), () =>
+        e <= 2 + 2 * span
       ),
-      
-      // Use Firestorm if Snapfire is up and no Feed the Flames
-      spell.cast("Firestorm", on => me.target,
-        req => Settings.EvokerDevastationUseFirestorm && 
-               me.target && 
-               me.hasAura(auras.snapfire) && 
-               !me.hasAura("Feed the Flames")
+      // R3
+      this.castEmpowered(S.eternitySurge, 3, () => this.getCurrentTarget(), () =>
+        e <= 3 + 3 * span
       ),
-      // Deep Breath before other cooldowns (per APL: BaumChange 1)
-      spell.cast("Deep Breath", 
-        on => {
-          const bestTarget = EvokerCommon.findBestDeepBreathTarget();
-          return bestTarget.unit ? bestTarget.unit.position : null;
-        },
-        req => Settings.EvokerDevastationUseDeepBreath && 
-               ((me.hasAura(auras.maneuverability) && 
-                 me.hasAura(auras.meltArmor) && 
-                 !spell.getCooldown("Fire Breath").timeleft <= 0 && 
-                 !spell.getCooldown("Eternity Surge").timeleft <= 0) || 
-                (me.hasAura("Feed the Flames") && 
-                 me.hasAura(auras.engulf) && 
-                 me.hasAura(auras.imminentDestruction)))
+      // R4
+      this.castEmpowered(S.eternitySurge, 4, () => this.getCurrentTarget(), () =>
+        e <= 4 + 4 * span
       ),
-      
-      // Firestorm with Feed the Flames talent (per APL: BaumChange #3)
-      spell.cast("Firestorm", on => me.target,
-        req => Settings.EvokerDevastationUseFirestorm && 
-               me.target && 
-               me.hasAura("Feed the Flames") && 
-               (!me.hasAura(auras.engulf) || 
-                spell.getCooldown("Engulf").timeleft > 4000 || 
-                spell.charges("Engulf") === 0 || 
-                (this.getVariable("next_dragonrage") <= spell.cooldown("Firestorm") * 1.2 || 
-                 !me.hasAura("Dragonrage")))
-      ),
-      
-      // Fire Breath to grab Iridescence Red before Dragonrage
-      this.callFireBreath(
-        req => me.hasAura("Dragonrage") && 
-               spell.getCooldown("Dragonrage").timeleft <= 0 && 
-               (me.hasAura("Iridescence") || me.hasAura("Scorching Embers")) && 
-               !me.hasAura(auras.engulf)
-      ),
-      // Tip the Scales optimally for AoE
-      spell.cast("Tip the Scales", on => me,
-        req => (!me.hasAura("Dragonrage") || me.hasAura(auras.dragonRage)) && 
-               (spell.getCooldown("Fire Breath").timeleft <= spell.getCooldown("Eternity Surge").timeleft || 
-                (spell.getCooldown("Eternity Surge").timeleft <= spell.getCooldown("Fire Breath").timeleft && 
-                 me.hasAura(auras.font_of_magic)) && !me.hasAura(auras.engulf))
-      ),
-      
-      // Shattering Star before Dragonrage (with Engulf) - per APL: BaumChange 2
-      spell.cast("Shattering Star", on => me.target,
-        req => me.target && 
-               ((spell.getCooldown("Dragonrage").timeleft <= 0 && me.hasAura(auras.arcane_vigor)) || 
-                (me.hasAura(auras.eternitys_span) && combat.targets.length <= 3)) && 
-               me.hasAura(auras.engulf)
-      ),
-      
-      // Dragonrage in AoE
-      spell.cast("Dragonrage", on => me.target,
-        req => me.target && 
-               Combat.burstToggle && 
-               Settings.EvokerDevastationEnableBurst && 
-               (me.target.timeToDie >= 32000 || 
-                combat.targets.length >= 3 && me.target.timeToDie >= 15000)
-      ),
-      // Fire Breath in AoE
-      this.callFireBreath(
-        req => (!me.hasAura("Dragonrage") || me.hasAura(auras.dragonRage) || 
-               spell.getCooldown("Dragonrage").timeleft > drPrepAOE() || 
-               !me.hasAura("Animosity") || me.hasAura("Flame Siphon")) && 
-              (me.target.timeToDie >= 8000 || me.hasAura(auras.massDisintegrate))
-      ),
-      
-      // Eternity Surge in AoE
-      this.callEternitySurge(
-        req => (!me.hasAura("Dragonrage") || me.hasAura(auras.dragonRage) || 
-               spell.getCooldown("Dragonrage").timeleft > drPrepAOE() || 
-               !me.hasAura("Animosity")) && 
-              (!me.hasAura("Jackpot") || !this.hasSetBonus(2, 4) || me.hasAura(auras.massDisintegrate))
-      ),
-      
-      // Shattering Star without overcapping - per APL: BaumChange 3
-      spell.cast("Shattering Star", on => me.target,
-        req => me.target && 
-               ((this.getEssenceBurstStacks() < this.getEssenceBurstMaxStacks() && 
-                 me.hasAura(auras.arcane_vigor)) || 
-                (me.hasAura(auras.eternitys_span) && 
-                 combat.targets.length <= 3) || 
-                (this.hasSetBonus(2, 4) && 
-                 this.getAuraStacks("Jackpot") < 2)) && 
-               (!me.hasAura(auras.engulf) || 
-                spell.getCooldown("Engulf").timeleft < 4000 || 
-                spell.charges("Engulf") > 0)
-      ),
-      // Engulf in AoE
-      spell.cast("Engulf", on => me.target,
-        req => Settings.EvokerDevastationUseEngulf && 
-               me.target && 
-               me.target.hasAura("Fire Breath Damage") && 
-               me.target.getDotRemaining("Fire Breath Damage") >= 
-               spell.travelTime("Engulf") + 1.5 * spell.isInFlightTo("Engulf", me.target) && 
-               (this.getVariable("next_dragonrage") >= spell.cooldown("Engulf") * 1.2 || 
-                !me.hasAura("Dragonrage"))
-      ),
-      
-      // Pyre with Charged Blast
-      spell.cast("Pyre", on => me.target,
-        req => me.target && 
-               this.getAuraStacks("Charged Blast") >= 12 && 
-               (spell.getCooldown("Dragonrage").timeleft > this.getGcdMax() * 4 || 
-                !me.hasAura("Dragonrage"))
-      ),
-      
-      // Mass Disintegrate
-      spell.cast("Disintegrate", on => me.target,
-        req => me.target && 
-               me.hasAura(auras.massDisintegrate) && 
-               me.hasAura("Mass Disintegrate") && 
-               (!this.hasVariable("pool_for_id") || 
-                this.getAuraRemainingTime(auras.massDisintegrate) <= 
-                this.getAuraStacks(auras.massDisintegrate) * (spell.getSpell("Disintegrate").castTime + 100))
-      ),
-      // Deep Breath with Imminent Destruction
-      spell.cast("Deep Breath", 
-        on => {
-          const bestTarget = EvokerCommon.findBestDeepBreathTarget();
-          return bestTarget.unit ? bestTarget.unit.position : null;
-        },
-        req => Settings.EvokerDevastationUseDeepBreath && 
-               me.hasAura(auras.imminentDestruction) && 
-               !me.hasAura(auras.essenceBurst)
-      ),
-      
-      // Pyre AoE
-      spell.cast("Pyre", on => me.target,
-        req => me.target && 
-               (combat.targets.length >= 4 - (me.hasAura(auras.immediatDestruction) ? 1 : 0) || 
-                me.hasAura(auras.volatility) || 
-                (me.hasAura("Scorching Embers") && 
-                 this.getActiveDots("Fire Breath Damage") >= combat.targets.length * 0.75)) && 
-               (spell.getCooldown("Dragonrage").timeleft > this.getGcdMax() * 4 || 
-                !me.hasAura("Dragonrage") || 
-                !me.hasAura("Charged Blast")) && 
-               !this.hasVariable("pool_for_id") && 
-               (!me.hasAura("Mass Disintegrate Stacks") || 
-                this.getEssenceBurstStacks() == 2 || 
-                (this.getEssenceBurstStacks() == 1 && this.getEssence() >= (3 - (me.hasAura(auras.imminentDestruction) ? 1 : 0))) || 
-                this.getEssence() >= (5 - (me.hasAura(auras.imminentDestruction) ? 2 : 0)))
-      ),
-      // Living Flame with Leaping Flames
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && 
-               (!me.hasAura("Burnout") || 
-                me.hasAura(auras.burnout) || 
-                spell.getCooldown("Fire Breath").timeleft <= this.getGcdMax() * 5000 || 
-                me.hasAura(auras.scarletAdaptation) || 
-                me.hasAura(auras.ancientFlame)) && 
-               me.hasAura(auras.leapingFlames) && 
-               (!me.hasAura(auras.essenceBurst) && 
-                this.getEssenceDeficit() > 1 || 
-                spell.getCooldown("Fire Breath").timeleft <= this.getGcdMax() * 3000 && 
-                this.getEssenceBurstStacks() < this.getEssenceBurstMaxStacks())
-      ),
-      
-      // Disintegrate with early chain and clip functionality
-      spell.cast("Disintegrate", on => me.target,
-        req => me.target && 
-               Settings.EvokerDevastationEarlyChainDisintegrate && 
-               Settings.EvokerDevastationClipDisintegrate && 
-               (combat.targets.length <= 4 || me.hasAura(auras.massDisintegrate))
-      ),
-      
-      // Living Flame with Burnout and Snapfire
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && 
-               me.hasAura(auras.snapfire) && 
-               me.hasAura(auras.burnout)
-      ),
-      // Firestorm
-      spell.cast("Firestorm", on => me.target,
-        req => Settings.EvokerDevastationUseFirestorm && 
-               me.target
-      ),
-      
-      // Living Flame with Snapfire
-      spell.cast("Living Flame", on => me.target,
-        req => me.target && 
-               me.hasAura(auras.snapfire) && 
-               !me.hasAura("Engulfing Blaze")
-      ),
-      
-      // Ancient Flame through green spells
-      this.callGreenSpells(
-        req => me.hasAura("Ancient Flame") && 
-               !me.hasAura(auras.ancientFlame) && 
-               !me.hasAura(auras.dragonRage)
-      ),
-      
-      // Azure Strike as fallback
-      spell.cast("Azure Strike", on => me.target,
-        req => me.target
-      )
     );
   }
 
-  // Helper methods for empower spells and variable handling
-  
-  // Methods for calling empower spells with context
-  callFireBreath(conditions) {
+  // =============================================
+  // SCALECOMMANDER — Unified list (SimC actions.sc — handles all target counts)
+  // =============================================
+  scRotation() {
     return new bt.Selector(
-      // Fire Breath for Scorching Embers and Engulf
-      EvokerCommon.castEmpowered("Fire Breath", 2, on => me.target, 
-        req => me.target && 
-               me.hasAura("Scorching Embers") && 
-               (spell.getCooldown("Engulf").timeleft <= spell.getSpell("Fire Breath").castTime + 500 || 
-                spell.getCooldown("Engulf").timeleft <= 0) && 
-               me.hasAura(auras.engulf) && 
-               conditions()
+      // 1. Deep Breath: Strafing Run talent + buff expiring or not up
+      spell.cast(S.deepBreath, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.strafingRun)) return false;
+        const sr = me.getAura(A.strafingRun);
+        return !sr || sr.remaining <= 3000;
+      }),
+
+      // 2. Dragonrage: TTD>=30 — fires with burst toggle OR auto CDs OR 3+ enemies (always use in AoE)
+      spell.cast(S.dragonrage, () => this.getCurrentTarget(), () =>
+        (this.useCDs() || this.getEnemyCount() >= 3) && (this.getEnemyCount() >= 3 || this.targetTTD() >= 15000)
       ),
-      
-      EvokerCommon.castEmpowered("Fire Breath", 3, on => me.target, 
-        req => me.target && 
-               me.hasAura("Scorching Embers") && 
-               (spell.getCooldown("Engulf").timeleft <= spell.getSpell("Fire Breath").castTime + 500 || 
-                spell.getCooldown("Engulf").timeleft <= 0) && 
-               me.hasAura(auras.engulf) && 
-               (!me.hasAura(auras.font_of_magic) || me.target.timeToDie <= spell.getSpell("Fire Breath").castTime) && 
-               conditions()
+
+      // 3. Hover: auto-use when empowers are ready and moving (critical for DPS)
+      spell.cast(S.hover, () => me, () => {
+        if (me.hasAura(A.hover)) return false;
+        // Always Hover when moving + empower is off CD (empowers are huge DPS)
+        if (me.isMoving() && spell.getChargesFractional(S.hover) > 0.3 &&
+            (!spell.isOnCooldown(S.eternitySurge) || !spell.isOnCooldown(S.fireBreath))) return true;
+        // Optional Slipstream usage
+        if (Settings.FWDevEHover && spell.isSpellKnown(T.slipstream)) return true;
+        return false;
+      }),
+
+      // 4. Azure Sweep: high priority when ES coming off CD soon (if talented)
+      spell.cast(S.azureSweep, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.azureSweep) &&
+        (this.getEB() === 0 || this.getEB() < 2) &&
+        (spell.getCooldown(S.eternitySurge)?.timeleft || 99999) <= 6000
       ),
-      EvokerCommon.castEmpowered("Fire Breath", 4, on => me.target, 
-        req => me.target && 
-               me.hasAura("Scorching Embers") && 
-               (spell.getCooldown("Engulf").timeleft <= spell.getSpell("Fire Breath").castTime + 500 || 
-                spell.getCooldown("Engulf").timeleft <= 0) && 
-               me.hasAura(auras.engulf) && 
-               me.hasAura(auras.font_of_magic) && 
-               conditions()
+
+      // 5. ES R1 (SC always R1) — only when off CD and not moving (or Hover up)
+      this.castEmpowered(S.eternitySurge, 1, () => this.getCurrentTarget(), () =>
+        !spell.isOnCooldown(S.eternitySurge) && (!me.isMoving() || me.hasAura(A.hover))
       ),
-      
-      // Standard Fire Breath usage for different situations
-      EvokerCommon.castEmpowered("Fire Breath", 1, on => me.target, 
-        req => me.target && 
-               ((this.getAuraRemainingTime(auras.dragonRage) < 1.75 * this.getSpellHaste() && 
-                 this.getAuraRemainingTime(auras.dragonRage) >= 1 * this.getSpellHaste()) && 
-                me.hasAura("Animosity") && 
-                this.hasVariable("can_extend_dr") || 
-                combat.targets.length === 1) && 
-               me.target.timeToDie <= spell.getSpell("Fire Breath").castTime && 
-               conditions()
+
+      // 6. TtS: off-GCD, only when Fire Breath is READY
+      spell.cast(S.tipTheScales, () => me, () =>
+        !spell.isOnCooldown(S.fireBreath)
       ),
-      EvokerCommon.castEmpowered("Fire Breath", 2, on => me.target, 
-        req => me.target && 
-               ((this.getAuraRemainingTime(auras.dragonRage) < 2.5 * this.getSpellHaste() && 
-                 this.getAuraRemainingTime(auras.dragonRage) >= 1.75 * this.getSpellHaste()) && 
-                me.hasAura("Animosity") && 
-                this.hasVariable("can_extend_dr") || 
-                me.hasAura("Scorching Embers") || 
-                combat.targets.length >= 2) && 
-               me.target.timeToDie <= me.target.hasAura("Fire Breath").remaining && 
-               conditions()
+
+      // 7. FB R1 (SC always R1) — only when off CD and not moving (or Hover up)
+      this.castEmpowered(S.fireBreath, 1, () => this.getCurrentTarget(), () =>
+        !spell.isOnCooldown(S.fireBreath) && (!me.isMoving() || me.hasAura(A.hover))
       ),
-      
-      EvokerCommon.castEmpowered("Fire Breath", 3, on => me.target, 
-        req => me.target && 
-               (!me.hasAura(auras.font_of_magic) || 
-                (this.getAuraRemainingTime(auras.dragonRage) <= 3.25 * this.getSpellHaste() && 
-                 this.getAuraRemainingTime(auras.dragonRage) >= 2.5 * this.getSpellHaste()) && 
-                me.hasAura("Animosity") && 
-                this.hasVariable("can_extend_dr") || 
-                me.hasAura("Scorching Embers")) && 
-               me.target.timeToDie <= me.target.hasAura("Fire Breath").remaining && 
-               conditions()
+
+      // 8. Deep Breath: Imminent Destruction AoE OR general fallback when off CD
+      spell.cast(S.deepBreath, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.immDestruction) ? this.usePyre() : !spell.isOnCooldown(S.deepBreath)
       ),
-      
-      EvokerCommon.castEmpowered("Fire Breath", 4, on => me.target, 
-        req => me.target && conditions()
-      )
+
+      // 9. Disintegrate: Mass Disint stacks — target_if=min:bombardments.remains
+      spell.cast(S.disintegrate, () => this.getBombTarget(), () => {
+        if (me.isMoving()) return false;
+        if (!me.hasAura(A.massDisintStacks)) return false;
+        return this.getEB() >= 1 || this.getEss() >= 2;
+      }),
+
+      // 10. Pyre: !mass_disint + use_pyre (4+ or 3+ with talents)
+      spell.cast(S.pyre, () => this.getCurrentTarget(), () =>
+        !me.hasAura(A.massDisintStacks) && this.usePyre() &&
+        (this.getEB() >= 1 || this.getEss() >= 2)
+      ),
+
+      // 11. Disintegrate: normal — target_if=max:fire_breath_dot.remains
+      spell.cast(S.disintegrate, () => this.getFBDotTarget(), () =>
+        !me.isMoving() && (this.getEB() >= 1 || this.getEss() >= 2)
+      ),
+
+      // 12. Azure Sweep (unconditional)
+      spell.cast(S.azureSweep, () => this.getCurrentTarget()),
+
+      // 13. Living Flame with procs: burnout | (leaping|ancient|engulfing) & !moving
+      spell.cast(S.livingFlame, () => this.getCurrentTarget(), () =>
+        !me.isMoving() && (me.hasAura(A.burnout) || me.hasAura(A.leapingFlames) ||
+          me.hasAura(A.ancientFlame) || spell.isSpellKnown(T.engulfingBlaze))
+      ),
+
+      // 14. Green: Ancient Flame + Scarlet Adaptation, not in DR
+      spell.cast(S.emeraldBlossom, () => me, () =>
+        spell.isSpellKnown(T.ancientFlame) && !me.hasAura(A.ancientFlame) &&
+        spell.isSpellKnown(T.scarletAdapt) && !this.inDR()
+      ),
+      spell.cast(S.verdantEmbrace, () => me, () =>
+        spell.isSpellKnown(T.ancientFlame) && !me.hasAura(A.ancientFlame) &&
+        spell.isSpellKnown(T.scarletAdapt) && !this.inDR()
+      ),
+
+      // 15. Living Flame filler (no procs needed)
+      spell.cast(S.livingFlame, () => this.getCurrentTarget(), () => !me.isMoving()),
+
+      // 16. Azure Strike
+      spell.cast(S.azureStrike, () => this.getCurrentTarget()),
     );
   }
 
-  callEternitySurge(conditions) {
+  // =============================================
+  // FLAMESHAPER ST (SimC actions.st_fs, 14 lines — ALL matched)
+  // =============================================
+  stFS() {
     return new bt.Selector(
-      // Eternity Surge with dynamic empower levels
-      EvokerCommon.castEmpowered("Eternity Surge", 1, on => me.target, 
-        req => me.target && 
-               (combat.targets.length <= 1 + (me.hasAura(auras.eternitys_span) ? 1 : 0) || 
-                (this.hasVariable("can_extend_dr") && 
-                 me.hasAura("Animosity") || 
-                 me.hasAura(auras.massDisintegrate)) && 
-                combat.targets.length > (3 + (me.hasAura(auras.font_of_magic) ? 1 : 0) + 
-                                         (me.hasAura(auras.eternitys_span) ? 4 : 0)) || 
-                this.getAuraRemainingTime(auras.dragonRage) < 1.75 * this.getSpellHaste() && 
-                this.getAuraRemainingTime(auras.dragonRage) >= 1 * this.getSpellHaste() && 
-                me.hasAura("Animosity") && 
-                this.hasVariable("can_extend_dr")) && 
-                conditions()
-      ),
-      EvokerCommon.castEmpowered("Eternity Surge", 2, on => me.target, 
-        req => me.target && 
-               (combat.targets.length <= 2 + 2 * (me.hasAura(auras.eternitys_span) ? 1 : 0) || 
-                this.getAuraRemainingTime(auras.dragonRage) < 2.5 * this.getSpellHaste() && 
-                this.getAuraRemainingTime(auras.dragonRage) >= 1.75 * this.getSpellHaste() && 
-                me.hasAura("Animosity") && 
-                this.hasVariable("can_extend_dr")) && 
-                conditions()
-      ),
-      
-      EvokerCommon.castEmpowered("Eternity Surge", 3, on => me.target, 
-        req => me.target && 
-               (combat.targets.length <= 3 + 3 * (me.hasAura(auras.eternitys_span) ? 1 : 0) || 
-                !me.hasAura(auras.font_of_magic) && me.hasAura(auras.massDisintegrate) || 
-                this.getAuraRemainingTime(auras.dragonRage) <= 3.25 * this.getSpellHaste() && 
-                this.getAuraRemainingTime(auras.dragonRage) >= 2.5 * this.getSpellHaste() && 
-                me.hasAura("Animosity") && 
-                this.hasVariable("can_extend_dr")) && 
-                conditions()
-      ),
-      EvokerCommon.castEmpowered("Eternity Surge", 4, on => me.target, 
-        req => me.target && 
-               (me.hasAura(auras.massDisintegrate) || 
-                combat.targets.length <= 4 + 4 * (me.hasAura(auras.eternitys_span) ? 1 : 0)) && 
-                conditions()
+      // 1. Dragonrage: fires with burst toggle OR auto CDs OR 3+ enemies
+      spell.cast(S.dragonrage, () => this.getCurrentTarget(), () =>
+        (this.useCDs() || this.getEnemyCount() >= 3) && (this.getEnemyCount() >= 3 || this.targetTTD() >= 15000)
       ),
 
-      // Fallback for custom empower level based on target count
-      EvokerCommon.castEmpowered("Eternity Surge", 
+      // 2. Hover: auto when moving + empowers ready
+      spell.cast(S.hover, () => me, () => {
+        if (me.hasAura(A.hover)) return false;
+        if (me.isMoving() && spell.getChargesFractional(S.hover) > 0.3 &&
+            (!spell.isOnCooldown(S.eternitySurge) || !spell.isOnCooldown(S.fireBreath))) return true;
+        if (Settings.FWDevEHover && spell.isSpellKnown(T.slipstream)) return true;
+        return false;
+      }),
+
+      // 3. TtS during DR: ES before FB priority
+      spell.cast(S.tipTheScales, () => me, () =>
+        this.inDR() && (spell.getCooldown(S.eternitySurge)?.timeleft || 99999) <=
+          (spell.getCooldown(S.fireBreath)?.timeleft || 99999)
+      ),
+
+      // 4. Berserking during DR
+      spell.cast(S.berserking, () => me, () => this.inDR()),
+
+      // 5. ES R2 at 2 enemies without Eternity's Span
+      this.castEmpowered(S.eternitySurge, 2, () => this.getCurrentTarget(), () =>
+        (!me.isMoving() || me.hasAura(A.hover)) &&
+        this.getEnemyCount() === 2 && !spell.isSpellKnown(T.eternitysSpan) &&
+        (this.canUseEmpower() || (me.hasAura(A.azureSweepBuff) && spell.isSpellKnown(T.azureSweep)))
+      ),
+
+      // 6. ES R1 (default): SimC: can_use_empower | 2pc+azure_sweep
+      this.castEmpowered(S.eternitySurge, 1, () => this.getCurrentTarget(), () =>
+        (!me.isMoving() || me.hasAura(A.hover)) &&
+        (this.canUseEmpower() || (me.hasAura(A.azureSweepBuff) && spell.isSpellKnown(T.azureSweep)))
+      ),
+
+      // 7. FB R1: refreshable DoT + can_use_empower + !TtS
+      // SimC: can_use_empower & !tip_the_scales & dot.refreshable &
+      //       (DR.CD>full_recharge | DR.up | full_recharge<gcd*5)
+      this.castEmpowered(S.fireBreath, 1, () => this.getCurrentTarget(), () => {
+        if (me.isMoving() && !me.hasAura(A.hover)) return false;
+        if (me.hasAura(A.tipTheScales)) return false;
+        if (!this.canUseEmpower()) return false;
+        const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+        if (fbDot && fbDot.remaining > 6000) return false; // not refreshable
+        const drCD = spell.getCooldown(S.dragonrage)?.timeleft || 99999;
+        const fbRecharge = spell.getFullRechargeTime(S.fireBreath) || 0;
+        return this.inDR() ||
+          (fbRecharge < 7500) ||
+          (drCD > fbRecharge) ||
+          !spell.isSpellKnown(T.animosity);
+      }),
+
+      // 7b. Deep Breath: baseline AoE damage (Imm Dest: when no FB DoT, otherwise on CD)
+      spell.cast(S.deepBreath, () => this.getCurrentTarget(), () => {
+        if (spell.isSpellKnown(T.immDestruction)) {
+          const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+          return !fbDot || fbDot.remaining < 1000;
+        }
+        return this.getEnemyCount() >= 2; // Without Imm Dest, only use in AoE
+      }),
+
+      // 8. Pyre: 2+ targets with FB DoT <= 8s + Feed the Flames + Volatility
+      spell.cast(S.pyre, () => this.getCurrentTarget(), () => {
+        if (this.getEnemyCount() < 2) return false;
+        const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+        return fbDot && fbDot.remaining <= 8000 && spell.isSpellKnown(T.feedTheFlames) &&
+          spell.isSpellKnown(T.volatility) && (this.getEB() >= 1 || this.getEss() >= 2);
+      }),
+
+      // 9. Disintegrate: chain, target with max FB DoT (Consume Flame value)
+      spell.cast(S.disintegrate, () => this.getFBDotTarget(), () =>
+        !me.isMoving() && (this.getEB() >= 1 || this.getEss() >= 2)
+      ),
+
+      // 10. Azure Sweep
+      spell.cast(S.azureSweep, () => this.getCurrentTarget()),
+
+      // 11. Living Flame with procs
+      spell.cast(S.livingFlame, () => this.getCurrentTarget(), () =>
+        !me.isMoving() && (me.hasAura(A.burnout) || me.hasAura(A.leapingFlames) || me.hasAura(A.ancientFlame))
+      ),
+
+      // 12. Azure Strike 2+
+      spell.cast(S.azureStrike, () => this.getCurrentTarget(), () => this.getEnemyCount() > 1),
+
+      // 13. Living Flame filler
+      spell.cast(S.livingFlame, () => this.getCurrentTarget(), () => !me.isMoving()),
+
+      // 14. Green + Azure Strike
+      spell.cast(S.emeraldBlossom, () => me, () =>
+        spell.isSpellKnown(T.ancientFlame) && !me.hasAura(A.ancientFlame) &&
+        spell.isSpellKnown(T.scarletAdapt) && !this.inDR()
+      ),
+      spell.cast(S.verdantEmbrace, () => me, () =>
+        spell.isSpellKnown(T.ancientFlame) && !me.hasAura(A.ancientFlame) &&
+        spell.isSpellKnown(T.scarletAdapt) && !this.inDR()
+      ),
+      spell.cast(S.azureStrike, () => this.getCurrentTarget()),
+    );
+  }
+
+  // (aoeSC removed — SC uses unified scRotation() per SimC)
+
+  // =============================================
+  // FLAMESHAPER AoE (SimC actions.aoe_fs, 15 lines — ALL matched)
+  // =============================================
+  aoeFS() {
+    return new bt.Selector(
+      // 1. Hover: auto when moving + empowers ready
+      spell.cast(S.hover, () => me, () => {
+        if (me.hasAura(A.hover)) return false;
+        if (me.isMoving() && spell.getChargesFractional(S.hover) > 0.3 &&
+            (!spell.isOnCooldown(S.eternitySurge) || !spell.isOnCooldown(S.fireBreath))) return true;
+        if (Settings.FWDevEHover && spell.isSpellKnown(T.slipstream)) return true;
+        return false;
+      }),
+
+      // 1b. Dragonrage: fires in AoE without burst toggle
+      spell.cast(S.dragonrage, () => this.getCurrentTarget(), () =>
+        (this.useCDs() || this.getEnemyCount() >= 3) && (this.getEnemyCount() >= 3 || this.targetTTD() >= 15000)
+      ),
+
+      // 2. FB R1 pre-DR: no active FB DoT & DR coming up
+      this.castEmpowered(S.fireBreath, 1, () => this.getCurrentTarget(), () => {
+        if (me.isMoving() && !me.hasAura(A.hover)) return false;
+        const drCD = spell.getCooldown(S.dragonrage)?.timeleft || 99999;
+        if (drCD > 3000) return false;
+        const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+        return (!fbDot || fbDot.remaining < 1000) && (this.getEnemyCount() >= 3 || this.targetTTD() > 15000);
+      }),
+
+      // 3. Tip the Scales during DR: ES before FB
+      spell.cast(S.tipTheScales, () => me, () =>
+        this.inDR() && (spell.getCooldown(S.eternitySurge)?.timeleft || 99999) <=
+          (spell.getCooldown(S.fireBreath)?.timeleft || 99999)
+      ),
+
+      // 4. ES sub-list: TtS up
+      new bt.Decorator(() => me.hasAura(A.tipTheScales), this.es(), new bt.Action(() => bt.Status.Failure)),
+
+      // 5. FB R1: Consume Flame + can_use_empower + refreshable
+      this.castEmpowered(S.fireBreath, 1, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.consumeFlame) || !this.canUseEmpowerAoE()) return false;
+        const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+        return !fbDot || fbDot.remaining < 6000;
+      }),
+
+      // 6. Dragonrage (moved to top — 1b)
+      spell.cast(S.dragonrage, () => this.getCurrentTarget(), () =>
+        (this.useCDs() || this.getEnemyCount() >= 3) && (this.getEnemyCount() >= 3 || this.targetTTD() >= 15000)
+      ),
+
+      // 7. ES: (DR or prep) & (DR or consume_flame & !azure_sweep) & (!FB DoT or enemies<=3)
+      new bt.Decorator(
         () => {
-          const targetCount = combat.targets.length;
-          if (targetCount >= 7) return 4;
-          if (targetCount >= 5) return 3;
-          if (targetCount >= 3) return 2;
-          return 1;
-        }, 
-        on => me.target, 
-        req => me.target && combat.targets.length > 0 && conditions()
-      )
-    );
-  }
-
-  // Helper for calling green spells
-  callGreenSpells(conditions) {
-    return new bt.Selector(
-      spell.cast("Emerald Blossom", on => me,
-        req => conditions()
+          if (!this.inDR() && !this.canUseEmpowerAoE()) return false;
+          if (!this.inDR() && !(spell.isSpellKnown(T.consumeFlame) && !me.hasAura(A.azureSweepBuff))) return false;
+          const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+          return !fbDot || fbDot.remaining < 1000 || this.getEnemyCount() <= 3;
+        },
+        this.es(),
+        new bt.Action(() => bt.Status.Failure)
       ),
-      spell.cast("Verdant Embrace", on => me,
-        req => conditions()
-      )
+
+      // 8. Pyre: CB >= 12 or 4+ targets or 3+ with talents
+      // SimC: DR.CD>gcd*4 & (CB>=12 | enemies>=4 | enemies>=3 & (ftf|vol))
+      spell.cast(S.pyre, () => this.getCurrentTarget(), () => {
+        const e = this.getEnemyCount();
+        if (e < 3) return false;
+        const drCD = spell.getCooldown(S.dragonrage)?.timeleft || 99999;
+        if (drCD <= 6000) return false;
+        return (this.getCBStacks() >= 12 || e >= 4 ||
+          (e >= 3 && (spell.isSpellKnown(T.feedTheFlames) || spell.isSpellKnown(T.volatility)))) &&
+          (this.getEB() >= 1 || this.getEss() >= 2);
+      }),
+
+      // 9. Pyre: 3 targets without Feed/Volatility
+      spell.cast(S.pyre, () => this.getCurrentTarget(), () =>
+        this.getEnemyCount() === 3 && !spell.isSpellKnown(T.feedTheFlames) &&
+        !spell.isSpellKnown(T.volatility) && (this.getEB() >= 1 || this.getEss() >= 2)
+      ),
+
+      // 10. Deep Breath: Imminent Destruction (no FB DoT) OR general use on CD
+      spell.cast(S.deepBreath, () => this.getCurrentTarget(), () => {
+        if (spell.isSpellKnown(T.immDestruction)) {
+          const fbDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+          return !fbDot || fbDot.remaining < 1000;
+        }
+        return true; // No Imm Dest — use on CD as AoE damage
+      }),
+
+      // 11. Azure Sweep
+      spell.cast(S.azureSweep, () => this.getCurrentTarget()),
+
+      // 12. Living Flame: Leaping Flames + procs + EB/essence check
+      // SimC: leaping_flames & (!burnout | burnout.up | active_dot.fb=0 | scarlet | ancient_flame) &
+      //       (!EB.up & essence.deficit>1 | FB.CD<=gcd*3 & EB<max)
+      spell.cast(S.livingFlame, () => this.getCurrentTarget(), () => {
+        if (!me.hasAura(A.leapingFlames) || me.isMoving()) return false;
+        const hasFBDot = this.getCurrentTarget()?.getAuraByMe(A.fireBreathDot);
+        if (!me.hasAura(A.burnout) && !me.hasAura(A.scarletAdaptation) && !me.hasAura(A.ancientFlame) && hasFBDot) {
+          return spell.isSpellKnown(T.burnout);
+        }
+        const fbCD = spell.getCooldown(S.fireBreath)?.timeleft || 99999;
+        return (this.getEB() === 0 && this.getEssDef() > 1) ||
+          (fbCD <= 4500 && this.getEB() < 2);
+      }),
+
+      // 13. ES: (DR or prep) + Azure Sweep buff
+      new bt.Decorator(
+        () => (this.inDR() || this.canUseEmpowerAoE()) && me.hasAura(A.azureSweepBuff),
+        this.es(),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+
+      // 14. Living Flame: Engulfing Blaze + procs
+      spell.cast(S.livingFlame, () => this.getCurrentTarget(), () =>
+        !me.isMoving() && (me.hasAura(A.leapingFlames) || me.hasAura(A.burnout) ||
+          me.hasAura(A.scarletAdaptation) || me.hasAura(A.ancientFlame))
+      ),
+
+      // 15. Azure Strike
+      spell.cast(S.azureStrike, () => this.getCurrentTarget()),
     );
   }
 
-  // Helper functions for variable and state checks
-  hasSetBonus(tier, pieces) {
-    if (tier === 1 && pieces === 4) {
-      // Check for previous tier (TWW S1) 4pc bonus
-      return Settings.EvokerDevastation4PreviousSet;
-    } else if (tier === 2 && pieces === 4) {
-      // Check for current tier (TWW S2) 4pc bonus
-      return Settings.EvokerDevastation4Set;
-    }
-    
-    // Default to false for any other combinations
-    return false;
+  // =============================================
+  // HELPERS
+  // =============================================
+  isSC() { return spell.isSpellKnown(T.massDisintegrate); }
+  isFS() { return !this.isSC(); }
+  inDR() { return me.hasAura(A.dragonrage); }
+  useCDs() { return combat.burstToggle || Settings.FWDevEAutoCDs; }
+
+  // SimC: variable.use_pyre = enemies>=4 | enemies>=3 & (volatility.rank=2 | feed_the_flames)
+  usePyre() {
+    const e = this.getEnemyCount();
+    return e >= 4 || (e >= 3 && (spell.isSpellKnown(T.feedTheFlames) || spell.isSpellKnown(T.volatility)));
   }
 
-  getAuraRemainingTime(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.remaining : 0;
-  }
-  
-  getAuraStacks(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.stacks : 0;
-  }
-
-  getSpellHaste() {
-    return (1 + me.modSpellHaste / 100);
+  // SimC: can_use_empower = DR.CD >= gcd*dr_prep_time (6 for ST, 4 for AoE)
+  // Fix: if DR is ready but won't fire (TTD too low), don't block empowers
+  canUseEmpower() {
+    if (!spell.isSpellKnown(S.dragonrage) || !spell.isSpellKnown(T.animosity)) return true;
+    const drCD = spell.getCooldown(S.dragonrage)?.timeleft || 0;
+    // DR is ready but TTD is too low to use it — don't lock out empowers
+    if (drCD === 0 && this.targetTTD() < 15000) return true;
+    return drCD >= 9000;
   }
 
-  getEssence() {
-    return me.powerByType(PowerType.Essence);
-  }
-  
-  getEssenceDeficit() {
-    return me.powerByType(PowerType.Essence, true);
-  }
-  
-  getEssenceBurstStacks() {
-    return this.getAuraStacks(auras.essenceBurst);
-  }
-  
-  getEssenceBurstMaxStacks() {
-    const aura = me.getAura(auras.essenceBurst);
-    return aura ? aura.maxStacks : 2; // Default to 2 if aura not found
-  }
-  
-  getActiveDots(dotName) {
-    // Count how many targets have this dot
-    if (!combat.targets || !Array.isArray(combat.targets)) {
-      return 0;
-    }
-    return combat.targets.filter(unit => unit && unit.hasAura && unit.hasAura(dotName)).length;
-  }
-  
-
-  /**
-   * Checks if a specific variable exists for a spell or game state
-   * 
-   * @param {string} variableName - The name of the variable to check
-   * @returns {boolean} True if the variable exists and is set, false otherwise
-   */
-  hasVariable(variableName) {
-    // Initialize variables object if it doesn't exist
-    if (!this._variables) {
-      this._variables = {};
-    }
-    
-    // Return true if the variable exists, false otherwise
-    return this._variables[variableName] === true;
+  canUseEmpowerAoE() {
+    if (!spell.isSpellKnown(S.dragonrage) || !spell.isSpellKnown(T.animosity)) return true;
+    const drCD = spell.getCooldown(S.dragonrage)?.timeleft || 0;
+    if (drCD === 0 && this.targetTTD() < 15000) return true;
+    return drCD >= 6000;
   }
 
-  /**
-   * Gets a variable's value for tracking spell states or conditions
-   * 
-   * @param {string} variableName - The name of the variable to get
-   * @returns {any} The variable value or undefined if not set
-   */
-  getVariable(variableName) {
-    // Initialize variables object if it doesn't exist
-    if (!this._variables) {
-      this._variables = {};
+  // Bombardments target: min:bombardments.remains
+  getBombTarget() {
+    if (!combat.targets || combat.targets.length <= 1) return this.getCurrentTarget();
+    let best = null;
+    let bestRem = 99999;
+    for (const t of combat.targets) {
+      if (!t || !common.validTarget(t) || me.distanceTo(t) > 25) continue;
+      const bomb = t.getAuraByMe(A.bombardments);
+      if (bomb && bomb.remaining < bestRem) {
+        bestRem = bomb.remaining;
+        best = t;
+      }
     }
-    
-    return this._variables[variableName];
-  }
-  
-  /**
-   * Sets a variable for tracking spell states or conditions
-   * 
-   * @param {string} variableName - The name of the variable to set
-   * @param {any} value - The value to set
-   */
-  setVariable(variableName, value = true) {
-    // Initialize variables object if it doesn't exist
-    if (!this._variables) {
-      this._variables = {};
-    }
-    
-    // Set the variable
-    this._variables[variableName] = value;
-  }
-  
-  /**
-   * Clears a variable
-   * 
-   * @param {string} variableName - The name of the variable to clear
-   */
-  clearVariable(variableName) {
-    // Initialize variables object if it doesn't exist
-    if (!this._variables) {
-      this._variables = {};
-    }
-    
-    // Remove the variable
-    delete this._variables[variableName];
+    return best || this.getCurrentTarget();
   }
 
-  getGcdMax() {
-    // Get the base GCD value (usually 1.5s without haste)
-    return 1500 / (1 + (me.modSpellHaste / 100));
+  // FB DoT target: max:fire_breath_damage.remains (maximize Consume Flame)
+  getFBDotTarget() {
+    if (!combat.targets || combat.targets.length <= 1) return this.getCurrentTarget();
+    let best = null;
+    let bestRem = 0;
+    for (const t of combat.targets) {
+      if (!t || !common.validTarget(t) || me.distanceTo(t) > 25) continue;
+      const fb = t.getAuraByMe(A.fireBreathDot);
+      if (fb && fb.remaining > bestRem) {
+        bestRem = fb.remaining;
+        best = t;
+      }
+    }
+    return best || this.getCurrentTarget();
   }
-  /**
-   * Initializes the variables system for the rotation
-   * This should be called when the behavior starts
-   */
-  initializeVariables() {
-    // Create the variables storage if it doesn't exist
-    this._variables = {};
-    
-    // Set initial values for key variables based on APL
-    this.setVariable("dr_prep_time_aoe", Settings.EvokerDevastationDRPrepTimeAOE * 1000);
-    this.setVariable("pool_for_cb", false);
-    this.setVariable("dr_prep_time_st", Settings.EvokerDevastationDRPrepTimeST * 1000);
-    this.setVariable("can_extend_dr", false);
-    this.setVariable("pyre_st", false); // Per APL
-    this.setVariable("es_send_threshold", Settings.EvokerDevastationESSendThreshold || 8);
-    this.setVariable("pool_for_id", Settings.EvokerDevastationPoolResourcesForDR);
-    this.setVariable("next_dragonrage", 999999); // Initialize with large value, updated in updateVariables
-    return bt.Status.succes;
+
+  getEB() {
+    if (this._ebFrame === wow.frameTime) return this._cachedEB;
+    this._ebFrame = wow.frameTime;
+    const a = me.getAura(A.essenceBurst);
+    this._cachedEB = a ? a.stacks : 0;
+    return this._cachedEB;
+  }
+
+  getCBStacks() {
+    if (this._cbFrame === wow.frameTime) return this._cachedCB;
+    this._cbFrame = wow.frameTime;
+    const a = me.getAura(A.chargedBlast);
+    this._cachedCB = a ? a.stacks : 0;
+    return this._cachedCB;
+  }
+
+  getEss() {
+    if (this._essFrame === wow.frameTime) return this._cachedEssence;
+    this._essFrame = wow.frameTime;
+    this._cachedEssence = me.powerByType(PowerType.Essence);
+    return this._cachedEssence;
+  }
+
+  getEssDef() {
+    if (this._essDefFrame === wow.frameTime) return this._cachedEssDef;
+    this._essDefFrame = wow.frameTime;
+    const max = me.maxPowerByType ? me.maxPowerByType(PowerType.Essence) : 5;
+    this._cachedEssDef = max - me.powerByType(PowerType.Essence);
+    return this._cachedEssDef;
+  }
+
+  getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const target = me.target;
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 25 && me.isFacing(target)) {
+      this._cachedTarget = target;
+      return target;
+    }
+    if (me.inCombat()) {
+      const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (t && common.validTarget(t) && me.isFacing(t)) { this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
+  }
+
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(10) + 1 : 1;
+    return this._cachedEnemyCount;
+  }
+
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
   }
 }

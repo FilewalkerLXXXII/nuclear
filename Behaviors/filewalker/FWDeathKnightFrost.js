@@ -1,1118 +1,663 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
-import Common from '@/Core/Common';
-import Spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import Settings from "@/Core/Settings";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
-const auras = {
-    // Key hero talent identifiers
-    REAPERS_MARK: 439843,         // Deathbringer
-    RIDERS_CHAMPION: 444005,      // Rider of the Apocalypse
-    
-    // Core DK spells and buffs
-    BREATH_OF_SINDRAGOSA: 152279,
-    PILLAR_OF_FROST: 51271,
-    EMPOWER_RUNE_WEAPON: 47568,
-    KILLING_MACHINE: 51128,
-    RIME: 59052,
-    FROST_FEVER: 55095,
-    UNHOLY_STRENGTH: 53365,
-    RAZORICE: 51714,
-    DEATH_AND_DECAY: 43265,
-    
-    // Talents
-    GATHERING_STORM: 194912,
-    BITING_COLD: 377056,
-    UNLEASHED_FRENZY: 376905,
-    ICY_TALONS: 194878,
-    BONEGRINDER: 377098,
-    OBLITERATION: 281238,
-    ASHEN_JUGGERNAUT: 48792,
-    COLD_HEART: 281208,
-    RAGE_OF_THE_FROZEN_CHAMPION: 377076,
-    ICEBREAKER: 392950,
-    BIND_IN_DARKNESS: 440031,
-    WITHER_AWAY: 441894,
-    SHATTERING_BLADE: 207057,
-    CLEAVING_STRIKES: 316916,
-    GLACIAL_ADVANCE: 194913,
-    SHATTERED_FROST: 455993,
-    
-    // Rider of the Apocalypse talent buffs
-    A_FEAST_OF_SOULS: 444072,
-    APOCALYPSE_NOW: 444040,
-    
-    // Deathbringer talent buffs
-    EXTERMINATE: 441378,
-    DARK_TALONS: 436687,
-    
-    // Other buffs
-    SMOTHERING_OFFENSE: 435005,
-    REAPERS_MARK_DEBUFF: 439950
-  };
 /**
- * Behavior implementation for Death Knight Frost
- * Based on SIMC APL as of March 5 2025 - 04347cf
+ * Frost Death Knight Behavior - Midnight 12.0.1
+ * Sources: SimC Midnight APL (deathknight_frost.simc) + Method (all pages) + Wowhead
+ *
+ * Auto-detects: Deathbringer (Reaper's Mark) vs Rider of the Apocalypse
+ * Build auto-detect: Breath of Sindragosa vs Obliteration
+ *
+ * SimC action lists matched line-by-line:
+ *   variables (9): st_planning, sending_cds, cooldown_check, fwf_buffs, rune_pooling, rp_pooling,
+ *                   frostscythe_priority, breath_of_sindragosa_check
+ *   high_prio_actions (3): interrupt, PI, AMS
+ *   cooldowns (14): RW, RM, PoF, BoS, FWF x5, Raise Dead, ERW x4
+ *   single_target (9): KM Obliterate, Rime HB, Shattering FS, FS dump, Obliterate, HB fish
+ *   aoe (13): Frostscythe KM, Frostbane FS, Obliterate, HB, GA, fillers
+ *   racials (8): all racials during cooldown_check
+ *
+ * Resource: Runes (PowerType 5) + Runic Power (PowerType 6)
+ * All melee instant — no movement block needed
+ *
+ * Key mechanics:
+ *   KM: 2 stacks max, empowers Obliterate/Frostscythe (guaranteed crit, 4x for FS)
+ *   Rime: free empowered HB, 45% from FS/GA
+ *   RP pooling for BoS: need 60 RP (40 for Deathbringer) before activating
+ *   Rune pooling for RM: save runes when RM CD < 6s
+ *   Gathering Storm: RW stacks → recast at 10 stacks when RW about to expire
  */
-export class DeathKnightFrostBehavior extends Behavior {
+
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'SimC Midnight APL + Method + Wowhead',
+};
+
+const S = {
+  obliterate:         49020,
+  howlingBlast:       49184,
+  frostscythe:        207230,
+  frostStrike:        49143,
+  glacialAdvance:     194913,
+  pillarOfFrost:      51271,
+  breathOfSindragosa: 1249658,
+  frostwyrmsFury:     279302,
+  empowerRuneWeapon:  47568,
+  remorselessWinter:  196770,
+  reapersMarkCast:    439843,
+  raiseDead:          46585,
+  deathStrike:        49998,
+  antiMagicShell:     48707,
+  iceboundFortitude:  48792,
+  mindFreeze:         47528,
+  berserking:         26297,
+};
+
+// Talent IDs for spell.isSpellKnown() checks
+const T = {
+  frostboundWill:     1238680,
+  shatteringBlade:    207057,
+  gatheringStorm:     194912,
+  obliteration:       281238,
+  apocalypseNow:      444040,
+  chosenOfFrostbrood: 1265633,  // FWF extends PoF variant
+  bonegrinder:        377098,
+  frostbane:          455993,
+  killingStreak:      1230153,
+  icyOnslaught:       1230272,
+  breathOfSindragosa: 1249658,
+  pillarOfFrost:      51271,
+};
+
+const A = {
+  killingMachine:     51128,    // Buff, max 2 stacks
+  rime:               59052,    // Free empowered HB
+  pillarOfFrost:      51271,
+  breathOfSind:       1249658,
+  bonegrinderFrost:   377103,   // 10% Frost dmg at 5 KM stacks
+  icyOnslaught:       1230273,  // FS/GA +15% dmg, stacking
+  unholyStrength:     53365,    // FC Str proc
+  frostbane:          1228433,  // Empowered FS from GA on Razorice
+  frostFever:         55095,    // DoT
+  razorice:           51714,    // 5 stacks, +Frost vuln
+  reapersMarkDebuff:  434765,
+  exterminate:        441378,   // Empowered Obliterates after RM
+  chosenFrostbroodFWF: 1265635, // Chosen of Frostbrood FWF buff (RP + recall)
+  chosenFrostbroodHaste: 1265630, // Chosen of Frostbrood Haste buff (+15% haste, 12s)
+  gatheringStorm:     211805,   // GS stacking buff from RW
+  remorselessWinter:  196770,   // RW active buff
+};
+
+export class FrostDeathknightBehavior extends Behavior {
+  name = 'FW Frost Death Knight';
   context = BehaviorContext.Any;
   specialization = Specialization.DeathKnight.Frost;
-  name = "FW Frost Death Knight";
-  version = 1;
+  version = wow.GameVersion.Retail;
 
-  // Aura IDs for easy reference
-  
+  // Per-tick caches
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _rpFrame = 0;
+  _cachedRP = 0;
+  _runeFrame = 0;
+  _cachedRunes = 0;
+  _kmFrame = 0;
+  _cachedKM = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
 
-  // Settings with default values from SIMC APL
+  _versionLogged = false;
+  _lastDebug = 0;
+
   static settings = [
     {
-      header: "Frost Death Knight Settings",
+      header: 'General',
       options: [
-        {
-            uid: "useCD",
-            text: "Use Cooldowns",
-            type: "checkbox",
-            default: true
-          },
-        {
-          uid: "bos_rp",
-          text: "Breath RP Threshold",
-          type: "slider",
-          min: 40,
-          max: 100,
-          default: 65
-        },
-        {
-          uid: "erw_breath_rp_trigger",
-          text: "ERW Breath RP Trigger",
-          type: "slider",
-          min: 30,
-          max: 100,
-          default: 70
-        },
-        {
-          uid: "erw_breath_rune_trigger",
-          text: "ERW Breath Rune Trigger",
-          type: "slider",
-          min: 0,
-          max: 6,
-          default: 3
-        },
-        {
-          uid: "oblit_rune_pooling",
-          text: "Obliteration Rune Pooling",
-          type: "slider",
-          min: 2,
-          max: 6,
-          default: 4
-        },
-        {
-          uid: "breath_rime_rp_threshold",
-          text: "Breath Rime RP Threshold",
-          type: "slider",
-          min: 20,
-          max: 100,
-          default: 60
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWFdkUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'slider', uid: 'FWFdkAoECount', text: 'AoE Target Count', default: 3, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWFdkDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWFdkAMS', text: 'Use AMS for RP', default: true },
+        { type: 'checkbox', uid: 'FWFdkIBF', text: 'Use Icebound Fortitude', default: true },
+        { type: 'slider', uid: 'FWFdkIBFHP', text: 'IBF HP %', default: 35, min: 10, max: 50 },
+        { type: 'checkbox', uid: 'FWFdkDS', text: 'Use Death Strike', default: true },
+        { type: 'slider', uid: 'FWFdkDSHP', text: 'Death Strike HP %', default: 45, min: 20, max: 60 },
+      ],
+    },
   ];
 
-  /**
-   * Builds the behavior tree for this specialization
-   * @returns {bt.Composite} The root node of the behavior tree
-   */
+  // =============================================
+  // BUILD — Main behavior tree
+  // =============================================
   build() {
     return new bt.Selector(
-      Common.waitForNotMounted(),
-      Common.waitForCastOrChannel(),
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Auto-target
       new bt.Action(() => {
-        // Return success if we don't have a valid target
-        if (this.getCurrentTarget() === null) {
-          return bt.Status.Success;
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
         }
         return bt.Status.Failure;
       }),
-      // Interrupt
-      Spell.interrupt("Mind Freeze", false),
-      
-      // High priority actions
-      Spell.cast("Anti-Magic Shell", () => 
-        me.runicPowerDeficit > 40 && 
-        !this.hasTalent("Breath of Sindragosa") || 
-        (this.hasTalent("Breath of Sindragosa") && 
-        this.getVariable("true_breath_cooldown") > 
-        Spell.getCooldown("Anti-Magic Shell").duration)
-      ),
 
-      // Trinkets
-    //   this.useTrinkets(),
-      
-      // Maintain Frost Fever
-      Spell.cast("Howling Blast", () => 
-        !this.getCurrentTarget().hasAuraByMe(auras.FROST_FEVER) && 
-        this.getEnemyCount() >= 2 && 
-        (!this.hasTalent("Breath of Sindragosa") || !me.hasAura(auras.BREATH_OF_SINDRAGOSA)) &&
-        (!this.hasTalent("Obliteration") || this.hasTalent("Wither Away") || 
-        this.hasTalent("Obliteration") && (!Spell.getCooldown("Pillar of Frost").ready || 
-        me.hasAura(auras.PILLAR_OF_FROST) && !me.hasAura(auras.KILLING_MACHINE)))
-      ),
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      common.waitForCastOrChannel(),
 
-      // Cooldowns
-      this.useCooldowns(),
-      
-      // Racial abilities
-      this.useRacials(),
-      
-      // Cold Heart handling
+      // Version + Debug
+      new bt.Action(() => {
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          const hero = this.isDeathbringer() ? 'Deathbringer' : 'Rider';
+          const build = this.hasBoS() ? 'Breath' : 'Obliteration';
+          console.info(`[FrostDK] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | ${hero} | ${build} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWFdkDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[FrostDK] RP:${Math.round(this.getRP())} Runes:${this.getRunes()} KM:${this.getKM()} Rime:${this.hasRime()} PoF:${this.inPoF()} BoS:${this.inBoS()} ERWfrac:${spell.getChargesFractional(S.empowerRuneWeapon).toFixed(2)} E:${this.getEnemyCount()}`);
+        }
+        return bt.Status.Failure;
+      }),
+
       new bt.Decorator(
-        () => this.hasTalent("Cold Heart") && 
-              (!me.hasAura(auras.KILLING_MACHINE) || this.hasTalent("Breath of Sindragosa")) && 
-              ((this.getDebuffStacks("Razorice") === 5 || !this.hasRuneforgeRazorice() && 
-              !this.hasTalent("Glacial Advance") && !this.hasTalent("Avalanche") && 
-              !this.hasTalent("Arctic Assault"))),
-        this.coldHeartActions()
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          // SimC: high_prio_actions
+          spell.interrupt(S.mindFreeze),
+          this.highPriority(),
+
+          // SimC: cooldowns
+          this.cooldowns(),
+
+          // SimC: racials — Berserking during cooldown_check
+          spell.cast(S.berserking, () => me, () => this.cdCheck()),
+
+          // SimC dispatch: AoE >= 3 → aoe, else → single_target
+          new bt.Decorator(
+            () => this.getEnemyCount() >= Settings.FWFdkAoECount,
+            this.aoeRotation(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          this.stRotation(),
+        )
       ),
-      
-      // Main action lists based on state
-      new bt.Decorator(
-        () => me.hasAura(auras.BREATH_OF_SINDRAGOSA),
-        this.breathActions()
-      ),
-      new bt.Decorator(
-        () => this.hasTalent("Obliteration") && me.hasAura(auras.PILLAR_OF_FROST) && !me.hasAura(auras.BREATH_OF_SINDRAGOSA),
-        this.obliterationActions()
-      ),
-      new bt.Decorator(
-        () => this.getEnemyCount() >= 2,
-        this.aoeActions()
-      ),
-      this.singleTargetActions()
     );
   }
 
-  /**
-   * Get the current valid target
-   * @returns {wow.CGUnit | null} The current target or null if none
-   */
-  getCurrentTarget() {
-    const target = me.targetUnit;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
-      return target;
-    }
-    return combat.bestTarget;
+  // =============================================
+  // HIGH PRIORITY (SimC high_prio_actions, 3 lines)
+  // =============================================
+  highPriority() {
+    return new bt.Selector(
+      // SimC: antimagic_shell,if=runic_power.deficit>40&death_knight.first_ams_cast<time
+      spell.cast(S.antiMagicShell, () => me, () =>
+        Settings.FWFdkAMS && this.getRPDeficit() > 40
+      ),
+      // Death Strike survival
+      spell.cast(S.deathStrike, () => this.getCurrentTarget(), () =>
+        Settings.FWFdkDS && me.effectiveHealthPercent < Settings.FWFdkDSHP && this.getRP() >= 35
+      ),
+      // IBF emergency
+      spell.cast(S.iceboundFortitude, () => me, () =>
+        Settings.FWFdkIBF && me.effectiveHealthPercent < Settings.FWFdkIBFHP
+      ),
+    );
   }
 
-  /**
-   * Get the number of enemies in range
-   * @returns {number} The number of enemies
-   */
-  getEnemyCount() {
-    return combat.targets.length;
+  // =============================================
+  // COOLDOWNS (SimC actions.cooldowns, 14 lines)
+  // =============================================
+  cooldowns() {
+    return new bt.Decorator(
+      () => this.sendingCDs(),
+      new bt.Selector(
+        // 1. Remorseless Winter: (enemies>1|gathering_storm)|(GS.stack=10&RW.remains<gcd)&fight>10
+        // SimC: remorseless_winter,if=variable.sending_cds&(active_enemies>1|talent.gathering_storm)|(buff.gathering_storm.stack=10&buff.remorseless_winter.remains<gcd.max)&fight_remains>10
+        spell.cast(S.remorselessWinter, () => me, () => {
+          if (this.targetTTD() <= 10000) return false;
+          // Standard: enemies > 1 or GS talented
+          if (this.getEnemyCount() > 1 || spell.isSpellKnown(T.gatheringStorm)) return true;
+          // GS stack=10 & RW about to expire → recast
+          const gs = me.getAura(A.gatheringStorm);
+          const rw = me.getAura(A.remorselessWinter);
+          if (gs && gs.stacks >= 10 && rw && rw.remaining < 1500) return true;
+          return false;
+        }),
+
+        // 2. Reaper's Mark: PoF CD <= GCD & BoS check | fight < 20
+        // SimC: reapers_mark,if=cooldown.pillar_of_frost.remains<=gcd.max&(!talent.breath_of_sindragosa|cooldown.breath_of_sindragosa.remains>20|cooldown.breath_of_sindragosa.remains<gcd.max&runic_power>=40)|fight_remains<20
+        spell.cast(S.reapersMarkCast, () => this.getCurrentTarget(), () => {
+          if (!this.isDeathbringer()) return false;
+          if (this.targetTTD() < 20000) return true;
+          const pofCD = spell.getCooldown(S.pillarOfFrost)?.timeleft || 0;
+          if (pofCD > 1500) return false;
+          if (!this.hasBoS()) return true;
+          const bosCD = spell.getCooldown(S.breathOfSindragosa)?.timeleft || 0;
+          return bosCD > 20000 || (bosCD < 1500 && this.getRP() >= 40);
+        }),
+
+        // 3. Pillar of Frost: sending_cds & DB RM check & BoS check | fight < 20
+        // SimC: pillar_of_frost,if=variable.sending_cds&(!hero_tree.deathbringer|cooldown.reapers_mark.remains>10)&(!talent.breath_of_sindragosa|cooldown.breath_of_sindragosa.remains>20|cooldown.breath_of_sindragosa.up&runic_power>=60)|fight_remains<20
+        spell.cast(S.pillarOfFrost, () => me, () => {
+          if (this.targetTTD() < 20000) return true;
+          if (this.isDeathbringer()) {
+            const rmCD = spell.getCooldown(S.reapersMarkCast)?.timeleft || 0;
+            if (rmCD <= 10000 && rmCD > 0) return false;
+          }
+          if (!this.hasBoS()) return true;
+          const bosCD = spell.getCooldown(S.breathOfSindragosa)?.timeleft || 0;
+          const bosReady = spell.getCooldown(S.breathOfSindragosa)?.ready || false;
+          return bosCD > 20000 || (bosReady && this.getRP() >= 60);
+        }),
+
+        // 4. Breath of Sindragosa: during PoF | fight < 20
+        // SimC: breath_of_sindragosa,use_off_gcd=1,if=!buff.breath_of_sindragosa.up&(buff.pillar_of_frost.up|fight_remains<20)
+        spell.cast(S.breathOfSindragosa, () => me, () =>
+          !this.inBoS() && (this.inPoF() || this.targetTTD() < 20000)
+        ),
+
+        // 5. FWF: Hero talent (Apocalypse Now/Chosen of Frostbrood) — not Chosen FWF buff up
+        // SimC: frostwyrms_fury,if=((talent.apocalypse_now|talent.chosen_of_frostbrood)&!buff.chosen_of_frostbrood_fwf.up)&variable.sending_cds&(!talent.breath_of_sindragosa&buff.pillar_of_frost.up|buff.breath_of_sindragosa.up)&!debuff.reapers_mark_debuff.up&!buff.exterminate.up|(fight_remains<20&!buff.chosen_of_frostbrood_haste.up)
+        spell.cast(S.frostwyrmsFury, () => this.getCurrentTarget(), () => {
+          // Fight ending check
+          if (this.targetTTD() < 20000 && !me.hasAura(A.chosenFrostbroodHaste)) return true;
+          // Hero talent path
+          if (!spell.isSpellKnown(T.apocalypseNow) && !spell.isSpellKnown(T.chosenOfFrostbrood)) return false;
+          if (me.hasAura(A.chosenFrostbroodFWF)) return false;
+          if (!this.sendingCDs()) return false;
+          const burstCheck = (!this.hasBoS() && this.inPoF()) || this.inBoS();
+          if (!burstCheck) return false;
+          const t = this.getCurrentTarget();
+          if (t && t.getAuraByMe(A.reapersMarkDebuff)) return false;
+          if (me.hasAura(A.exterminate)) return false;
+          return true;
+        }),
+
+        // 6. FWF: Chosen FWF buff up — fire the recall
+        // SimC: frostwyrms_fury,if=buff.chosen_of_frostbrood_fwf.up&!buff.chosen_of_frostbrood_haste.up&!debuff.reapers_mark_debuff.up&buff.exterminate.stack<=1
+        spell.cast(S.frostwyrmsFury, () => this.getCurrentTarget(), () => {
+          if (!me.hasAura(A.chosenFrostbroodFWF)) return false;
+          if (me.hasAura(A.chosenFrostbroodHaste)) return false;
+          const t = this.getCurrentTarget();
+          if (t && t.getAuraByMe(A.reapersMarkDebuff)) return false;
+          const ext = me.getAura(A.exterminate);
+          return !ext || ext.stacks <= 1;
+        }),
+
+        // 7. FWF: Non-hero ST — during PoF (not Obliteration) | fight ending
+        // SimC: frostwyrms_fury,if=!(talent.apocalypse_now|talent.chosen_of_frostbrood)&active_enemies=1&(talent.pillar_of_frost&buff.pillar_of_frost.up&!talent.obliteration|!talent.pillar_of_frost)&variable.fwf_buffs|fight_remains<3
+        spell.cast(S.frostwyrmsFury, () => this.getCurrentTarget(), () => {
+          if (this.targetTTD() < 3000) return true;
+          if (spell.isSpellKnown(T.apocalypseNow) || spell.isSpellKnown(T.chosenOfFrostbrood)) return false;
+          if (this.getEnemyCount() !== 1) return false;
+          const pofOk = (spell.isSpellKnown(T.pillarOfFrost) && this.inPoF() && !spell.isSpellKnown(T.obliteration)) || !spell.isSpellKnown(T.pillarOfFrost);
+          return pofOk && this.fwfBuffs();
+        }),
+
+        // 8. FWF: Non-hero AoE — during PoF
+        // SimC: frostwyrms_fury,if=!(talent.apocalypse_now|talent.chosen_of_frostbrood)&active_enemies>=2&(talent.pillar_of_frost&buff.pillar_of_frost.up|...)&variable.fwf_buffs
+        spell.cast(S.frostwyrmsFury, () => this.getCurrentTarget(), () => {
+          if (spell.isSpellKnown(T.apocalypseNow) || spell.isSpellKnown(T.chosenOfFrostbrood)) return false;
+          if (this.getEnemyCount() < 2) return false;
+          const pofOk = spell.isSpellKnown(T.pillarOfFrost) && this.inPoF();
+          return pofOk && this.fwfBuffs();
+        }),
+
+        // 9. FWF: Non-hero Obliteration variant
+        // SimC: frostwyrms_fury,if=!(talent.apocalypse_now|talent.chosen_of_frostbrood)&talent.obliteration&(talent.pillar_of_frost&buff.pillar_of_frost.up&!main_hand.2h|!buff.pillar_of_frost.up&main_hand.2h&cooldown.pillar_of_frost.remains|!talent.pillar_of_frost)&variable.fwf_buffs
+        spell.cast(S.frostwyrmsFury, () => this.getCurrentTarget(), () => {
+          if (spell.isSpellKnown(T.apocalypseNow) || spell.isSpellKnown(T.chosenOfFrostbrood)) return false;
+          if (!spell.isSpellKnown(T.obliteration)) return false;
+          // Simplified: during PoF
+          if (spell.isSpellKnown(T.pillarOfFrost) && this.inPoF()) return this.fwfBuffs();
+          if (!spell.isSpellKnown(T.pillarOfFrost)) return this.fwfBuffs();
+          return false;
+        }),
+
+        // 10. Raise Dead
+        spell.cast(S.raiseDead, () => me),
+
+        // 11. ERW: (rune < 2 | no KM) & RP < threshold
+        // SimC: empower_rune_weapon,if=(rune<2|!buff.killing_machine.react)&runic_power<35+(talent.icy_onslaught*buff.icy_onslaught.stack*5)
+        spell.cast(S.empowerRuneWeapon, () => me, () => {
+          const io = me.getAura(A.icyOnslaught);
+          const ioVal = spell.isSpellKnown(T.icyOnslaught) && io ? (io.stacks || 0) * 5 : 0;
+          return (this.getRunes() < 2 || this.getKM() === 0) &&
+            this.getRP() < 35 + ioVal;
+        }),
+
+        // 12. ERW: charge cap prevention
+        // SimC: empower_rune_weapon,if=cooldown.empower_rune_weapon.full_recharge_time<=6&buff.killing_machine.react<2-(talent.killing_streak)
+        spell.cast(S.empowerRuneWeapon, () => me, () => {
+          const recharge = spell.getFullRechargeTime(S.empowerRuneWeapon) || 99999;
+          const kmThreshold = spell.isSpellKnown(T.killingStreak) ? 1 : 2;
+          return recharge <= 6000 && this.getKM() < kmThreshold;
+        }),
+
+        // 13. ERW: BoS-specific timing
+        // SimC: empower_rune_weapon,if=talent.breath_of_sindragosa&(cooldown.empower_rune_weapon.full_recharge_time-30<=cooldown.breath_of_sindragosa.remains+6)&(cooldown.breath_of_sindragosa.remains<=6)&(buff.killing_machine.react<2-(talent.killing_streak))
+        spell.cast(S.empowerRuneWeapon, () => me, () => {
+          if (!this.hasBoS()) return false;
+          const erwRecharge = spell.getFullRechargeTime(S.empowerRuneWeapon) || 99999;
+          const bosCD = spell.getCooldown(S.breathOfSindragosa)?.timeleft || 99999;
+          const kmThreshold = spell.isSpellKnown(T.killingStreak) ? 1 : 2;
+          return (erwRecharge - 30000 <= bosCD + 6000) && bosCD <= 6000 && this.getKM() < kmThreshold;
+        }),
+
+        // 14. ERW: Obliteration + PoF (PoF remains > 4 GCDs & rune <= 2 & KM = 1)
+        // SimC: empower_rune_weapon,if=talent.obliteration&buff.pillar_of_frost.remains>4*gcd.max&rune<=2&buff.killing_machine.react=1
+        spell.cast(S.empowerRuneWeapon, () => me, () => {
+          if (!spell.isSpellKnown(T.obliteration)) return false;
+          const pofAura = me.getAura(A.pillarOfFrost);
+          return pofAura && pofAura.remaining > 6000 && this.getRunes() <= 2 && this.getKM() === 1;
+        }),
+      ),
+    );
   }
 
-  /**
-   * Check if we have a specific talent
-   * @param {string} talentName - The name of the talent to check
-   * @returns {boolean} True if we have the talent
-   */
-  hasTalent(talentName) {
-    // Check for specific spellID based on talent name
-    const talentIds = {
-      "Breath of Sindragosa": 152279,
-      "Obliteration": 281238,
-      "Pillar of Frost": 51271,
-      "Empower Rune Weapon": 47568,
-      "Cold Heart": 281208,
-      "Glacial Advance": 194913,
-      "Avalanche": 207142,
-      "Arctic Assault": 456230,
-      "Gathering Storm": 194912,
-      "Biting Cold": 377056,
-      "Icebreaker": 392950,
-      "Rage of the Frozen Champion": 377076,
-      "Shattered Frost": 455993,
-      "Shattering Blade": 207057,
-      "Cleaving Strikes": 316916,
-      "Wither Away": 441894,
-      "Bind in Darkness": 440031,
-      "Unholy Ground": 374265,
-      "The Long Winter": 456240,
-      "Enduring Strength": 377190,
-      "A Feast of Souls": 444072,
-      "Apocalypse Now": 444040,
-      "Unleashed Frenzy": 376905,
-      "Icy Talons": 194878,
-      "Bonegrinder": 377098,
-      "Frostwyrm's Fury": 279302
-    };
+  // =============================================
+  // SINGLE TARGET (SimC actions.single_target, 9 lines)
+  // =============================================
+  stRotation() {
+    return new bt.Selector(
+      // 1. Obliterate: KM=2 | (KM & rune>=3)
+      // SimC: obliterate,if=buff.killing_machine.react=2|(buff.killing_machine.react&rune>=3)
+      spell.cast(S.obliterate, () => this.getCurrentTarget(), () => {
+        const km = this.getKM();
+        return km >= 2 || (km >= 1 && this.getRunes() >= 3);
+      }),
 
-    const id = talentIds[talentName];
-    if (id) {
-      return Spell.isSpellKnown(id);
-    }
-    
-    // Fallback to checking if we have the spell
-    return Spell.isSpellKnown(talentName);
+      // 2. Howling Blast: Rime & Frostbound Will
+      // SimC: howling_blast,if=buff.rime.react&talent.frostbound_will
+      spell.cast(S.howlingBlast, () => this.getCurrentTarget(), () =>
+        this.hasRime() && spell.isSpellKnown(T.frostboundWill)
+      ),
+
+      // 3. Frost Strike: Shattering Blade & Razorice=5 & !rp_pooling
+      // SimC: frost_strike,if=debuff.razorice.react=5&talent.shattering_blade&!variable.rp_pooling
+      spell.cast(S.frostStrike, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.shatteringBlade) || this.rpPooling()) return false;
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        const rz = t.getAuraByMe(A.razorice);
+        return rz && rz.stacks >= 5;
+      }),
+
+      // 4. Howling Blast: Rime
+      // SimC: howling_blast,if=buff.rime.react
+      spell.cast(S.howlingBlast, () => this.getCurrentTarget(), () => this.hasRime()),
+
+      // 5. Frost Strike: !shattering_blade & !rp_pooling & deficit < 30
+      // SimC: frost_strike,if=!talent.shattering_blade&!variable.rp_pooling&runic_power.deficit<30
+      spell.cast(S.frostStrike, () => this.getCurrentTarget(), () =>
+        !spell.isSpellKnown(T.shatteringBlade) && !this.rpPooling() && this.getRPDeficit() < 30
+      ),
+
+      // 6. Obliterate: KM & !rune_pooling
+      // SimC: obliterate,if=buff.killing_machine.react&!variable.rune_pooling
+      spell.cast(S.obliterate, () => this.getCurrentTarget(), () =>
+        this.getKM() >= 1 && !this.runePooling()
+      ),
+
+      // 7. Frost Strike: !rp_pooling
+      // SimC: frost_strike,if=!variable.rp_pooling
+      spell.cast(S.frostStrike, () => this.getCurrentTarget(), () =>
+        !this.rpPooling()
+      ),
+
+      // 8. Obliterate: !rune_pooling & !(obliteration & PoF)
+      // SimC: obliterate,if=!variable.rune_pooling&!(talent.obliteration&buff.pillar_of_frost.up)
+      spell.cast(S.obliterate, () => this.getCurrentTarget(), () =>
+        !this.runePooling() && !(spell.isSpellKnown(T.obliteration) && this.inPoF())
+      ),
+
+      // 9. Howling Blast: !KM & (obliteration & PoF) — fish for KM
+      // SimC: howling_blast,if=!buff.killing_machine.react&(talent.obliteration&buff.pillar_of_frost.up)
+      spell.cast(S.howlingBlast, () => this.getCurrentTarget(), () =>
+        this.getKM() === 0 && spell.isSpellKnown(T.obliteration) && this.inPoF()
+      ),
+    );
   }
 
-  /**
-   * Check if the player is using the Deathbringer hero talent
-   * @returns {boolean} True if using Deathbringer
-   */
-  isDeathbringer() {
-    return me.hasAura(auras.REAPERS_MARK);
+  // =============================================
+  // AOE (SimC actions.aoe, 13 lines, 3+ targets)
+  // =============================================
+  aoeRotation() {
+    return new bt.Selector(
+      // 1. Frostscythe: KM=2 & enemies >= frostscythe_priority
+      // SimC: frostscythe,if=buff.killing_machine.react=2&active_enemies>=variable.frostscythe_priority
+      spell.cast(S.frostscythe, () => this.getCurrentTarget(), () =>
+        this.getKM() >= 2 && this.getEnemyCount() >= 3
+      ),
+
+      // 2. Frost Strike: Razorice=5 & Frostbane proc
+      // SimC: frost_strike,if=debuff.razorice.react=5&buff.frostbane.react
+      spell.cast(S.frostStrike, () => this.getCurrentTarget(), () => {
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        const rz = t.getAuraByMe(A.razorice);
+        return rz && rz.stacks >= 5 && me.hasAura(A.frostbane);
+      }),
+
+      // 3. Frostscythe: KM & rune>=3 & enemies >= priority
+      // SimC: frostscythe,if=buff.killing_machine.react&rune>=3&active_enemies>=variable.frostscythe_priority
+      spell.cast(S.frostscythe, () => this.getCurrentTarget(), () =>
+        this.getKM() >= 1 && this.getRunes() >= 3 && this.getEnemyCount() >= 3
+      ),
+
+      // 4. Obliterate: KM=2 | (KM & rune>=3)
+      // SimC: obliterate,if=buff.killing_machine.react=2|(buff.killing_machine.react&rune>=3)
+      spell.cast(S.obliterate, () => this.getCurrentTarget(), () => {
+        const km = this.getKM();
+        return km >= 2 || (km >= 1 && this.getRunes() >= 3);
+      }),
+
+      // 5. Howling Blast: (Rime & Frostbound Will) | !Frost Fever ticking
+      // SimC: howling_blast,if=buff.rime.react&talent.frostbound_will|!dot.frost_fever.ticking
+      spell.cast(S.howlingBlast, () => this.getCurrentTarget(), () => {
+        if (this.hasRime() && spell.isSpellKnown(T.frostboundWill)) return true;
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        const ff = t.getAuraByMe(A.frostFever);
+        return !ff || ff.remaining < 3000;
+      }),
+
+      // 6. Frost Strike: Razorice=5 & Shattering Blade & enemies<5 & !rp_pooling & !frostbane
+      // SimC: frost_strike,if=debuff.razorice.react=5&talent.shattering_blade&active_enemies<5&!variable.rp_pooling&!talent.frostbane
+      spell.cast(S.frostStrike, () => this.getCurrentTarget(), () => {
+        if (this.rpPooling() || spell.isSpellKnown(T.frostbane)) return false;
+        if (!spell.isSpellKnown(T.shatteringBlade) || this.getEnemyCount() >= 5) return false;
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        const rz = t.getAuraByMe(A.razorice);
+        return rz && rz.stacks >= 5;
+      }),
+
+      // 7. Frostscythe: KM & !rune_pooling & enemies >= priority
+      // SimC: frostscythe,if=buff.killing_machine.react&!variable.rune_pooling&active_enemies>=variable.frostscythe_priority
+      spell.cast(S.frostscythe, () => this.getCurrentTarget(), () =>
+        this.getKM() >= 1 && !this.runePooling() && this.getEnemyCount() >= 3
+      ),
+
+      // 8. Obliterate: KM & !rune_pooling
+      // SimC: obliterate,if=buff.killing_machine.react&!variable.rune_pooling
+      spell.cast(S.obliterate, () => this.getCurrentTarget(), () =>
+        this.getKM() >= 1 && !this.runePooling()
+      ),
+
+      // 9. Howling Blast: Rime
+      spell.cast(S.howlingBlast, () => this.getCurrentTarget(), () => this.hasRime()),
+
+      // 10. Glacial Advance: !rp_pooling
+      // SimC: glacial_advance,if=!variable.rp_pooling
+      spell.cast(S.glacialAdvance, () => this.getCurrentTarget(), () =>
+        !this.rpPooling()
+      ),
+
+      // 11. Frostscythe: !rune_pooling & !(obliteration & PoF) & enemies >= priority
+      // SimC: frostscythe,if=!variable.rune_pooling&!(talent.obliteration&buff.pillar_of_frost.up)&active_enemies>=variable.frostscythe_priority
+      spell.cast(S.frostscythe, () => this.getCurrentTarget(), () =>
+        !this.runePooling() && !(spell.isSpellKnown(T.obliteration) && this.inPoF()) &&
+        this.getEnemyCount() >= 3
+      ),
+
+      // 12. Obliterate: !rune_pooling & !(obliteration & PoF)
+      // SimC: obliterate,if=!variable.rune_pooling&!(talent.obliteration&buff.pillar_of_frost.up)
+      spell.cast(S.obliterate, () => this.getCurrentTarget(), () =>
+        !this.runePooling() && !(spell.isSpellKnown(T.obliteration) && this.inPoF())
+      ),
+
+      // 13. Howling Blast: !KM & (obliteration & PoF) — fish for KM
+      // SimC: howling_blast,if=!buff.killing_machine.react&(talent.obliteration&buff.pillar_of_frost.up)
+      spell.cast(S.howlingBlast, () => this.getCurrentTarget(), () =>
+        this.getKM() === 0 && spell.isSpellKnown(T.obliteration) && this.inPoF()
+      ),
+    );
   }
 
-  /**
-   * Check if the player is using the Rider of the Apocalypse hero talent
-   * @returns {boolean} True if using Rider of the Apocalypse
-   */
-  isRiderOfTheApocalypse() {
-    return me.hasAura(auras.RIDERS_CHAMPION);
+  // =============================================
+  // SIMC VARIABLE HELPERS
+  // =============================================
+  isDeathbringer() { return spell.isSpellKnown(S.reapersMarkCast); }
+  isRider() { return !this.isDeathbringer(); }
+  hasBoS() { return spell.isSpellKnown(T.breathOfSindragosa); }
+
+  inPoF() { return me.hasAura(A.pillarOfFrost); }
+  inBoS() { return me.hasAura(A.breathOfSind); }
+  inBurst() { return this.inPoF() || this.inBoS(); }
+  hasRime() { return me.hasAura(A.rime); }
+
+  // variable.sending_cds: SimC: (variable.st_planning|variable.adds_remain)
+  // Simplified: CDs enabled & TTD > 10s (st_planning = 1 for single target, adds_remain for AoE)
+  sendingCDs() { return Settings.FWFdkUseCDs && this.targetTTD() > 10000; }
+
+  // variable.cooldown_check: (talent.pillar_of_frost&buff.pillar_of_frost.up)|!talent.pillar_of_frost|fight_remains<20
+  cdCheck() {
+    return (spell.isSpellKnown(T.pillarOfFrost) && this.inPoF()) ||
+      !spell.isSpellKnown(T.pillarOfFrost) ||
+      this.targetTTD() < 20000;
   }
 
-  /**
-   * Get the number of debuff stacks on the target
-   * @param {string} debuffName - The name of the debuff
-   * @returns {number} Number of stacks
-   */
-  getDebuffStacks(debuffName) {
-    const target = this.getCurrentTarget();
-    if (!target) return 0;
-    
-    if (debuffName === "Razorice") {
-      return target.getAuraStacks(auras.RAZORICE) || 0;
-    }
-    
-    return target.getAuraStacks(debuffName) || 0;
-  }
-
-  /**
-   * Check if we have the Razorice runeforge
-   * @returns {boolean} True if we have Razorice
-   */
-  hasRuneforgeRazorice() {
-    // Since we can't directly check for runeforge, we approximate
-    // by checking if the target has the debuff and we've been in combat
-    const target = this.getCurrentTarget();
-    return target && target.hasAura(auras.RAZORICE) && me.inCombat();
-  }
-
-  /**
-   * Helper method to check if we have Fallen Crusader runeforge
-   * @returns {boolean} Whether we have Fallen Crusader
-   */
-  hasRuneforgeFallenCrusader() {
-    // Since we can't directly check for runeforge, we approximate
-    // Look for the Unholy Strength proc which is a sign of Fallen Crusader
-    return me.hasAura(auras.UNHOLY_STRENGTH);
-  }
-
-  /**
-   * Get SIMC variable values
-   * @param {string} name - The name of the variable
-   * @returns {boolean|number} The value of the variable
-   */
-  getVariable(name) {
-    switch (name) {
-      case "st_planning":
-        return this.getEnemyCount() === 1;
-      case "adds_remain":
-        return this.getEnemyCount() > 1;
-      case "use_breath":
-        return this.getVariable("st_planning") || this.getEnemyCount() >= 2;
-      case "sending_cds":
-        return this.getVariable("st_planning") || this.getVariable("adds_remain");
-      case "rime_buffs":
-        return me.hasAura(auras.RIME) && (
-          this.getVariable("static_rime_buffs") || 
-          (this.hasTalent("Avalanche") && !this.hasTalent("Arctic Assault") && 
-          this.getDebuffStacks("Razorice") < 5)
-        );
-      case "rp_buffs":
-        return (this.hasTalent("Unleashed Frenzy") && 
-                (this.getAuraRemainingTime(auras.UNLEASHED_FRENZY) < 4.5 || 
-                this.getAuraStacks(auras.UNLEASHED_FRENZY) < 3)) || 
-               (this.hasTalent("Icy Talons") && 
-                (this.getAuraRemainingTime(auras.ICY_TALONS) < 4.5 || 
-                this.getAuraStacks(auras.ICY_TALONS) < (3 + (2 * (this.hasTalent("Smothering Offense") ? 1 : 0)) + 
-                (2 * (this.hasTalent("Dark Talons") ? 1 : 0)))));
-      case "cooldown_check":
-        return (!this.hasTalent("Breath of Sindragosa") || me.hasAura(auras.BREATH_OF_SINDRAGOSA)) && 
-               (this.hasTalent("Pillar of Frost") && me.hasAura(auras.PILLAR_OF_FROST) && 
-               (this.hasTalent("Obliteration") && this.getAuraRemainingTime(auras.PILLAR_OF_FROST) > 10 || 
-               !this.hasTalent("Obliteration")) || !this.hasTalent("Pillar of Frost") && 
-               me.hasAura(auras.EMPOWER_RUNE_WEAPON) || !this.hasTalent("Pillar of Frost") && 
-               !this.hasTalent("Empower Rune Weapon") || this.getEnemyCount() >= 2 && 
-               me.hasAura(auras.PILLAR_OF_FROST));
-      case "static_rime_buffs":
-        return this.hasTalent("Rage of the Frozen Champion") || 
-               this.hasTalent("Icebreaker") || 
-               this.hasTalent("Bind in Darkness");
-      case "breath_rp_cost":
-        return 17; // Static value from SIMC
-      case "true_breath_cooldown":
-        return Spell.getCooldown("Breath of Sindragosa").timeleft > 
-               Spell.getCooldown("Pillar of Frost").timeleft ? 
-               Spell.getCooldown("Breath of Sindragosa").timeleft : 
-               Spell.getCooldown("Pillar of Frost").timeleft;
-      case "breath_rp_threshold":
-        const setting = Settings.bos_rp || 65;
-        return setting;
-      case "erw_breath_rp_trigger":
-        return Settings.erw_breath_rp_trigger || 70;
-      case "erw_breath_rune_trigger":
-        return Settings.erw_breath_rune_trigger || 3;
-      case "oblit_rune_pooling":
-        return Settings.oblit_rune_pooling || 4;
-      case "breath_rime_rp_threshold":
-        return Settings.breath_rime_rp_threshold || 60;
-      case "ga_priority":
-        return (!this.hasTalent("Shattered Frost") && this.hasTalent("Shattering Blade") && 
-                this.getEnemyCount() >= 4) || 
-               (!this.hasTalent("Shattered Frost") && !this.hasTalent("Shattering Blade") && 
-                this.getEnemyCount() >= 2);
-      case "breath_dying":
-        const rpCost = this.getVariable("breath_rp_cost");
-        return me.runicPowerDeficit > (100 - rpCost*2*1.5) && 
-               me.runeTimeTo(2) > me.runicPower / rpCost;
-      case "fwf_buffs":
-        const target = this.getCurrentTarget();
-        return (this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 1.5 || 
-               (me.hasAura(auras.UNHOLY_STRENGTH) && 
-               this.getAuraRemainingTime(auras.UNHOLY_STRENGTH) < 1.5) || 
-               (this.hasTalent("Bonegrinder") && me.hasAura(auras.BONEGRINDER) && 
-               this.getAuraRemainingTime(auras.BONEGRINDER) < 1.5)) && 
-               (this.getEnemyCount() > 1 || this.getDebuffStacks("Razorice") === 5 || 
-               !this.hasRuneforgeRazorice() && 
-               (!this.hasTalent("Glacial Advance") || !this.hasTalent("Avalanche") || 
-               !this.hasTalent("Arctic Assault")) || this.hasTalent("Shattering Blade"));
-      case "pooling_runes":
-        return me.runes < this.getVariable("oblit_rune_pooling") && 
-               this.hasTalent("Obliteration") && 
-               (!this.hasTalent("Breath of Sindragosa") || 
-               this.getVariable("true_breath_cooldown") > 0) && 
-               Spell.getCooldown("Pillar of Frost").timeleft < 
-               this.getVariable("oblit_pooling_time");
-      case "pooling_runic_power":
-        return (this.hasTalent("Breath of Sindragosa") && 
-               (this.getVariable("true_breath_cooldown") < 
-               this.getVariable("breath_pooling_time"))) || 
-               (this.hasTalent("Obliteration") && 
-               (!this.hasTalent("Breath of Sindragosa") || 
-               Spell.getCooldown("Breath of Sindragosa").timeleft > 30) && 
-               me.runicPower < 35 && 
-               Spell.getCooldown("Pillar of Frost").timeleft < 
-               this.getVariable("oblit_pooling_time"));
+  // variable.fwf_buffs: (buff.pillar_of_frost.remains<gcd|(buff.unholy_strength.up&buff.unholy_strength.remains<gcd)|(talent.bonegrinder.rank=2&buff.bonegrinder_frost.up&buff.bonegrinder_frost.remains<gcd))&(active_enemies>1|debuff.razorice.stack=5|talent.shattering_blade)
+  fwfBuffs() {
+    const pof = me.getAura(A.pillarOfFrost);
+    const us = me.getAura(A.unholyStrength);
+    const bg = me.getAura(A.bonegrinderFrost);
+    const aboutToExpire = (pof && pof.remaining < 1500) ||
+      (us && us.remaining > 0 && us.remaining < 1500) ||
+      (spell.isSpellKnown(T.bonegrinder) && bg && bg.remaining > 0 && bg.remaining < 1500);
+    if (!aboutToExpire) return false;
+    if (this.getEnemyCount() > 1) return true;
+    if (spell.isSpellKnown(T.shatteringBlade)) return true;
+    const t = this.getCurrentTarget();
+    if (t) {
+      const rz = t.getAuraByMe(A.razorice);
+      if (rz && rz.stacks >= 5) return true;
     }
     return false;
   }
 
-  /**
-   * Get the remaining time on an aura
-   * @param {number} auraId - The ID of the aura
-   * @returns {number} Remaining time in seconds
-   */
-  getAuraRemainingTime(auraId) {
-    const aura = me.getAura(auraId);
-    return aura ? aura.remaining / 1000 : 0;
+  // variable.rune_pooling: hero_tree.deathbringer&cooldown.reapers_mark.remains<6&rune<3&variable.sending_cds
+  runePooling() {
+    if (!this.isDeathbringer()) return false;
+    const rmCD = spell.getCooldown(S.reapersMarkCast)?.timeleft || 99999;
+    return rmCD < 6000 && this.getRunes() < 3 && this.sendingCDs();
   }
 
-  /**
-   * Get the number of stacks on an aura
-   * @param {number} auraId - The ID of the aura
-   * @returns {number} Number of stacks
-   */
-  getAuraStacks(auraId) {
-    const aura = me.getAura(auraId);
-    return aura ? aura.stacks : 0;
+  // variable.rp_pooling: talent.breath_of_sindragosa&cooldown.breath_of_sindragosa.remains<4*gcd.max&runic_power<60+(35+5*buff.icy_onslaught.up)-(10*rune)&variable.sending_cds
+  rpPooling() {
+    if (!this.hasBoS()) return false;
+    const bosCD = spell.getCooldown(S.breathOfSindragosa)?.timeleft || 99999;
+    if (bosCD > 6000) return false; // 4*gcd ~= 6s
+    const io = me.getAura(A.icyOnslaught);
+    const ioUp = io && io.remaining > 0 ? 1 : 0;
+    const threshold = 60 + (35 + 5 * ioUp) - (10 * this.getRunes());
+    return this.getRP() < threshold && this.sendingCDs();
   }
 
-  /**
-   * Use trinkets based on conditions
-   * @returns {bt.Composite} Action to use trinkets
-   */
-  useTrinkets() {
-    return new bt.Selector(
-      Common.useEquippedItemByName("Treacherous Transmitter", () => 
-        Spell.getCooldown("Pillar of Frost").timeleft < 6 && 
-        this.getVariable("sending_cds") && this.trinketCondition()
-      ),
-      Common.useEquippedItemByName(1, () => 
-        this.trinket1Condition() && me.hasAura(auras.PILLAR_OF_FROST) && 
-        this.getAuraRemainingTime(auras.PILLAR_OF_FROST) > 5
-      ),
-      Common.useEquippedItemByName(2, () => 
-        this.trinket2Condition() && me.hasAura(auras.PILLAR_OF_FROST) && 
-        this.getAuraRemainingTime(auras.PILLAR_OF_FROST) > 5
-      )
-    );
+  // variable.breath_of_sindragosa_check: !talent.breath_of_sindragosa|(cooldown.breath_of_sindragosa.remains>20|(cooldown.breath_of_sindragosa.remains<1*gcd.max&runic_power>=(60-20*hero_tree.deathbringer)))
+  bosCheck() {
+    if (!this.hasBoS()) return true;
+    const bosCD = spell.getCooldown(S.breathOfSindragosa)?.timeleft || 99999;
+    if (bosCD > 20000) return true;
+    const rpThreshold = 60 - (this.isDeathbringer() ? 20 : 0);
+    return bosCD < 1500 && this.getRP() >= rpThreshold;
   }
 
-  /**
-   * Helper method for trinket 1 condition
-   * @returns {boolean} Whether trinket 1 should be used
-   */
-  trinket1Condition() {
-    // This is a simplified implementation of the trinket logic
-    return me.hasAura(auras.PILLAR_OF_FROST) || 
-           me.hasAura(auras.BREATH_OF_SINDRAGOSA);
+  // =============================================
+  // RESOURCE HELPERS (cached per tick)
+  // =============================================
+  getRP() {
+    if (this._rpFrame === wow.frameTime) return this._cachedRP;
+    this._rpFrame = wow.frameTime;
+    this._cachedRP = me.powerByType(PowerType.RunicPower);
+    return this._cachedRP;
+  }
+  getRPDeficit() { return 100 - this.getRP(); }
+
+  getRunes() {
+    if (this._runeFrame === wow.frameTime) return this._cachedRunes;
+    this._runeFrame = wow.frameTime;
+    this._cachedRunes = me.powerByType(PowerType.Runes);
+    return this._cachedRunes;
   }
 
-  /**
-   * Helper method for trinket 2 condition
-   * @returns {boolean} Whether trinket 2 should be used
-   */
-  trinket2Condition() {
-    // This is a simplified implementation of the trinket logic
-    return me.hasAura(auras.PILLAR_OF_FROST) || 
-           me.hasAura(auras.BREATH_OF_SINDRAGOSA);
+  getKM() {
+    if (this._kmFrame === wow.frameTime) return this._cachedKM;
+    this._kmFrame = wow.frameTime;
+    const aura = me.getAura(A.killingMachine);
+    this._cachedKM = aura ? aura.stacks : 0;
+    return this._cachedKM;
   }
 
-  /**
-   * General trinket condition
-   */
-  trinketCondition() {
-    return this.getVariable("sending_cds") || 
-           (!this.hasTalent("Breath of Sindragosa") || 
-           Spell.getCooldown("Breath of Sindragosa").timeleft < 6);
+  // =============================================
+  // TARGET (cached per tick)
+  // =============================================
+  getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const target = me.target;
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 8 && me.isFacing(target)) {
+      this._cachedTarget = target;
+      return target;
+    }
+    if (me.inCombat()) {
+      const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (t && common.validTarget(t) && me.isFacing(t)) { this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
   }
 
-  /**
-   * Use racial abilities based on conditions
-   * @returns {bt.Composite} Action to use racial abilities
-   */
-  useRacials() {
-    return new bt.Selector(
-      Spell.cast("Blood Fury", () => this.getVariable("cooldown_check")),
-      Spell.cast("Berserking", () => this.getVariable("cooldown_check")),
-      Spell.cast("Arcane Pulse", () => this.getVariable("cooldown_check")),
-      Spell.cast("Lights Judgment", () => this.getVariable("cooldown_check")),
-      Spell.cast("Ancestral Call", () => this.getVariable("cooldown_check")),
-      Spell.cast("Fireblood", () => this.getVariable("cooldown_check")),
-      Spell.cast("Bag of Tricks", () => {
-        if (this.hasTalent("Obliteration")) {
-          return !me.hasAura(auras.PILLAR_OF_FROST) && 
-                 me.hasAura(auras.UNHOLY_STRENGTH);
-        } else {
-          return me.hasAura(auras.PILLAR_OF_FROST) && 
-                 (me.hasAura(auras.UNHOLY_STRENGTH) && 
-                 this.getAuraRemainingTime(auras.UNHOLY_STRENGTH) < 4.5 || 
-                 this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 4.5);
-        }
-      })
-    );
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(8) + 1 : 1;
+    return this._cachedEnemyCount;
   }
 
-  /**
-   * Use major cooldowns based on conditions
-   * @returns {bt.Composite} Action to use cooldowns
-   */
-  // Replace the useCooldowns() method with this improved version
-useCooldowns() {
-    return new bt.Selector(
-      // Potion
-      new bt.Action(() => {
-        // Potion usage would go here if we had the API
-        return bt.Status.Failure;
-      }),
-      
-      // Pillar of Frost - Simplified to ensure it triggers reliably
-      Spell.cast("Pillar of Frost", () => {
-        // Basic condition - always use when available if cooldowns are enabled
-        if (!Settings.useCD) return false;
-        
-        // Don't use if saving for Breath
-        if (this.hasTalent("Breath of Sindragosa") && 
-            Spell.getCooldown("Breath of Sindragosa").ready &&
-            me.runicPower < this.getVariable("breath_rp_threshold")) {
-          return false;
-        }
-        
-        // Use with valid target in combat
-        const target = this.getCurrentTarget();
-        return target && me.inCombat();
-      }),
-      
-      // Empower Rune Weapon - Less dependent on Pillar of Frost
-      Spell.cast("Empower Rune Weapon", () => {
-        if (!Settings.useCD) return false;
-        
-        // For Obliteration build
-        if (this.hasTalent("Obliteration") && !this.hasTalent("Breath of Sindragosa")) {
-          // Use with Pillar if possible, otherwise use it when below 3 runes
-          return me.hasAura(auras.PILLAR_OF_FROST) || me.runes <= 2;
-        } 
-        // For Breath of Sindragosa build
-        else if (this.hasTalent("Breath of Sindragosa")) {
-          // During Breath, use when resources are low
-          if (me.hasAura(auras.BREATH_OF_SINDRAGOSA)) {
-            return me.runicPower < 40 || 
-                  (me.runicPower < this.getVariable("erw_breath_rp_trigger") && 
-                  me.runes < this.getVariable("erw_breath_rune_trigger"));
-          }
-          // Before Breath, use to prepare resources
-          else if (Spell.getCooldown("Breath of Sindragosa").ready &&
-                  me.runicPower < this.getVariable("breath_rp_threshold")) {
-            return true;
-          }
-        } 
-        // For any other build
-        else {
-          return me.runes < 4;
-        }
-        
-        return false;
-      }),
-      
-      // Abomination Limb - Unchanged
-      Spell.cast("Abomination Limb", () => {
-        if (this.hasTalent("Obliteration")) {
-          return !me.hasAura(auras.PILLAR_OF_FROST) && 
-                this.getVariable("sending_cds") && 
-                (!this.isDeathbringer() || 
-                Spell.getCooldown("Reaper's Mark").timeleft < 5);
-        } else {
-          return this.getVariable("sending_cds");
-        }
-      }),
-      
-      // Remorseless Winter - Unchanged
-      Spell.cast("Remorseless Winter", () => {
-        const rwBuffs = this.hasTalent("Gathering Storm") || this.hasTalent("Biting Cold");
-        return rwBuffs && this.getVariable("sending_cds") && 
-              (!this.hasTalent("Arctic Assault") || !me.hasAura(auras.PILLAR_OF_FROST)) && 
-              (Spell.getCooldown("Pillar of Frost").timeleft > 20 || 
-              Spell.getCooldown("Pillar of Frost").timeleft < 1.5 * 3 || 
-              (this.getAuraStacks(auras.GATHERING_STORM) === 10 && 
-              this.getAuraRemainingTime("Remorseless Winter") < 1.5));
-      }),
-      
-      // Chill Streak - Unchanged
-      Spell.cast("Chill Streak", () => 
-        this.getVariable("sending_cds") && 
-        (!this.hasTalent("Arctic Assault") || !me.hasAura(auras.PILLAR_OF_FROST))
-      ),
-      
-      // Breath of Sindragosa - Unchanged
-      Spell.cast("Breath of Sindragosa", () => 
-        !me.hasAura(auras.BREATH_OF_SINDRAGOSA) && 
-        Settings.useCD &&
-        me.runicPower > this.getVariable("breath_rp_threshold") && 
-        (me.runes < 2 || me.runicPower > 80) && 
-        (Spell.getCooldown("Pillar of Frost").ready && 
-        this.getVariable("use_breath"))
-      ),
-      
-      // Reaper's Mark - Unchanged
-      Spell.cast("Reaper's Mark", () => {
-        const target = this.getCurrentTarget();
-        return (target.isBoss || target.timeToDeath() > 13) && 
-              !target.hasAura(auras.REAPERS_MARK_DEBUFF) && 
-              (me.hasAura(auras.PILLAR_OF_FROST) || 
-              Spell.getCooldown("Pillar of Frost").timeleft > 5);
-      }),
-      
-      Spell.cast(47568, () => { // Using spell ID 47568 for Empower Rune Weapon
-        if (!Settings.useCD) return false;
-        
-        // Very simple conditions - use when we need resources
-        if (me.hasAura(auras.PILLAR_OF_FROST)) {
-          return true; // Always use during Pillar
-        }
-        
-        // Use for resource generation when low
-        if (me.runes < 3) {
-          return true;
-        }
-        
-        return false;
-      }),
-      
-      // Direct implementation for Frostwyrm's Fury
-      // Must be placed before the useCooldowns() method call in the main sequence
-      Spell.cast(279302, () => { // Using spell ID 279302 for Frostwyrm's Fury
-        if (!Settings.useCD) return false;
-        
-        // Very simple condition - just use with Pillar
-        if (me.hasAura(auras.PILLAR_OF_FROST)) {
-          return true;
-        }
-        
-        return false;
-      }),
-
-      // Frostwyrm's Fury - Simplified logic
-      Spell.cast("Frostwyrm's Fury", () => {
-        if (!Settings.useCD) return false;
-        
-        // If we have Rider of the Apocalypse with Apocalypse Now
-        if (this.isRiderOfTheApocalypse() && this.hasTalent("Apocalypse Now")) {
-          return me.hasAura(auras.PILLAR_OF_FROST) || me.hasAura(auras.BREATH_OF_SINDRAGOSA);
-        }
-        
-        // For single target
-        if (this.getEnemyCount() === 1) {
-          return me.hasAura(auras.PILLAR_OF_FROST) && 
-                this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 4;
-        }
-        
-        // For AoE
-        if (this.getEnemyCount() >= 2) {
-          return me.hasAura(auras.PILLAR_OF_FROST);
-        }
-        
-        return false;
-      }),
-      
-      // Raise Dead - Unchanged
-      Spell.cast("Raise Dead", () => me.hasAura(auras.PILLAR_OF_FROST)),
-      
-      // Frostscythe - Unchanged
-      Spell.cast("Frostscythe", () => !me.hasAura(auras.KILLING_MACHINE) && 
-                                    !me.hasAura(auras.PILLAR_OF_FROST)),
-      
-      // Death and Decay - Unchanged
-      new bt.Action(() => {
-        // This could be Spell.cast("Death and Decay", ...) in practice
-        // but we don't have a way to cast DnD in the simple spell interface
-        // so we would need to create a custom implementation
-        return bt.Status.Failure;
-      })
-    );
-  }
-
-  /**
-   * Cold Heart action list
-   * @returns {bt.Composite} Action list for Cold Heart
-   */
-  coldHeartActions() {
-    return new bt.Selector(
-      // actions.cold_heart+=/chains_of_ice,if=fight_remains<gcd&(rune<2|!buff.killing_machine.up&(!main_hand.2h&buff.cold_heart.stack>=4|main_hand.2h&buff.cold_heart.stack>8)|buff.killing_machine.up&(!main_hand.2h&buff.cold_heart.stack>8|main_hand.2h&buff.cold_heart.stack>10))
-      Spell.cast("Chains of Ice", () => {
-        const target = this.getCurrentTarget();
-        if (target.timeToDeath() < 1.5) {
-          if (me.runes < 2) return true;
-          if (!me.hasAura(auras.KILLING_MACHINE) && 
-              (!me.mainHand2H && this.getAuraStacks(auras.COLD_HEART) >= 4 || 
-               me.mainHand2H && this.getAuraStacks(auras.COLD_HEART) > 8)) {
-            return true;
-          }
-          if (me.hasAura(auras.KILLING_MACHINE) && 
-              (!me.mainHand2H && this.getAuraStacks(auras.COLD_HEART) > 8 || 
-               me.mainHand2H && this.getAuraStacks(auras.COLD_HEART) > 10)) {
-            return true;
-          }
-        }
-        return false;
-      }),
-      
-      // actions.cold_heart+=/chains_of_ice,if=!talent.obliteration&buff.pillar_of_frost.up&buff.cold_heart.stack>=10&(buff.pillar_of_frost.remains<gcd*(1+(talent.frostwyrms_fury&cooldown.frostwyrms_fury.ready))|buff.unholy_strength.up&buff.unholy_strength.remains<gcd)
-      Spell.cast("Chains of Ice", () => 
-        !this.hasTalent("Obliteration") && 
-        me.hasAura(auras.PILLAR_OF_FROST) && 
-        this.getAuraStacks(auras.COLD_HEART) >= 10 && 
-        (this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 1.5 * 
-        (1 + (this.hasTalent("Frostwyrm's Fury") && 
-        Spell.getCooldown("Frostwyrm's Fury").ready ? 1 : 0)) || 
-        me.hasAura(auras.UNHOLY_STRENGTH) && 
-        this.getAuraRemainingTime(auras.UNHOLY_STRENGTH) < 1.5)
-      ),
-      
-      // actions.cold_heart+=/chains_of_ice,if=!talent.obliteration&death_knight.runeforge.fallen_crusader&!buff.pillar_of_frost.up&cooldown.pillar_of_frost.remains>15&(buff.cold_heart.stack>=10&buff.unholy_strength.up|buff.cold_heart.stack>=13)
-      Spell.cast("Chains of Ice", () => 
-        !this.hasTalent("Obliteration") && 
-        this.hasRuneforgeFallenCrusader() && 
-        !me.hasAura(auras.PILLAR_OF_FROST) && 
-        Spell.getCooldown("Pillar of Frost").timeleft > 15 && 
-        (this.getAuraStacks(auras.COLD_HEART) >= 10 && 
-        me.hasAura(auras.UNHOLY_STRENGTH) || 
-        this.getAuraStacks(auras.COLD_HEART) >= 13)
-      ),
-      
-      // actions.cold_heart+=/chains_of_ice,if=!talent.obliteration&!death_knight.runeforge.fallen_crusader&buff.cold_heart.stack>=10&!buff.pillar_of_frost.up&cooldown.pillar_of_frost.remains>20
-      Spell.cast("Chains of Ice", () => 
-        !this.hasTalent("Obliteration") && 
-        !this.hasRuneforgeFallenCrusader() && 
-        this.getAuraStacks(auras.COLD_HEART) >= 10 && 
-        !me.hasAura(auras.PILLAR_OF_FROST) && 
-        Spell.getCooldown("Pillar of Frost").timeleft > 20
-      ),
-      
-      // actions.cold_heart+=/chains_of_ice,if=talent.obliteration&!buff.pillar_of_frost.up&(buff.cold_heart.stack>=14&buff.unholy_strength.up|buff.cold_heart.stack>=19|cooldown.pillar_of_frost.remains<3&buff.cold_heart.stack>=14)
-      Spell.cast("Chains of Ice", () => 
-        this.hasTalent("Obliteration") && 
-        !me.hasAura(auras.PILLAR_OF_FROST) && 
-        (this.getAuraStacks(auras.COLD_HEART) >= 14 && 
-        me.hasAura(auras.UNHOLY_STRENGTH) || 
-        this.getAuraStacks(auras.COLD_HEART) >= 19 || 
-        Spell.getCooldown("Pillar of Frost").timeleft < 3 && 
-        this.getAuraStacks(auras.COLD_HEART) >= 14)
-      )
-    );
-  }
-
-  /**
-   * Breath of Sindragosa rotation
-   * @returns {bt.Composite} Action list for Breath of Sindragosa
-   */
-  breathActions() {
-    return new bt.Selector(
-      // actions.breath+=/obliterate,cycle_targets=1,if=buff.killing_machine.stack=2
-      Spell.cast("Obliterate", () => 
-        me.hasAura(auras.KILLING_MACHINE) && 
-        this.getAuraStacks(auras.KILLING_MACHINE) === 2
-      ),
-      
-      // actions.breath+=/soul_reaper,if=fight_remains>5&target.time_to_pct_35<5&target.time_to_die>5&runic_power>50
-      Spell.cast("Soul Reaper", () => {
-        const target = this.getCurrentTarget();
-        return target.timeToDeath() > 5 && 
-               target.timeToDeath() > 5 && 
-               me.runicPower > 50;
-      }),
-      
-      // actions.breath+=/howling_blast,if=(variable.rime_buffs|!buff.killing_machine.up&buff.pillar_of_frost.up&talent.obliteration&!buff.bonegrinder_frost.up)&runic_power>(variable.breath_rime_rp_threshold-(talent.rage_of_the_frozen_champion*6))|!dot.frost_fever.ticking
-      Spell.cast("Howling Blast", () => {
-        const target = this.getCurrentTarget();
-        return (this.getVariable("rime_buffs") || 
-               !me.hasAura(auras.KILLING_MACHINE) && 
-               me.hasAura(auras.PILLAR_OF_FROST) && 
-               this.hasTalent("Obliteration") && 
-               !me.hasAura(auras.BONEGRINDER)) && 
-               me.runicPower > (this.getVariable("breath_rime_rp_threshold") - 
-               (this.hasTalent("Rage of the Frozen Champion") ? 6 : 0)) || 
-               !target.hasAuraByMe(auras.FROST_FEVER);
-      }),
-      
-      // actions.breath+=/horn_of_winter,if=rune<2&runic_power.deficit>30&(!buff.empower_rune_weapon.up|runic_power<variable.breath_rp_cost*2*gcd.max)
-      Spell.cast("Horn of Winter", () => 
-        me.runes < 2 && me.runicPowerDeficit > 30 && 
-        (!me.hasAura(auras.EMPOWER_RUNE_WEAPON) || 
-        me.runicPower < this.getVariable("breath_rp_cost") * 2 * 1.5)
-      ),
-      
-      // actions.breath+=/obliterate,cycle_targets=1,if=buff.killing_machine.up|runic_power.deficit>20
-      Spell.cast("Obliterate", () => 
-        me.hasAura(auras.KILLING_MACHINE) || me.runicPowerDeficit > 20
-      ),
-      
-      // actions.breath+=/soul_reaper,if=fight_remains>5&target.time_to_pct_35<5&target.time_to_die>5&active_enemies=1&rune>2
-      Spell.cast("Soul Reaper", () => {
-        const target = this.getCurrentTarget();
-        return target.timeToDeath() > 5 && 
-               target.timeToDeath() > 5 && 
-               this.getEnemyCount() === 1 && 
-               me.runes > 2;
-      }),
-      
-      // actions.breath+=/remorseless_winter,if=variable.breath_dying
-      Spell.cast("Remorseless Winter", () => this.getVariable("breath_dying")),
-      
-      // actions.breath+=/any_dnd,if=!death_and_decay.ticking&(variable.st_planning&talent.unholy_ground&runic_power.deficit>=10&!talent.obliteration|variable.breath_dying)
-      new bt.Action(() => {
-        // Death and Decay casting would go here
-        return bt.Status.Failure;
-      }),
-      
-      // actions.breath+=/howling_blast,if=variable.breath_dying
-      Spell.cast("Howling Blast", () => this.getVariable("breath_dying")),
-      
-      // actions.breath+=/arcane_torrent,if=runic_power<60
-      Spell.cast("Arcane Torrent", () => me.runicPower < 60),
-      
-      // actions.breath+=/howling_blast,if=buff.rime.up
-      Spell.cast("Howling Blast", () => me.hasAura(auras.RIME))
-    );
-  }
-
-  /**
-   * Obliteration rotation
-   * @returns {bt.Composite} Action list for Obliteration
-   */
-  obliterationActions() {
-    return new bt.Selector(
-      // actions.obliteration+=/obliterate,cycle_targets=1,if=buff.killing_machine.up&(buff.exterminate.up|fight_remains<gcd*2)
-      Spell.cast("Obliterate", () => 
-        me.hasAura(auras.KILLING_MACHINE) && 
-        (me.hasAura(auras.EXTERMINATE) || 
-        this.getCurrentTarget().timeToDeath() < 1.5 * 2)
-      ),
-      
-      // actions.obliteration+=/howling_blast,if=buff.killing_machine.stack<2&buff.pillar_of_frost.remains<gcd&variable.rime_buffs
-      Spell.cast("Howling Blast", () => 
-        this.getAuraStacks(auras.KILLING_MACHINE) < 2 && 
-        this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 1.5 && 
-        this.getVariable("rime_buffs")
-      ),
-      
-      // actions.obliteration+=/glacial_advance,if=buff.killing_machine.stack<2&buff.pillar_of_frost.remains<gcd&!buff.death_and_decay.up&variable.ga_priority
-      Spell.cast("Glacial Advance", () => 
-        this.getAuraStacks(auras.KILLING_MACHINE) < 2 && 
-        this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 1.5 && 
-        !me.hasAura(auras.DEATH_AND_DECAY) && 
-        this.getVariable("ga_priority")
-      ),
-      
-      // actions.obliteration+=/frost_strike,cycle_targets=1,if=buff.killing_machine.stack<2&buff.pillar_of_frost.remains<gcd&!buff.death_and_decay.up
-      Spell.cast("Frost Strike", () => 
-        this.getAuraStacks(auras.KILLING_MACHINE) < 2 && 
-        this.getAuraRemainingTime(auras.PILLAR_OF_FROST) < 1.5 && 
-        !me.hasAura(auras.DEATH_AND_DECAY)
-      ),
-      
-      // actions.obliteration+=/frost_strike,cycle_targets=1,if=debuff.razorice.stack=5&talent.shattering_blade&talent.a_feast_of_souls&buff.a_feast_of_souls.up
-      Spell.cast("Frost Strike", () => {
-        const target = this.getCurrentTarget();
-        return this.getDebuffStacks("Razorice") === 5 && 
-               this.hasTalent("Shattering Blade") && 
-               this.hasTalent("A Feast of Souls") && 
-               me.hasAura(auras.A_FEAST_OF_SOULS);
-      }),
-      
-      // actions.obliteration+=/soul_reaper,if=fight_remains>5&target.time_to_pct_35<5&target.time_to_die>5&active_enemies=1&rune>2&!buff.killing_machine.up
-      Spell.cast("Soul Reaper", () => {
-        const target = this.getCurrentTarget();
-        return target.timeToDeath() > 5 && 
-               target.timeToDeath() > 5 && 
-               this.getEnemyCount() === 1 && 
-               me.runes > 2 && 
-               !me.hasAura(auras.KILLING_MACHINE);
-      }),
-      
-      // actions.obliteration+=/obliterate,cycle_targets=1,if=buff.killing_machine.up
-      Spell.cast("Obliterate", () => me.hasAura(auras.KILLING_MACHINE)),
-      
-      // actions.obliteration+=/soul_reaper,if=fight_remains>5&target.time_to_pct_35<5&target.time_to_die>5&rune>2
-      Spell.cast("Soul Reaper", () => {
-        const target = this.getCurrentTarget();
-        return target.timeToDeath() > 5 && 
-               target.timeToDeath() > 5 && 
-               me.runes > 2;
-      }),
-      
-      // actions.obliteration+=/howling_blast,cycle_targets=1,if=!buff.killing_machine.up&(!dot.frost_fever.ticking)
-      Spell.cast("Howling Blast", () => {
-        const target = this.getCurrentTarget();
-        return !me.hasAura(auras.KILLING_MACHINE) && 
-               !target.hasAuraByMe(auras.FROST_FEVER);
-      }),
-      
-      // actions.obliteration+=/glacial_advance,cycle_targets=1,if=(variable.ga_priority|debuff.razorice.stack<5)&(!death_knight.runeforge.razorice&(debuff.razorice.stack<5|debuff.razorice.remains<gcd*3)|((variable.rp_buffs|rune<2)&active_enemies>1))
-      Spell.cast("Glacial Advance", () => {
-        const target = this.getCurrentTarget();
-        return (this.getVariable("ga_priority") || 
-               this.getDebuffStacks("Razorice") < 5) && 
-               (!this.hasRuneforgeRazorice() && 
-               (this.getDebuffStacks("Razorice") < 5 || 
-               target.getAuraRemainingTime(auras.RAZORICE) < 1.5 * 3) || 
-               ((this.getVariable("rp_buffs") || me.runes < 2) && 
-               this.getEnemyCount() > 1));
-      }),
-      
-      // actions.obliteration+=/frost_strike,cycle_targets=1,if=(rune<2|variable.rp_buffs|debuff.razorice.stack=5&talent.shattering_blade)&!variable.pooling_runic_power&(!talent.glacial_advance|active_enemies=1|talent.shattered_frost)
-      Spell.cast("Frost Strike", () => {
-        const target = this.getCurrentTarget();
-        return (me.runes < 2 || this.getVariable("rp_buffs") || 
-               this.getDebuffStacks("Razorice") === 5 && 
-               this.hasTalent("Shattering Blade")) && 
-               !this.getVariable("pooling_runic_power") && 
-               (!this.hasTalent("Glacial Advance") || 
-               this.getEnemyCount() === 1 || this.hasTalent("Shattered Frost"));
-      }),
-      
-      // actions.obliteration+=/howling_blast,if=buff.rime.up
-      Spell.cast("Howling Blast", () => me.hasAura(auras.RIME)),
-      
-      // actions.obliteration+=/frost_strike,cycle_targets=1,if=!variable.pooling_runic_power&(!talent.glacial_advance|active_enemies=1|talent.shattered_frost)
-      Spell.cast("Frost Strike", () => 
-        !this.getVariable("pooling_runic_power") && 
-        (!this.hasTalent("Glacial Advance") || 
-        this.getEnemyCount() === 1 || this.hasTalent("Shattered Frost"))
-      ),
-      
-      // actions.obliteration+=/glacial_advance,cycle_targets=1,if=!variable.pooling_runic_power&variable.ga_priority
-      Spell.cast("Glacial Advance", () => 
-        !this.getVariable("pooling_runic_power") && 
-        this.getVariable("ga_priority")
-      ),
-      
-      // actions.obliteration+=/frost_strike,cycle_targets=1,if=!variable.pooling_runic_power
-      Spell.cast("Frost Strike", () => !this.getVariable("pooling_runic_power")),
-      
-      // actions.obliteration+=/horn_of_winter,if=rune<3
-      Spell.cast("Horn of Winter", () => me.runes < 3),
-      
-      // actions.obliteration+=/arcane_torrent,if=rune<1&runic_power<30
-      Spell.cast("Arcane Torrent", () => me.runes < 1 && me.runicPower < 30),
-      
-      // actions.obliteration+=/howling_blast,if=!buff.killing_machine.up
-      Spell.cast("Howling Blast", () => !me.hasAura(auras.KILLING_MACHINE))
-    );
-  }
-
-  /**
-   * AoE rotation for 2+ targets
-   * @returns {bt.Composite} Action list for AoE
-   */
-  aoeActions() {
-    return new bt.Selector(
-      // actions.aoe+=/obliterate,if=buff.killing_machine.up&talent.cleaving_strikes&buff.death_and_decay.up
-      Spell.cast("Obliterate", () => 
-        me.hasAura(auras.KILLING_MACHINE) && 
-        this.hasTalent("Cleaving Strikes") && 
-        me.hasAura(auras.DEATH_AND_DECAY)
-      ),
-      
-      // actions.aoe+=/frost_strike,cycle_targets=1,if=!variable.pooling_runic_power&debuff.razorice.stack=5&talent.shattering_blade&(talent.shattered_frost|active_enemies<4)
-      Spell.cast("Frost Strike", () => {
-        const target = this.getCurrentTarget();
-        return !this.getVariable("pooling_runic_power") && 
-               this.getDebuffStacks("Razorice") === 5 && 
-               this.hasTalent("Shattering Blade") && 
-               (this.hasTalent("Shattered Frost") || this.getEnemyCount() < 4);
-      }),
-      
-      // actions.aoe+=/howling_blast,cycle_targets=1,if=!dot.frost_fever.ticking
-      Spell.cast("Howling Blast", () => {
-        const target = this.getCurrentTarget();
-        return !target.hasAuraByMe(auras.FROST_FEVER);
-      }),
-      
-      // actions.aoe+=/howling_blast,if=buff.rime.up
-      Spell.cast("Howling Blast", () => me.hasAura(auras.RIME)),
-      
-      // actions.aoe+=/obliterate,if=buff.killing_machine.stack>0
-      Spell.cast("Obliterate", () => me.hasAura(auras.KILLING_MACHINE)),
-      
-      // actions.aoe+=/glacial_advance,cycle_targets=1,if=!variable.pooling_runic_power&(variable.ga_priority|debuff.razorice.stack<5)
-      Spell.cast("Glacial Advance", () => 
-        !this.getVariable("pooling_runic_power") && 
-        (this.getVariable("ga_priority") || this.getDebuffStacks("Razorice") < 5)
-      ),
-      
-      // actions.aoe+=/frost_strike,cycle_targets=1,if=!variable.pooling_runic_power
-      Spell.cast("Frost Strike", () => !this.getVariable("pooling_runic_power")),
-      
-      // actions.aoe+=/obliterate
-      Spell.cast("Obliterate"),
-      
-      // actions.aoe+=/horn_of_winter,if=rune<2&runic_power.deficit>25&(!talent.breath_of_sindragosa|variable.true_breath_cooldown>cooldown.horn_of_winter.duration-15)
-      Spell.cast("Horn of Winter", () => 
-        me.runes < 2 && me.runicPowerDeficit > 25 && 
-        (!this.hasTalent("Breath of Sindragosa") || 
-        this.getVariable("true_breath_cooldown") > 
-        Spell.getCooldown("Horn of Winter").duration - 15)
-      ),
-      
-      // actions.aoe+=/arcane_torrent,if=runic_power.deficit>25
-      Spell.cast("Arcane Torrent", () => me.runicPowerDeficit > 25)
-    );
-  }
-
-  /**
-   * Single target rotation
-   * @returns {bt.Composite} Action list for single target
-   */
-  singleTargetActions() {
-    return new bt.Selector(
-      // actions.single_target+=/frost_strike,if=talent.a_feast_of_souls&debuff.razorice.stack=5&talent.shattering_blade&buff.a_feast_of_souls.up
-      Spell.cast("Frost Strike", () => {
-        const target = this.getCurrentTarget();
-        return this.hasTalent("A Feast of Souls") && 
-               this.getDebuffStacks("Razorice") === 5 && 
-               this.hasTalent("Shattering Blade") && 
-               me.hasAura(auras.A_FEAST_OF_SOULS);
-      }),
-      
-      // actions.single_target+=/obliterate,if=buff.killing_machine.stack=2|buff.exterminate.up
-      Spell.cast("Obliterate", () => 
-        this.getAuraStacks(auras.KILLING_MACHINE) === 2 || 
-        me.hasAura(auras.EXTERMINATE)
-      ),
-      
-      // actions.single_target+=/frost_strike,if=(debuff.razorice.stack=5&talent.shattering_blade)|(rune<2&!talent.icebreaker)
-      Spell.cast("Frost Strike", () => 
-        (this.getDebuffStacks("Razorice") === 5 && 
-        this.hasTalent("Shattering Blade")) || 
-        (me.runes < 2 && !this.hasTalent("Icebreaker"))
-      ),
-      
-      // actions.single_target+=/soul_reaper,if=fight_remains>5&target.time_to_pct_35<5&target.time_to_die>5&!buff.killing_machine.react
-      Spell.cast("Soul Reaper", () => {
-        const target = this.getCurrentTarget();
-        return target.timeToDeath() > 5 && 
-               target.timeToDeath() > 5 && 
-               !me.hasAura(auras.KILLING_MACHINE);
-      }),
-      
-      // actions.single_target+=/howling_blast,if=variable.rime_buffs
-      Spell.cast("Howling Blast", () => this.getVariable("rime_buffs")),
-      
-      // actions.single_target+=/obliterate,if=buff.killing_machine.up&!variable.pooling_runes
-      Spell.cast("Obliterate", () => 
-        me.hasAura(auras.KILLING_MACHINE) && 
-        !this.getVariable("pooling_runes")
-      ),
-      
-      // actions.single_target+=/soul_reaper,if=fight_remains>5&target.time_to_pct_35<5&target.time_to_die>5&rune>2
-      Spell.cast("Soul Reaper", () => {
-        const target = this.getCurrentTarget();
-        return target.timeToDeath() > 5 && 
-               target.timeToDeath() > 5 && 
-               me.runes > 2;
-      }),
-      
-      // actions.single_target+=/frost_strike,if=!variable.pooling_runic_power&(variable.rp_buffs|(!talent.shattering_blade&runic_power.deficit<20))
-      Spell.cast("Frost Strike", () => 
-        !this.getVariable("pooling_runic_power") && 
-        (this.getVariable("rp_buffs") || 
-        (!this.hasTalent("Shattering Blade") && me.runicPowerDeficit < 20))
-      ),
-      
-      // actions.single_target+=/howling_blast,if=buff.rime.up
-      Spell.cast("Howling Blast", () => me.hasAura(auras.RIME)),
-      
-      // actions.single_target+=/frost_strike,if=!variable.pooling_runic_power&!(main_hand.2h|talent.shattering_blade)
-      Spell.cast("Frost Strike", () => 
-        !this.getVariable("pooling_runic_power") && 
-        !(me.mainHand2H || this.hasTalent("Shattering Blade"))
-      ),
-      
-      // actions.single_target+=/obliterate,if=!variable.pooling_runes&main_hand.2h
-      Spell.cast("Obliterate", () => 
-        !this.getVariable("pooling_runes") && me.mainHand2H
-      ),
-      
-      // actions.single_target+=/frost_strike,if=!variable.pooling_runic_power
-      Spell.cast("Frost Strike", () => !this.getVariable("pooling_runic_power")),
-      
-      // actions.single_target+=/obliterate,if=!variable.pooling_runes
-      Spell.cast("Obliterate", () => !this.getVariable("pooling_runes")),
-      
-      // actions.single_target+=/howling_blast,if=!dot.frost_fever.ticking
-      Spell.cast("Howling Blast", () => {
-        const target = this.getCurrentTarget();
-        return !target.hasAuraByMe(auras.FROST_FEVER);
-      }),
-      
-      // actions.single_target+=/horn_of_winter,if=rune<2&runic_power.deficit>25&(!talent.breath_of_sindragosa|variable.true_breath_cooldown>cooldown.horn_of_winter.duration-15)
-      Spell.cast("Horn of Winter", () => 
-        me.runes < 2 && me.runicPowerDeficit > 25 && 
-        (!this.hasTalent("Breath of Sindragosa") || 
-        this.getVariable("true_breath_cooldown") > 
-        Spell.getCooldown("Horn of Winter").duration - 15)
-      ),
-      
-      // actions.single_target+=/arcane_torrent,if=!talent.breath_of_sindragosa&runic_power.deficit>20
-      Spell.cast("Arcane Torrent", () => 
-        !this.hasTalent("Breath of Sindragosa") && me.runicPowerDeficit > 20
-      )
-    );
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
   }
 }

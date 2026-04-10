@@ -1,605 +1,630 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
 import common from '@/Core/Common';
-import Settings from "@/Core/Settings";
-import CombatTimer from '@/Core/CombatTimer';
-import spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
-// Define spell IDs for easier reference
-const spells = {
-  // Core arcane spells
-  arcaneBlast: 30451,
-  arcaneBarrage: 44425,
-  arcaneMissiles: 5143,
-  arcaneExplosion: 1449,
-  arcaneOrb: 153626,
-  touchOfTheMagi: 321507,
-  arcaneSurge: 365350,
-  evocation: 12051,
-  presenceOfMind: 205025,
-  
-  // Secondary spells
-  supernova: 157980,
-  shiftingPower: 382440,
-  
-  // Utility
-  spellsteal: 30449,
-  mirrorImage: 55342,
-  arcaneIntellect: 1459,
-  invisibility: 66,
-  iceBlock: 45438,
-  counterspell: 2139,
-  removeCurse: 475,
+/**
+ * Arcane Mage Behavior - Midnight 12.0.1
+ * Sources: SimC Midnight APL (mage.cpp midnight branch) + Method + Wowhead
+ *
+ * Auto-detects: Spellslinger (Splintering Sorcery) vs Sunfury (Spellfire Spheres)
+ * SimC sub-lists: cooldowns (11), spellslinger (9), spellslinger_orbm (9), sunfury (7)
+ *
+ * Core: Arcane Blast (builder) -> Arcane Salvo stacking -> Barrage at threshold
+ * Burst: Arcane Surge (mana dump, +35% dmg) -> Touch of the Magi -> Barrage
+ * SS: Touch AFTER Surge | SF: Touch at END of Surge for Arcane Soul window
+ *
+ * Variables: opener, time_for_pooling, sunfury_hold_for_cds, pulse_aoe_count
+ * Resource: Mana + Arcane Charges (max 4) + Arcane Salvo (max 20/25)
+ * Movement: Barrage/Pulse/PoM+Blast/Orb instants
+ *
+ * SimC line coverage: cooldowns 11/11, spellslinger 9/9, spellslinger_orbm 9/9, sunfury 7/7
+ * Default actions: berserking, fight-end barrage/AM/Orb, sunfury_hold_for_cds variable
+ */
+
+const S = {
+  arcaneBlast:        30451,
+  arcaneBarrage:      44425,
+  arcaneMissiles:     5143,
+  arcaneExplosion:    1449,
+  arcaneOrb:          153626,
+  arcanePulse:        1243460,
+  arcaneSurge:        365350,
+  touchOfTheMagi:     321507,
+  evocation:          12051,
+  presenceOfMind:     205025,
+  mirrorImage:        55342,
+  counterspell:       2139,
+  prismaticBarrier:   235450,
+  iceBlock:           45438,
+  arcaneIntellect:    1459,
+  berserking:         26297,
 };
 
-// Define aura IDs for easier reference
-const auras = {
-  // Core arcane auras
-  arcaneCharge: 36032,        // Arcane Charge
-  arcaneSurge: 365362,        // Arcane Surge
-  touchOfTheMagi: 210824,     // Touch of the Magi
-  clearcasting: 263725,       // Clearcasting
-  evocation: 12051,           // Evocation
-  presenceOfMind: 205025,     // Presence of Mind
-  siphonStorm: 382467,        // Siphon Storm
-  
-  // Arcane talents and buffs
-  arcaneTempo: 383997,        // Arcane Tempo
-  arcaneHarmony: 384455,      // Arcane Harmony
-  netherPrecision: 383783,    // Nether Precision
-  arcaneFamiliar: 210126,     // Arcane Familiar
-  intuition: 377200,          // Intuition
-  aetherAttunement: 383951,   // Aether Attunement (4pc Set Bonus)
-  magisSparkBlast: 378194,    // Magi's Spark (Arcane Blast debuff)
-  
-  // Talent buffs
-  leydrinker: 383791,         // Leydrinker
-  radiantSpark: 376103,       // Radiant Spark
-  unerringProficiency: 378195, // Unerring Proficiency
-  
-  // Other
-  arcaneIntellect: 1459,      // Arcane Intellect
-  mirrorImage: 55342,         // Mirror Image
+const T = {
+  splinteringSorcery: 443739,
+  spellfireSpheres:   448601,
+  orbMastery:         1243435,
+  highVoltage:        461248,
+  overpoweredMissiles: 1277009,
+  orbBarrage:         384858,
+  resonance:          205028,
+  impetus:            383676,
+  spellfireSalvo:     1260616,
+  arcanePulse:        1243460,
 };
 
-export class ArcaneMageBehaviour extends Behavior {
+const A = {
+  arcaneSurge:        365350,
+  touchOfTheMagi:     321507,
+  clearcasting:       263725,
+  arcaneCharge:       36032,
+  arcaneSalvo:        384452,
+  presenceOfMind:     205025,
+  overpoweredMissiles: 1277009,
+  arcaneSoul:         451038,
+};
+
+export class ArcaneMageBehavior extends Behavior {
+  name = 'FW Arcane Mage';
   context = BehaviorContext.Any;
   specialization = Specialization.Mage.Arcane;
-  name = "FW Arcane Mage Spellslinger";
-  version = 1.0;
+  version = wow.GameVersion.Retail;
+
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _manaFrame = 0;
+  _cachedMana = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _salvoFrame = 0;
+  _cachedSalvo = 0;
+  _ccFrame = 0;
+  _cachedCC = null;
+  _versionLogged = false;
+  _lastDebug = 0;
+  _opener = true;
 
   static settings = [
     {
-      header: "Arcane Mage Settings",
+      header: 'General',
       options: [
-        {
-          type: "checkbox",
-          text: "Use AoE rotation automatically",
-          uid: "AutoAOE",
-          default: true,
-          tooltip: "Automatically switches to AoE rotation based on target count"
-        },
-        {
-          type: "slider",
-          text: "AoE Target Count",
-          uid: "AOETargetCount",
-          default: 3,
-          min: 2,
-          max: 6,
-          step: 1,
-          tooltip: "Number of targets required to use AoE rotation"
-        },
-        {
-          type: "checkbox",
-          text: "Attack out of combat",
-          uid: "AttackOOC",
-          default: false,
-          tooltip: "Attack targets even when out of combat"
-        },
-        {
-          type: "checkbox",
-          text: "Use Presence of Mind",
-          uid: "UsePresenceOfMind",
-          default: true,
-          tooltip: "Use Presence of Mind during rotation"
-        },
-        {
-          type: "checkbox",
-          text: "Use Shifting Power",
-          uid: "UseShiftingPower",
-          default: true,
-          tooltip: "Use Shifting Power to reduce cooldowns"
-        },
-        {
-          type: "checkbox",
-          text: "Cancel Presence of Mind",
-          uid: "CancelPOM",
-          default: true,
-          tooltip: "Cancel Presence of Mind after one stack to start cooldown"
-        },
-        {
-          type: "checkbox",
-          text: "Use Evocation",
-          uid: "UseEvocation",
-          default: true,
-          tooltip: "Use Evocation to restore mana during cooldowns"
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWArcUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'slider', uid: 'FWArcAoECount', text: 'AoE Target Count', default: 3, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWArcDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWArcBarrier', text: 'Use Prismatic Barrier', default: true },
+        { type: 'checkbox', uid: 'FWArcIceBlock', text: 'Use Ice Block', default: true },
+        { type: 'slider', uid: 'FWArcIceBlockHP', text: 'Ice Block HP %', default: 15, min: 5, max: 30 },
+      ],
+    },
   ];
 
+  // =============================================
+  // BUILD
+  // =============================================
   build() {
-
- return new bt.Selector(
+    return new bt.Selector(
       common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // OOC: Arcane Intellect
+      spell.cast(S.arcaneIntellect, () => me, () =>
+        spell.getTimeSinceLastCast(S.arcaneIntellect) > 60000 && !me.hasAura(1459)
+      ),
+
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
       new bt.Action(() => {
-        if (this.getCurrentTarget() === null) {
-          return bt.Status.Success;
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
         }
         return bt.Status.Failure;
       }),
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
       common.waitForCastOrChannel(),
-      spell.cast("Arcane Intellect", () => !me.hasAura(auras.arcaneIntellect)),
-      spell.cast("Ice Block", () => me.pctHealth < 20),
-      spell.cast("Remove Curse", () => {
-        // Remove curse from self if we have a dispellable curse
-        const curseAura = me.auras.find(aura => aura.dispelType === 2 && aura.isDebuff());
-        return curseAura !== undefined;
+
+      // SimC: variable,name=opener,op=set,if=debuff.touch_of_the_magi.up&variable.opener,value=0
+      new bt.Action(() => {
+        if (this._opener && this.targetHasTouch()) this._opener = false;
+        return bt.Status.Failure;
       }),
-      spell.interrupt("Counterspell", false),
+
+      new bt.Action(() => {
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[Arcane] Midnight 12.0.1 | ${this.isSS() ? 'Spellslinger' : 'Sunfury'} | OrbM: ${this.hasOrbM()} | SimC APL full`);
+        }
+        if (Settings.FWArcDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[Arcane] Mana:${Math.round(this.getMana())}% Chrg:${this.getCharges()} Salvo:${this.getSalvo()} CC:${this.getCCStacks()} Surge:${this.inSurge()} Soul:${this.inSoul()} OPM:${me.hasAura(A.overpoweredMissiles)} Hold:${this.sunfuryHoldForCds()} E:${this.getEnemyCount()}`);
+        }
+        return bt.Status.Failure;
+      }),
+
       new bt.Decorator(
-        () => me.hasAura(auras.touchOfTheMagi) || me.hasAura(auras.arcaneSurge),
-        // this.useTrinkets(),
-        new bt.Action(() => bt.Status.Failure)
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          spell.interrupt(S.counterspell),
+
+          // Defensives
+          spell.cast(S.prismaticBarrier, () => me, () => Settings.FWArcBarrier && me.inCombat()),
+          spell.cast(S.iceBlock, () => me, () =>
+            Settings.FWArcIceBlock && me.effectiveHealthPercent < Settings.FWArcIceBlockHP
+          ),
+
+          // Movement block — full instant rotation
+          new bt.Decorator(
+            () => me.isMoving(),
+            new bt.Selector(
+              // Barrage at high salvo or charges
+              spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+                this.getSalvo() >= 20 || this.getCharges() >= 4
+              ),
+              // Arcane Orb (instant, generates charges)
+              spell.cast(S.arcaneOrb, () => this.getCurrentTarget()),
+              // Arcane Pulse (instant AoE)
+              spell.cast(S.arcanePulse, () => this.getCurrentTarget()),
+              // PoM for instant Blast
+              spell.cast(S.presenceOfMind, () => me, () => this.getCharges() < 2),
+              spell.cast(S.arcaneBlast, () => this.getCurrentTarget(), () => me.hasAura(A.presenceOfMind)),
+              // Low-charge barrage as filler
+              spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () => this.getCharges() >= 2),
+              new bt.Action(() => bt.Status.Success)
+            ),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+
+          // SimC: berserking,if=(buff.arcane_surge.up&debuff.touch_of_the_magi.up)|fight_remains<13
+          spell.cast(S.berserking, () => me, () =>
+            (this.inSurge() && this.targetHasTouch()) || this.targetTTD() < 13000
+          ),
+
+          // SimC: arcane_barrage,if=fight_remains<gcd.max*2
+          spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+            this.targetTTD() < 3000
+          ),
+
+          // SimC: arcane_missiles,if=fight_remains<execute_time*(1+cc.react)&cc.react&salvo>=13+(5*spellfire_salvo)&!orb_mastery
+          spell.cast(S.arcaneMissiles, () => this.getCurrentTarget(), () => {
+            if (!this.hasCC() || this.hasOrbM()) return false;
+            const salvoThreshold = 13 + (spell.isSpellKnown(T.spellfireSalvo) ? 5 : 0);
+            return this.targetTTD() < 4000 && this.getSalvo() >= salvoThreshold;
+          }),
+
+          // SimC: arcane_orb,if=fight_remains<execute_time*(1+cc.react)&cc.react&salvo>=13+(5*spellfire_salvo)&orb_mastery
+          spell.cast(S.arcaneOrb, () => this.getCurrentTarget(), () => {
+            if (!this.hasCC() || !this.hasOrbM()) return false;
+            const salvoThreshold = 13 + (spell.isSpellKnown(T.spellfireSalvo) ? 5 : 0);
+            return this.targetTTD() < 4000 && this.getSalvo() >= salvoThreshold;
+          }),
+
+          // SimC: call_action_list,name=cooldowns
+          this.cooldowns(),
+
+          // SimC dispatch: SS+OrbM -> spellslinger_orbm, SS -> spellslinger, else -> sunfury
+          new bt.Decorator(
+            () => this.isSS() && this.hasOrbM(),
+            this.ssOrbM(), new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.isSS(),
+            this.ssRotation(), new bt.Action(() => bt.Status.Failure)
+          ),
+          this.sfRotation(),
+
+          // SimC fallback: arcane_barrage,if=(time>5&!prev_gcd.1.arcane_surge)|(prev_off_gcd.touch&salvo=max)
+          spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+            spell.getTimeSinceLastCast(S.arcaneSurge) > 1500 ||
+            (spell.getTimeSinceLastCast(S.touchOfTheMagi) < 1500 && this.getSalvo() >= this.maxSalvo())
+          ),
+        )
       ),
-      new bt.Decorator(
-        () => me.hasAura(auras.touchOfTheMagi) || me.hasAura(auras.arcaneSurge),
-        // this.useRacials(),
-        new bt.Action(() => bt.Status.Failure)
-      ),
-      new bt.Decorator(
-        () => this.shouldUseAoe(),
-        this.aoeRotation(),
-        new bt.Action(() => bt.Status.Success)
-      ),
-      new bt.Decorator(
-        () => true,
-        this.singleTargetRotation(),
-        new bt.Action(() => bt.Status.Success)
-      )
     );
   }
 
-  // Utility Methods
-  getCurrentTarget() {
-    const targetPredicate = unit => common.validTarget(unit) && me.distanceTo(unit) < 40 && me.isFacing(unit);
-    const target = me.targetUnit;
-    if (target !== null && targetPredicate(target)) {
-      return target;
-    }
-    return combat.targets.find(targetPredicate) || null;
-  }
-
-  getEnemiesInRange(range) {
-    return me.getUnitsAroundCount(range);
-  }
-
-  getArcaneCharges() {
-    const arcaneChargeAura = me.powerByType(PowerType.ArcaneCharges)    ;
-    return arcaneChargeAura ? arcaneChargeAura.stacks : 0;
-  }
-
-  getAuraRemainingTime(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.remaining : 0;
-  }
-
-  getDebuffRemainingTime(debuffName) {
-    const target = this.getCurrentTarget();
-    if (!target) return 0;
-    
-    const debuff = target.getAuraByMe(debuffName);
-    return debuff ? debuff.remaining : 0;
-  }
-
-  hasTargetMagisSpark() {
-    const target = this.getCurrentTarget();
-    return target ? target.hasAuraByMe(auras.magisSparkBlast) : false;
-  }
-
-  hasTargetTouchOfTheMagi() {
-    const target = this.getCurrentTarget();
-    return target ? target.hasAuraByMe(auras.touchOfTheMagi) : false;
-  }
-
-  shouldUseAoe() {
-    return me.getUnitsAroundCount(10) >= Settings.AOETargetCount;
-  }
-
-  hasTalent(talentName) {
-    return spell.isSpellKnown(talentName);
-  }
-
-  shouldBarrageFromHarmony() {
-    const harmonyAura = me.getAura(auras.arcaneHarmony);
-    if (!harmonyAura) return false;
-    
-    // Based on SimC: barrage if Harmony is over 18 stacks, or 12 with High Voltage
-    // and either no Nether Precision or your last stack of it
-    const hasHighVoltage = this.hasTalent("High Voltage");
-    const netherPrecisionAura = me.getAura(auras.netherPrecision);
-    const netherPrecisionStacks = netherPrecisionAura ? netherPrecisionAura.stacks : 0;
-    
-    const stackThreshold = hasHighVoltage ? 12 : 18;
-    
-    return harmonyAura.stacks >= stackThreshold && 
-           (netherPrecisionStacks === 0 || netherPrecisionStacks === 1);
-  }
-
-  shouldUseTouchOfTheMagi() {
-    // Check cooldown status and conditions
-    const touchCd = spell.getCooldown("Touch of the Magi");
-    if (!touchCd.ready) return false;
-    
-    const arcaneCharges = this.getArcaneCharges();
-    const arcaneSurgeUp = me.hasAura(auras.arcaneSurge);
-    const lastSpell = spell.getLastSuccessfulSpell();
-    
-    // After arcane barrage or with Arcane Surge
-    if (lastSpell === "Arcane Barrage") return true;
-    if (lastSpell === "Arcane Aurge" && arcaneCharges < 4) return true;
-    
-    // Need more info on target health to align with burst windows
-    return touchCd.ready && arcaneCharges < 4 && !me.hasAura(auras.touchOfTheMagi);
-  }
-
-  shouldUseArcaneSurge() {
-    const touchCd = spell.getCooldown("Touch of the Magi");
-    const arcaneSurgeCd = spell.getCooldown("Arcane Surge");
-    
-    if (!arcaneSurgeCd.ready) return false;
-    
-    // Use before Touch of the Magi comes off cooldown
-    return touchCd.timeleft < 3000;
-  }
-
-  useTrinkets() {
+  // =============================================
+  // COOLDOWNS (SimC actions.cooldowns — 11 entries)
+  // =============================================
+  cooldowns() {
     return new bt.Selector(
-      common.useEquippedItemByName("Neural Synapse Enhancer", () => 
-        this.hasTargetTouchOfTheMagi() && me.hasAura(auras.arcaneSurge)
+      // SimC 1: arcane_orb,if=(ss|sf_ts)&opener&time_for_pooling,line_cd=30
+      spell.cast(S.arcaneOrb, () => this.getCurrentTarget(), () =>
+        (this.isSS() || this.sfTouchSurge()) && this._opener &&
+        spell.getTimeSinceLastCast(S.arcaneOrb) > 30000
       ),
-      common.useEquippedItemByName("Spymaster's Web", () => 
-        this.shouldUseCooldowns() && 
-        (spell.getLastSuccessfulSpell() === "Arcane Surge" || 
-        spell.getLastSuccessfulSpell() === "evocation")
+
+      // SimC 2: arcane_orb,if=ss&prev_off_gcd.touch&time<5&salvo<=14,line_cd=999
+      spell.cast(S.arcaneOrb, () => this.getCurrentTarget(), () =>
+        this.isSS() && spell.getTimeSinceLastCast(S.touchOfTheMagi) < 1500 &&
+        this.getSalvo() <= 14
       ),
-      // Add more trinkets as needed
-      common.useEquippedItemByName("Mugs Moxie Jug", () => 
-        me.hasAura(auras.arcaneSurge) || me.hasAura(auras.touchOfTheMagi)
+
+      // SimC 4: arcane_missiles,if=sf&!sf_ts&opener,line_cd=30 (SF opener pooling with AM)
+      spell.cast(S.arcaneMissiles, () => this.getCurrentTarget(), () =>
+        this.isSF() && !this.sfTouchSurge() && this._opener && this.hasCC() &&
+        spell.getTimeSinceLastCast(S.arcaneMissiles) > 30000
       ),
-      common.useEquippedItemByName("Eye of Kezan", () => 
-        me.hasAura(auras.arcaneSurge) || me.hasAura(auras.touchOfTheMagi)
-      )
+
+      // SimC 5: arcane_pulse,if=(ss|sf_ts)&salvo<20&(opener|(orbm&surge_cd<gcd*(mana/divisor)))&aoe>=pulse_count
+      spell.cast(S.arcanePulse, () => this.getCurrentTarget(), () => {
+        if (!(this.isSS() || this.sfTouchSurge())) return false;
+        if (this.getSalvo() >= 20) return false;
+        const divisor = 8 + (this.getEnemyCount() > this.pulseAoECount() ? 8 : 0);
+        const poolCondition = this._opener ||
+          (this.hasOrbM() && this.surgeCDRemains() < (1500 * this.getMana() / divisor));
+        return poolCondition && this.getEnemyCount() >= this.pulseAoECount();
+      }),
+
+      // SimC 6: arcane_blast,if=(ss|sf_ts)&salvo<20&(opener|(orbm&surge_cd<gcd*(mana/divisor)))
+      spell.cast(S.arcaneBlast, () => this.getCurrentTarget(), () => {
+        if (!(this.isSS() || this.sfTouchSurge())) return false;
+        if (this.getSalvo() >= 20) return false;
+        const divisor = 8 + (this.getEnemyCount() >= 2 ? 8 : 0);
+        return this._opener ||
+          (this.hasOrbM() && this.surgeCDRemains() < (1500 * this.getMana() / divisor));
+      }),
+
+      // SimC 8: touch_of_the_magi,use_off_gcd=1 — complex conditions
+      spell.cast(S.touchOfTheMagi, () => this.getCurrentTarget(), () => {
+        if (!Settings.FWArcUseCDs || !this.getCurrentTarget()) return false;
+        // (ss|sf_ts) & surge up
+        if ((this.isSS() || this.sfTouchSurge()) && this.inSurge()) return true;
+        // sf & !sf_ts & surge up & surge.remains < 5+gcd
+        if (this.isSF() && !this.sfTouchSurge() && this.inSurge()) {
+          const surgeRem = me.getAura(A.arcaneSurge)?.remaining || 0;
+          return surgeRem < 6500; // 5s + ~1.5s gcd
+        }
+        // off-CD & surge CD > 30 & surge down
+        return spell.getCooldown(S.touchOfTheMagi)?.ready &&
+          this.surgeCDRemains() > 30000 && !this.inSurge();
+      }),
+
+      // SimC 9: arcane_surge
+      spell.cast(S.arcaneSurge, () => this.getCurrentTarget(), () =>
+        Settings.FWArcUseCDs && this.targetTTD() > 15000
+      ),
+
+      // Mirror Image (SimC precombat, use on CD)
+      spell.cast(S.mirrorImage, () => me, () => Settings.FWArcUseCDs),
+
+      // SimC 11: evocation,if=mana<10&surge.down&touch.down&surge_cd>10
+      spell.cast(S.evocation, () => me, () =>
+        this.getMana() < 10 && !this.inSurge() && !this.targetHasTouch() &&
+        this.surgeCDRemains() > 10000
+      ),
     );
   }
 
-  useRacials() {
+  // =============================================
+  // SPELLSLINGER (non-Orb Mastery) (SimC actions.spellslinger, 9 lines)
+  // =============================================
+  ssRotation() {
     return new bt.Selector(
-      spell.cast("Berserking", () => 
-        spell.getLastSuccessfulSpell() === "Arcane surge"
+      // SimC 1: arcane_orb,if=charges<(3+(aoe>=2))&(((cc=0&hv)|(cc&salvo>=12))|(aoe>=2))&touch_cd>gcd*4
+      spell.cast(S.arcaneOrb, () => this.getCurrentTarget(), () => {
+        const threshold = this.getEnemyCount() >= 2 ? 4 : 3;
+        if (this.getCharges() >= threshold) return false;
+        if (this.touchCDRemains() <= 6000) return false; // gcd*4
+        return (!this.hasCC() && spell.isSpellKnown(T.highVoltage)) ||
+          (this.hasCC() && this.getSalvo() >= 12) || this.getEnemyCount() >= 2;
+      }),
+
+      // SimC 2: arcane_barrage,if=salvo>=20&(charges=4|orb_barrage)&touch_cd>gcd*(4-(2*(aoe>=2)))
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+        this.getSalvo() >= 20 && (this.getCharges() >= 4 || spell.isSpellKnown(T.orbBarrage)) &&
+        this.touchCDRemains() > (this.getEnemyCount() >= 2 ? 3000 : 6000)
       ),
-      spell.cast("Blood Fury", () => 
-        spell.getLastSuccessfulSpell() === "Arcane Surge"
+
+      // SimC 3: arcane_barrage,if=aoe>=2&charges=4&cc&opm&hv&salvo>5&salvo<14&touch_cd>gcd*4
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+        this.getEnemyCount() >= 2 && this.getCharges() >= 4 && this.hasCC() &&
+        me.hasAura(A.overpoweredMissiles) && spell.isSpellKnown(T.highVoltage) &&
+        this.getSalvo() > 5 && this.getSalvo() < 14 && this.touchCDRemains() > 6000
       ),
-      spell.cast("Fireblood", () => 
-        spell.getLastSuccessfulSpell() === "Arcane Surge"
+
+      // SimC 4: arcane_missiles,if=cc&(salvo<(10+(5*(opm=0)))|(charges<2&hv&aoe>=2))
+      spell.cast(S.arcaneMissiles, () => this.getCurrentTarget(), () => {
+        if (!this.hasCC()) return false;
+        const opmZero = !me.hasAura(A.overpoweredMissiles);
+        return this.getSalvo() < (10 + (opmZero ? 5 : 0)) ||
+          (this.getCharges() < 2 && spell.isSpellKnown(T.highVoltage) && this.getEnemyCount() >= 2);
+      }),
+
+      // SimC 5: presence_of_mind,use_off_gcd=1,if=charges<2&(cc=0|!hv&orb_frac<0.95)&!prev_orb&!prev_am
+      spell.cast(S.presenceOfMind, () => me, () =>
+        this.getCharges() < 2 &&
+        (!this.hasCC() || (!spell.isSpellKnown(T.highVoltage) && spell.getChargesFractional(S.arcaneOrb) < 0.95)) &&
+        spell.getTimeSinceLastCast(S.arcaneOrb) > 1500 && spell.getTimeSinceLastCast(S.arcaneMissiles) > 1500
       ),
-      spell.cast("Ancestral Call", () => 
-        spell.getLastSuccessfulSpell() === "Arcane Surge"
+
+      // SimC 6: arcane_blast,if=pom.up
+      spell.cast(S.arcaneBlast, () => this.getCurrentTarget(), () => me.hasAura(A.presenceOfMind)),
+
+      // SimC 7: arcane_pulse,if=(aoe>=pulse_count&!funnel)|(charges<3&mana>50)
+      spell.cast(S.arcanePulse, () => this.getCurrentTarget(), () =>
+        this.getEnemyCount() >= this.pulseAoECount() || (this.getCharges() < 3 && this.getMana() > 50)
       ),
-      spell.cast("Light's Judgment", on => this.getCurrentTarget(), () => 
-        !me.hasAura(auras.arcaneSurge) && !this.hasTargetTouchOfTheMagi() && this.getEnemiesInRange(10) >= 2
-      )
+
+      // SimC 8: arcane_blast
+      spell.cast(S.arcaneBlast, () => this.getCurrentTarget()),
+
+      // SimC 9: arcane_barrage,if=!prev_surge|prev_touch&salvo=20
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+        spell.getTimeSinceLastCast(S.arcaneSurge) > 1500 ||
+        (spell.getTimeSinceLastCast(S.touchOfTheMagi) < 1500 && this.getSalvo() >= 20)
+      ),
     );
   }
 
-  shouldUseCooldowns() {
-    const target = this.getCurrentTarget();
-    if (!target) return false;
+  // =============================================
+  // SPELLSLINGER ORB MASTERY (SimC actions.spellslinger_orbm, 9 lines)
+  // =============================================
+  ssOrbM() {
+    return new bt.Selector(
+      // SimC 1: arcane_orb,if=(prev_barrage|aoe>=4)&((cc&salvo<=14)|(cc=0&orb_frac>1.9&salvo<=18))
+      spell.cast(S.arcaneOrb, () => this.getCurrentTarget(), () => {
+        if (spell.getTimeSinceLastCast(S.arcaneBarrage) > 1500 && this.getEnemyCount() < 4) return false;
+        return (this.hasCC() && this.getSalvo() <= 14) ||
+          (!this.hasCC() && spell.getChargesFractional(S.arcaneOrb) > 1.9 && this.getSalvo() <= 18);
+      }),
 
-    // Don't use cooldowns on low health targets unless they're bosses
-    const targetHealth = target.pctHealth;
-    const isBoss = target.classification === 3; // Check if target is a boss
-    
-    return targetHealth > 30 || isBoss;
+      // SimC 2: arcane_barrage,if=(charges=4|orb_barrage)&salvo>=20&touch_cd>gcd*(4-2*(aoe>=2))
+      //   |((surge.remains<gcd&surge.up)|(touch.remains<gcd&touch.up))&salvo>=15
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () => {
+        const salvo = this.getSalvo();
+        if ((this.getCharges() >= 4 || spell.isSpellKnown(T.orbBarrage)) && salvo >= 20 &&
+          this.touchCDRemains() > (this.getEnemyCount() >= 2 ? 3000 : 6000)) return true;
+        const surgeRem = me.getAura(A.arcaneSurge)?.remaining || 0;
+        if (surgeRem > 0 && surgeRem < 1500 && salvo >= 15) return true;
+        const touchRem = this.getCurrentTarget()?.getAuraByMe(A.touchOfTheMagi)?.remaining || 0;
+        return touchRem > 0 && touchRem < 1500 && salvo >= 15;
+      }),
+
+      // SimC 3: arcane_missiles,if=(hv|opm_talent|(cc=3))&cc&salvo<=(10+(5*(opm=0)))&!prev_orb
+      //   &(surge.down|(hv&aoe=1))&(aoe<2|opm_talent)
+      spell.cast(S.arcaneMissiles, () => this.getCurrentTarget(), () => {
+        if (!this.hasCC()) return false;
+        if (spell.getTimeSinceLastCast(S.arcaneOrb) < 1500) return false;
+        if (!(spell.isSpellKnown(T.highVoltage) || spell.isSpellKnown(T.overpoweredMissiles) || this.getCCStacks() >= 3)) return false;
+        const opmZero = !me.hasAura(A.overpoweredMissiles);
+        return this.getSalvo() <= (10 + (opmZero ? 5 : 0)) &&
+          (!this.inSurge() || (spell.isSpellKnown(T.highVoltage) && this.getEnemyCount() === 1)) &&
+          (this.getEnemyCount() < 2 || spell.isSpellKnown(T.overpoweredMissiles));
+      }),
+
+      // SimC 4: arcane_barrage,if=salvo<7&surge.down&touch.down&charges=4&resonance&arcane_pulse
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+        this.getSalvo() < 7 && !this.inSurge() && !this.targetHasTouch() &&
+        this.getCharges() >= 4 && spell.isSpellKnown(T.resonance) && spell.isSpellKnown(T.arcanePulse)
+      ),
+
+      // SimC 5: presence_of_mind,if=charges<2&(cc=0|!hv&orb_frac<0.95)&!prev_orb&!prev_am
+      spell.cast(S.presenceOfMind, () => me, () =>
+        this.getCharges() < 2 &&
+        (!this.hasCC() || (!spell.isSpellKnown(T.highVoltage) && spell.getChargesFractional(S.arcaneOrb) < 0.95)) &&
+        spell.getTimeSinceLastCast(S.arcaneOrb) > 1500
+      ),
+
+      // SimC 6: arcane_blast,if=pom.up
+      spell.cast(S.arcaneBlast, () => this.getCurrentTarget(), () => me.hasAura(A.presenceOfMind)),
+
+      // SimC 7: arcane_pulse,if=(aoe>=pulse_count&!funnel)|(charges<3&mana>30)
+      spell.cast(S.arcanePulse, () => this.getCurrentTarget(), () =>
+        this.getEnemyCount() >= this.pulseAoECount() || (this.getCharges() < 3 && this.getMana() > 30)
+      ),
+
+      // SimC 8: arcane_blast
+      spell.cast(S.arcaneBlast, () => this.getCurrentTarget()),
+
+      // SimC 9: arcane_barrage,if=(time>5&!prev_surge)|(prev_touch&salvo=20)
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () =>
+        spell.getTimeSinceLastCast(S.arcaneSurge) > 1500 ||
+        (spell.getTimeSinceLastCast(S.touchOfTheMagi) < 1500 && this.getSalvo() >= 20)
+      ),
+    );
   }
 
-  // Cooldown rotation - implements the cd_opener action list
-  cooldownRotation() {
+  // =============================================
+  // SUNFURY (SimC actions.sunfury, 7 lines)
+  // =============================================
+  sfRotation() {
     return new bt.Selector(
-      // Touch of the Magi logic
-      spell.cast("Touch of the Magi", on => this.getCurrentTarget(), () => {
-        const lastSpell = spell.getLastSuccessfulSpell();
-        const arcaneBarrageInFlight = lastSpell === "Arcane Barrage";
-        const arcaneCharges = this.getArcaneCharges();
-        const arcaneSurgeUp = me.hasAura(auras.arcaneSurge);
-        const touchCooldownLong = spell.getCooldown("Touch of the Magi").timeleft > 30000;
-        
-        if (arcaneBarrageInFlight && (arcaneSurgeUp || touchCooldownLong)) {
-          return true;
+      // SimC 1: arcane_barrage — Arcane Soul | post-Touch | Touch ending | hold_for_cds with salvo bands
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () => {
+        if (this.inSoul()) return true;
+        if (spell.getTimeSinceLastCast(S.touchOfTheMagi) < 1500) return true;
+        const touchRem = this.getCurrentTarget()?.getAuraByMe(A.touchOfTheMagi)?.remaining || 0;
+        if (touchRem > 0 && touchRem < 1500 && this.getCharges() >= 4) return true;
+        // SimC: charges=4 & sunfury_hold_for_cds & (salvo band checks OR salvo=25)
+        const salvo = this.getSalvo();
+        if (this.getCharges() >= 4 && this.sunfuryHoldForCds()) {
+          const hasCC = this.hasCC();
+          const hasHV = spell.isSpellKnown(T.highVoltage);
+          const orbReady = spell.getChargesFractional(S.arcaneOrb) > 0.95;
+          const aoe3 = this.getEnemyCount() >= 3;
+          // (cc&hv)|(orb_ready&aoe>=3) triggers band check
+          if ((hasCC && hasHV) || (orbReady && aoe3)) {
+            // Salvo bands: 6-6, 12-12, 18-18, or (<19 & !resonance & aoe>=3)
+            if ((salvo >= 6 && salvo < 7) || (salvo >= 12 && salvo < 13) ||
+              (salvo >= 18 && salvo < 19) || (salvo < 19 && !spell.isSpellKnown(T.resonance) && aoe3)) {
+              return true;
+            }
+          }
+          if (salvo >= this.maxSalvo()) return true;
         }
-        
-        // Special case: if Arcane Surge was just cast
-        if (lastSpell === "Arcane Surge" && (arcaneCharges < 4 || !me.hasAura(auras.netherPrecision))) {
-          return true;
-        }
-        
-        // Second special case: pool for cooldown windows
-        if (touchCooldownLong && spell.getCooldown("Touch of the Magi").ready && arcaneCharges < 4 && !arcaneBarrageInFlight) {
-          return true;
-        }
-        
         return false;
       }),
-      
-      // Presence of Mind logic
-      spell.cast("Presence of Mind", () => {
-        if (!Settings.UsePresenceOfMind) return false;
-        
-        return this.hasTargetTouchOfTheMagi() && 
-               me.hasAura(auras.netherPrecision) && 
-               this.getEnemiesInRange(10) < 3;
-      }),
-      
-      // Cancel PoM after one use
-      new bt.Action(() => {
-        if (!Settings.CancelPOM) return bt.Status.Failure;
-        
-        const pomAura = me.getAura(auras.presenceOfMind);
-        if (pomAura && pomAura.stacks === 1 && spell.getLastSuccessfulSpell() === "Arcane Blast") {
-          me.cancelAura(auras.presenceOfMind);
-          return bt.Status.Success;
+
+      // SimC 2: arcane_missiles — complex cc/salvo/charge/surge conditions
+      spell.cast(S.arcaneMissiles, () => this.getCurrentTarget(), () => {
+        if (!this.hasCC()) return false;
+        const opmUp = me.hasAura(A.overpoweredMissiles);
+        const salvo = this.getSalvo();
+        const ccStacks = this.getCCStacks();
+        const surgeUp = this.inSurge();
+        const surgeDown = !surgeUp;
+        const salvoThreshold = 15 - (opmUp && surgeDown ? 5 : 0);
+        // (touch_cd > gcd*(8-4*sf_ts) & opm=0) | surge.up | charges<3 | cc>1
+        // ... & salvo < threshold
+        const touchGate = 8 - (this.sfTouchSurge() ? 4 : 0);
+        if ((this.touchCDRemains() > touchGate * 1500 && !opmUp) || surgeUp ||
+          this.getCharges() < 3 || ccStacks > 1) {
+          if (salvo < salvoThreshold) return true;
         }
-        return bt.Status.Failure;
+        // (touch.up & surge.up) — dump during burst
+        if (this.targetHasTouch() && surgeUp) return true;
+        return false;
       }),
-      
-      // Evocation before Arcane Surge
-      spell.cast("Evocation", () => {
-        if (!Settings.UseEvocation) return false;
-        
-        const arcaneSurgeCd = spell.getCooldown("Arcane Surge");
-        const touchCd = spell.getCooldown("Touch of the Magi");
-        
-        return arcaneSurgeCd.timeleft < 3000 && touchCd.timeleft < 5000;
-      }),
-      
-      // Use Arcane Missiles for Nether Precision
-      spell.cast("Arcane Missiles", on => this.getCurrentTarget(), () => {
-        const lastSpell = spell.getLastSuccessfulSpell();
-        const clearcasting = me.hasAura(auras.clearcasting);
-        const hasNetherPrecision = me.hasAura(auras.netherPrecision);
-        const hasAetherAttunement = me.hasAura(auras.aetherAttunement);
-        const has4pcBonus = true; // Assume we have the 4pc bonus
-        
-        // Based on SimC: use Missiles after evocation/surge to build Nether Precision
-        return (lastSpell === "evocation" || lastSpell === "Arcane Surge") && 
-               !hasNetherPrecision && 
-               clearcasting && 
-               (!hasAetherAttunement || has4pcBonus);
-      }),
-      
-      // Arcane Surge
-      spell.cast("Arcane Surge", () => {
-        const touchCd = spell.getCooldown("Touch of the Magi");
-        const arcaneCharges = this.getArcaneCharges();
-        
-        // Based on SimC: use when Touch of the Magi is about to come off cooldown
-        return touchCd.timeleft < (spell.getSpell("Arcane Surge").castTime + 
-                                 (arcaneCharges === 4 ? 0 : 3000));
-      })
-    );
-  }
 
-  // Single target rotation - Implements the spellslinger action list
-  singleTargetRotation() {
-    return new bt.Selector(
-      // First run cooldown rotation if appropriate
-      new bt.Decorator(
-        () => this.shouldUseCooldowns(),
-        this.cooldownRotation(),
-        new bt.Action(() => bt.Status.Success)
+      // SimC 3: arcane_orb,if=charges<2
+      spell.cast(S.arcaneOrb, () => this.getCurrentTarget(), () => this.getCharges() < 2),
+
+      // SimC 4: arcane_pulse,if=(aoe>=pulse_count&!funnel)|(charges<3&mana>50)
+      spell.cast(S.arcanePulse, () => this.getCurrentTarget(), () =>
+        this.getEnemyCount() >= this.pulseAoECount() || (this.getCharges() < 3 && this.getMana() > 50)
       ),
 
-      // Shifting Power outside cooldowns
-      spell.cast("Shifting Power", () => {
-        if (!Settings.UseShiftingPower) return false;
-        
-        const arcaneSurgeUp = me.hasAura(auras.arcaneSurge);
-        const siphonStormUp = me.hasAura(auras.siphonStorm);
-        const touchUp = this.hasTargetTouchOfTheMagi();
-        const orbCharges = spell.getCharges("Arcane Orb");
-        const touchCooldown = spell.getCooldown("Touch of the Magi");
-        const hasIntuition = me.hasAura(auras.intuition);
-        const intuitionRemains = hasIntuition ? me.getAura(auras.intuition).remaining : 0;
-        
-        // Based on SimC logic
-        return (((orbCharges === 0 || touchCooldown.timeleft < 23000) && 
-               !arcaneSurgeUp && !siphonStormUp && !touchUp && 
-               (spell.getCooldown("Evocation").timeleft > 12000) && 
-               touchCooldown.timeleft > (12000 + 6000)) || 
-               (spell.getLastSuccessfulSpell() === "Arcane Barrage" && 
-               (arcaneSurgeUp || touchUp || spell.getCooldown("Evocation").timeleft < 20000))) && 
-               (!hasIntuition || intuitionRemains > 4000);
-      }),
-      
-      // Barrage if Tempo or Intuition is about to expire
-      spell.cast("Arcane Barrage", on => this.getCurrentTarget(), () => {
-        const tempoUp = me.hasAura(auras.arcaneTempo);
-        const tempoRemains = tempoUp ? me.getAura(auras.arcaneTempo).remaining : 0;
-        const intuitionUp = me.hasAura(auras.intuition);
-        const intuitionRemains = intuitionUp ? me.getAura(auras.intuition).remaining : 0;
-        
-        return (tempoUp && tempoRemains < 1500) || (intuitionUp && intuitionRemains < 1500);
-      }),
-      
-      // // Barrage if Harmony stacks are high
-      // spell.cast("Arcane Barrage", on => this.getCurrentTarget(), () => {
-      //   return this.shouldBarrageFromHarmony();
-      // }),
-      
-      // // Barrage before Touch of the Magi
-      // spell.cast("Arcane Barrage", on => this.getCurrentTarget(), () => {
-      //   const touchCd = spell.getCooldown("Touch of the Magi");
-      //   return touchCd.ready || touchCd.timeleft < 1500;
-      // }),
-      
-      // Use Clearcasting for Nether Precision
-      spell.cast("Arcane Missiles", on => this.getCurrentTarget(), () => {
-        const clearcastingUp = me.hasAura(auras.clearcasting);
-        const netherPrecisionUp = me.hasAura(auras.netherPrecision);
-        const touchCd = spell.getCooldown("Touch of the Magi");
-        const surgeCd = spell.getCooldown("Arcane Surge");
-        const hasMagisSpark = this.hasTalent("Magi's Spark");
-        const clearcastingStacks = clearcastingUp ? me.getAura(auras.clearcasting).stacks : 0;
-        
-        return clearcastingUp && !netherPrecisionUp && 
-               ((touchCd.timeleft > 7000 && surgeCd.timeleft > 7000) || 
-               clearcastingStacks > 1 || !hasMagisSpark);
-      }),
-      
-      // Arcane Blast with Magi's Spark or Leydrinker
-      spell.cast("Arcane Blast", on => this.getCurrentTarget(), () => {
-        const hasSpark = this.hasTargetMagisSpark();
-        const hasLeydrinker = me.hasAura(auras.leydrinker);
-        const arcaneCharges = this.getArcaneCharges();
-        
-        return (hasSpark || hasLeydrinker) && arcaneCharges === 4;
-      }),
-      
-      // Arcane Orb when low on charges
-      spell.cast("Arcane Orb", on => this.getCurrentTarget(), () => {
-        const arcaneCharges = this.getArcaneCharges();
-        const hasHighVoltage = this.hasTalent("High Voltage");
-        
-        return (arcaneCharges < 3) || (arcaneCharges < (hasHighVoltage ? 2 : 1));
-      }),
-      
-      // Arcane Barrage with Intuition
-      spell.cast("Arcane Barrage", on => this.getCurrentTarget(), () => {
-        return me.hasAura(auras.intuition);
-      }),
-      
-      // Default to Arcane Blast
-      spell.cast("Arcane Blast", on => this.getCurrentTarget()),
-      
-      // Final fallback to Arcane Barrage
-      spell.cast("Arcane Barrage", on => this.getCurrentTarget())
-    );
-  }
-  
-  // AoE rotation - Implements the spellslinger_aoe action list
-  aoeRotation() {
-    return new bt.Selector(
-      // First run cooldown rotation if appropriate
-      new bt.Decorator(
-        () => this.shouldUseCooldowns(),
-        this.cooldownRotation(),
-        new bt.Action(() => bt.Status.Success)
+      // SimC 5: arcane_explosion,if=aoe>3&charges<2&!impetus
+      spell.cast(S.arcaneExplosion, () => me, () =>
+        this.getEnemyCount() > 3 && this.getCharges() < 2 && !spell.isSpellKnown(T.impetus)
       ),
-      
-      // Supernova if we have max Unerring Proficiency stacks
-      spell.cast("Supernova", () => {
-        const proficiencyAura = me.getAura(auras.unerringProficiency);
-        return proficiencyAura && proficiencyAura.stacks === 30;
+
+      // SimC 6: arcane_blast
+      spell.cast(S.arcaneBlast, () => this.getCurrentTarget()),
+
+      // SimC 7: arcane_barrage,if=(sf_ts&(!prev_surge|prev_touch&salvo=25))|!sf_ts
+      spell.cast(S.arcaneBarrage, () => this.getCurrentTarget(), () => {
+        if (this.sfTouchSurge()) {
+          return spell.getTimeSinceLastCast(S.arcaneSurge) > 1500 ||
+            (spell.getTimeSinceLastCast(S.touchOfTheMagi) < 1500 && this.getSalvo() >= 25);
+        }
+        return true; // !sf_touch_surge — always barrage as fallback
       }),
-      
-      // Shifting Power in AoE
-      spell.cast("Shifting Power", () => {
-        if (!Settings.UseShiftingPower) return false;
-        
-        const arcaneSurgeUp = me.hasAura(auras.arcaneSurge);
-        const siphonStormUp = me.hasAura(auras.siphonStorm);
-        const touchUp = this.hasTargetTouchOfTheMagi();
-        const orbCharges = spell.getCharges("Arcane Orb");
-        const touchCooldown = spell.getCooldown("Touch of the Magi");
-        const evoCooldown = spell.getCooldown("Evocation");
-        const hasShiftingShards = this.hasTalent("Shifting Shards");
-        
-        // Based on SimC logic for AoE
-        return ((arcaneSurgeUp === false && siphonStormUp === false && touchUp === false && 
-                evoCooldown.timeleft > 15000 && touchCooldown.timeleft > 10000 && 
-                orbCharges === 0) || 
-                (spell.getLastSuccessfulSpell() === "Arcane Barrage" && 
-                (arcaneSurgeUp || touchUp || evoCooldown.timeleft < 20000) && 
-                hasShiftingShards));
-      }),
-      
-      // Arcane Orb to build charges in AoE
-      spell.cast("Arcane Orb", on => this.getCurrentTarget(), () => {
-        const arcaneCharges = this.getArcaneCharges();
-        return arcaneCharges < 3;
-      }),
-      
-      // Arcane Blast if we have Magi's Spark or Leydrinker
-      spell.cast("Arcane Blast", on => this.getCurrentTarget(), () => {
-        const hasSpark = this.hasTargetMagisSpark();
-        const hasLeydrinker = me.hasAura(auras.leydrinker);
-        
-        return (hasSpark || hasLeydrinker) && spell.getLastSuccessfulSpell() !== "Arcane Blast";
-      }),
-      
-      // Barrage if we have Aether Attunement and High Voltage
-      spell.cast("Arcane Barrage", on => this.getCurrentTarget(), () => {
-        const hasAether = me.hasAura(auras.aetherAttunement);
-        const hasHighVoltage = this.hasTalent("High Voltage");
-        const hasClearcasting = me.hasAura(auras.clearcasting);
-        const arcaneCharges = this.getArcaneCharges();
-        
-        return hasAether && hasHighVoltage && hasClearcasting && arcaneCharges > 1;
-      }),
-      
-      // Missiles with Clearcasting in AoE
-      spell.cast("Arcane Missiles", on => this.getCurrentTarget(), () => {
-        const hasClearcasting = me.hasAura(auras.clearcasting);
-        const hasHighVoltage = this.hasTalent("High Voltage");
-        const arcaneCharges = this.getArcaneCharges();
-        const hasNetherPrecision = me.hasAura(auras.netherPrecision);
-        
-        return hasClearcasting && ((hasHighVoltage && arcaneCharges < 4) || !hasNetherPrecision);
-      }),
-      
-      // Presence of Mind at low charges
-      spell.cast("Presence of Mind", () => {
-        if (!Settings.UsePresenceOfMind) return false;
-        
-        const arcaneCharges = this.getArcaneCharges();
-        return arcaneCharges === 3 || arcaneCharges === 2;
-      }),
-      
-      // Barrage at max charges
-      spell.cast("Arcane Barrage", on => this.getCurrentTarget(), () => {
-        const arcaneCharges = this.getArcaneCharges();
-        return arcaneCharges === 4;
-      }),
-      
-      // Arcane Explosion for AoE
-      spell.cast("Arcane Explosion", () => {
-        const arcaneCharges = this.getArcaneCharges();
-        const hasReverberate = this.hasTalent("Reverberate");
-        
-        return hasReverberate || arcaneCharges < 2;
-      }),
-      
-      // Default to Arcane Blast if nothing else to do
-      spell.cast("Arcane Blast", on => this.getCurrentTarget()),
-      
-      // Fallback to Arcane Barrage if we can't cast anything else
-      spell.cast("Arcane Barrage", on => this.getCurrentTarget())
     );
   }
 
+  // =============================================
+  // HELPERS
+  // =============================================
+  isSS() { return spell.isSpellKnown(T.splinteringSorcery); }
+  isSF() { return !this.isSS(); }
+  hasOrbM() { return spell.isSpellKnown(T.orbMastery); }
+  sfTouchSurge() { return false; } // sf_touch_surge default=0, user-configurable variable
+  inSurge() { return me.hasAura(A.arcaneSurge); }
+  surgeRemains() { return me.getAura(A.arcaneSurge)?.remaining || 0; }
+  inSoul() { return me.hasAura(A.arcaneSoul); }
+
+  hasCC() {
+    this._refreshCCCache();
+    return this._cachedCC !== null;
+  }
+
+  getCCStacks() {
+    this._refreshCCCache();
+    return this._cachedCC ? this._cachedCC.stacks : 0;
+  }
+
+  _refreshCCCache() {
+    if (this._ccFrame === wow.frameTime) return;
+    this._ccFrame = wow.frameTime;
+    this._cachedCC = me.getAura(A.clearcasting) || null;
+  }
+
+  getCharges() { return me.powerByType(PowerType.ArcaneCharges); }
+
+  getSalvo() {
+    if (this._salvoFrame === wow.frameTime) return this._cachedSalvo;
+    this._salvoFrame = wow.frameTime;
+    const a = me.getAura(A.arcaneSalvo);
+    this._cachedSalvo = a ? a.stacks : 0;
+    return this._cachedSalvo;
+  }
+
+  maxSalvo() { return spell.isSpellKnown(T.spellfireSalvo) ? 25 : 20; }
+  pulseAoECount() { return 3 + (this.hasOrbM() ? 1 : 0); }
+
+  // SimC: variable,name=sunfury_hold_for_cds
+  // Simplified: surge.down & touch_cd > threshold & surge_cd > threshold
+  //   OR (cc|orb_ready & surge.remains > threshold during burst)
+  sunfuryHoldForCds() {
+    if (this.isSS()) return false; // SS doesn't use this
+    const surgeUp = this.inSurge();
+    const enemies = this.getEnemyCount();
+    const opmCC = me.hasAura(A.overpoweredMissiles) && this.hasCC();
+    const orbCC3 = (spell.getChargesFractional(S.arcaneOrb) > 0.95 || this.hasCC()) && enemies >= 3;
+    const reduction = (enemies >= 3 ? 1 : 0) + Math.min(opmCC ? 2 : 0, orbCC3 ? 1 : 0);
+    const gcdThreshold = 4 - reduction;
+
+    if (!surgeUp) {
+      // surge.down: both touch_cd and surge_cd must be > gcd*threshold
+      return this.touchCDRemains() > gcdThreshold * 1500 &&
+        this.surgeCDRemains() > gcdThreshold * 1500;
+    } else {
+      // surge.up: (cc|(salvo=25|orb_ready)&aoe>=3) & surge.remains > gcd*(6-2*min(opm,aoe>=3))
+      const hasCC = this.hasCC();
+      const salvoMax = this.getSalvo() >= 25;
+      const orbReady = spell.getChargesFractional(S.arcaneOrb) > 0.95;
+      if (hasCC || ((salvoMax || orbReady) && enemies >= 3)) {
+        const burstReduction = Math.min(opmCC ? 2 : 0, enemies >= 3 ? 2 : 0);
+        return this.surgeRemains() > (6 - burstReduction) * 1500;
+      }
+      return false;
+    }
+  }
+
+  targetHasTouch() {
+    const t = this.getCurrentTarget();
+    return t ? !!(t.getAuraByMe(A.touchOfTheMagi) || t.getAuraByMe(S.touchOfTheMagi)) : false;
+  }
+
+  surgeCDRemains() { return spell.getCooldown(S.arcaneSurge)?.timeleft || 0; }
+  touchCDRemains() { return spell.getCooldown(S.touchOfTheMagi)?.timeleft || 0; }
+
+  getMana() {
+    if (this._manaFrame === wow.frameTime) return this._cachedMana;
+    this._manaFrame = wow.frameTime;
+    const max = me.maxPowerByType ? me.maxPowerByType(PowerType.Mana) : 1;
+    this._cachedMana = max > 0 ? (me.powerByType(PowerType.Mana) / max) * 100 : 100;
+    return this._cachedMana;
+  }
+
+  getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const target = me.target;
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 40 && me.isFacing(target)) {
+      this._cachedTarget = target;
+      return target;
+    }
+    if (me.inCombat()) {
+      const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (t && common.validTarget(t) && me.isFacing(t)) { this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
+  }
+
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(10) + 1 : 1;
+    return this._cachedEnemyCount;
+  }
+
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
+  }
 }

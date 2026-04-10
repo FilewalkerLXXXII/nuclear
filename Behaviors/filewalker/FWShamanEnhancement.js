@@ -1,1719 +1,824 @@
-
 import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
 import common from '@/Core/Common';
 import spell from '@/Core/Spell';
-import Settings from "@/Core/Settings";
-import CombatTimer from '@/Core/CombatTimer';
-import objMgr from "@/Core/ObjectManager";
+import Settings from '@/Core/Settings';
+import { PowerType } from "@/Enums/PowerType";
 import { me } from '@/Core/ObjectManager';
-import Pet from "@/Core/Pet";
 import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
+import { DispelPriority } from '@/Data/Dispels';
+import { WoWDispelType } from '@/Enums/Auras';
 
-// STATUS : DONE
+/**
+ * Enhancement Shaman Behavior - Midnight 12.0.1
+ * Sources: SimC APL (midnight/shaman_enhancement.simc) + Method + Wowhead + Icy Veins
+ *
+ * Auto-detects: Stormbringer vs Totemic
+ * Dispatches to: stormbringerST / totemicST / aoeRotation
+ *
+ * Key mechanics:
+ *   Thorim's Invocation priming (ti_lb / ti_cl) via last MW spender tracking
+ *   Whirling motes (Fire/Earth/Air) for Totemic
+ *   MW spend: 10 optimal, 8+ during specific conditions, 5+ filler
+ *   Stormstrike charges_fractional >= 1.8 cap prevention
+ *   Elemental Tempo: LB when LL CD would be reduced enough by MW spend
+ *   All melee instant — no movement block needed
+ *
+ * Hotfixes (March 17): All damage +8%, LB/CL +10%, Primordial Storm +10%
+ */
 
-
-const auras = {
-  maelstromweapon: 344179,
-  legacyfrostwitch: 384451,
-  hothand: 215785,
-  crashlightning: 187878,
-  primordialwave: 375982,
-  primordialstorm: 375982,
-  ascendance: 114051,
-  doomwinds: 384352,
-  electrostatic: 378286, // Electrostatic Wager aura
-  arcDischarge: 384359, // Arc Discharge aura
-  stormblast: 319930,
-  hailstorm: 334195,
-  feralspirits: 333957,
-  convergingstorms: 384363,
-  whirlingair: 453409,
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'SimC APL + Method + Wowhead + Icy Veins',
 };
 
-export class EnhancementShamanNewBehavior extends Behavior {
+const S = {
+  stormstrike:        17364,
+  windstrike:         115356,
+  lavaLash:           60103,
+  crashLightning:     187874,
+  lightningBolt:      188196,
+  chainLightning:     188443,
+  doomWinds:          384352,
+  ascendance:         114051,
+  sundering:          197214,
+  surgingTotem:       444995,
+  tempest:            454009,
+  voltaicBlaze:       470057,
+  primordialStorm:    1218090,  // Cast ID (confirmed)
+  flameShock:         188389,
+  iceStrike:          342240,
+  frostShock:         196840,
+  elementalBlast:     117014,
+  totemicRecall:      108285,
+  windShear:          57994,
+  purge:              370,        // Remove 1 Magic buff from enemy
+  cleanseSpirit:      51886,     // Remove Curse from friendly ally
+  skyfury:            462854,
+  astralShift:        108271,
+  healingSurge:       8004,
+  berserking:         26297,
+  // Weapon Imbuements + Shield (precombat, must maintain)
+  windfuryWeapon:     33757,
+  flametongueWeapon:  318038,
+  lightningShield:    192106,
+};
+
+// Talent IDs used in conditions
+const T = {
+  surgingElements:    382042,
+  feralSpirit:        51533,
+  thorimInvocation:   384444,
+  stormUnleashed:     1262713,
+  fireNova:           1260666,
+  splitstream:        445035,
+  elementalTempo:     1250364,
+  surgingTotem:       444995,
+  ashenCatalyst:      390370,
+  lashingFlames:      334046,
+  primordialWave:     375982,
+};
+
+const A = {
+  maelstromWeapon:    344179,
+  doomWinds:          466772,  // Buff aura (cast spell is 384352, 8s +100% WF proc)
+  ascendance:         114051,
+  hotHand:            215785,  // Hot Hand buff aura (SimC: find_spell(215785), 8s. Talent passive=201900)
+  stormsurge:         201846,
+  crashLightning:     1252415,  // Buff aura ID (confirmed)
+  crashLightningAlt:  187878,   // Legacy fallback
+  flameShock:         188389,
+  tempest:            454009,
+  primordialStorm:    1218090,  // Buff aura — TODO: verify if buff ID differs from cast
+  whirlingFire:       453405,
+  whirlingEarth:      453406,
+  whirlingAir:        453409,
+  lashingFlames:      334168,   // Debuff on target
+  stormblast:         319930,
+  convergingStorms:   198300,   // Buff aura ID (not talent 384363)
+  legacyFrostWitch:   384450,
+  totemicMomentum:    1260644,
+  amplificationCore:  445029,
+  skyfury:            462854,
+  windfuryWeapon:     319773,   // WF weapon buff aura (confirmed)
+  flametongueWeapon:  319778,   // FT weapon buff aura (confirmed)
+  lightningShield:    192106,   // LS buff on player
+  ashenCatalyst:      390371,  // Stacking buff (+8% LL dmg/stack, 8 max, 15s)
+};
+
+export class EnhancementShamanBehavior extends Behavior {
   name = 'FW Enhancement Shaman';
   context = BehaviorContext.Any;
   specialization = Specialization.Shaman.Enhancement;
   version = wow.GameVersion.Retail;
 
+  // Per-tick caches
+  _mwFrame = 0;
+  _cachedMW = 0;
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+
+  // State
+  _versionLogged = false;
+  _lastDebug = 0;
+  _combatStart = 0;
+
   static settings = [
     {
-      header: "Rotation",
+      header: 'General',
       options: [
-        { type: "checkbox", uid: "ShamanEnhancerUseFunnel", text: "Use Funnel Rotation", default: false },
-        { type: "checkbox", uid: "ShamanEnhancerUseTotemicHero", text: "Use Totemic Hero Talents", default: true },
-      ]
+        { type: 'checkbox', uid: 'FWEnhAutoCDs', text: 'Auto Cooldowns (ignore burst keybind)', default: false },
+        { type: 'slider', uid: 'FWEnhAoECount', text: 'AoE Target Count', default: 2, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWEnhDebug', text: 'Debug Logging', default: false },
+      ],
     },
     {
-      header: "Cooldowns",
+      header: 'Defensives',
       options: [
-        { type: "checkbox", uid: "ShamanEnhancerUseCooldown", text: "Use Major Cooldowns", default: true },
-        { type: "checkbox", uid: "ShamanEnhancer4Set", text: "Use Tier Set Bonuses", default: true },
-      ]
+        { type: 'checkbox', uid: 'FWEnhAstralShift', text: 'Use Astral Shift', default: true },
+        { type: 'slider', uid: 'FWEnhAstralShiftHP', text: 'Astral Shift HP %', default: 45, min: 10, max: 80 },
+        { type: 'checkbox', uid: 'FWEnhHealingSurge', text: 'Use Healing Surge', default: true },
+        { type: 'slider', uid: 'FWEnhHealingSurgeHP', text: 'Healing Surge HP %', default: 35, min: 10, max: 60 },
+      ],
     },
-    {
-      header: "Defensives",
-      options: [
-        { type: "checkbox", uid: "ShamanEnhancerUseAstralShift", text: "Use Astral Shift", default: true },
-        { type: "checkbox", uid: "ShamanEnhancerSelfheal", text: "Use Self-Heal", default: true },
-        { type: "slider", uid: "ShamanEnhancerSelfhealPercentage", text: "Self-Heal Percentage", min: 1, max: 100, default: 20 },
-      ]
-    }
   ];
 
+  // =============================================
+  // BUILD — Main behavior tree
+  // =============================================
   build() {
-    
-    console.debug('COMBATTIME: '+ CombatTimer.getCombatStartTime());
     return new bt.Selector(
       common.waitForNotMounted(),
       common.waitForNotSitting(),
-      
-      new bt.Action(() => (this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure)),
-      common.waitForTarget(),
-      common.waitForFacing(),
-      common.waitForCastOrChannel(),
-      
-      this.manageSurgingTotem(),
 
-
-      // Precombat actions
+      // OOC: Weapon Imbuements + Lightning Shield + Skyfury
       new bt.Decorator(
-        ret => !spell.isGlobalCooldown(),
+        () => !me.inCombat(),
         new bt.Selector(
-          // Interrupt
-          spell.interrupt('Wind Shear'),
-          
-          // Precombat buffs
-          spell.cast('Lightning Shield', on => me, req => !me.hasAura('Lightning Shield')),
-          spell.cast('Windfury Weapon', on => me, req => !me.hasAura('Windfury Weapon')),
-          spell.cast('Flametongue Weapon', on => me, req => !me.hasAura('Flametongue Weapon')),
-          spell.cast('Skyfury', on => me, req => !me.hasAura('Skyfury')),
-          
-          // Defensive actions
+          // Windfury Weapon — CRITICAL: ~15-20% of total damage
+          spell.cast(S.windfuryWeapon, () => me, () =>
+            !me.hasAura(A.windfuryWeapon) && spell.getTimeSinceLastCast(S.windfuryWeapon) > 5000
+          ),
+          // Flametongue Weapon — significant damage amp
+          spell.cast(S.flametongueWeapon, () => me, () =>
+            !me.hasAura(A.flametongueWeapon) && spell.getTimeSinceLastCast(S.flametongueWeapon) > 5000
+          ),
+          // Lightning Shield
+          spell.cast(S.lightningShield, () => me, () =>
+            !me.hasAura(A.lightningShield) && spell.getTimeSinceLastCast(S.lightningShield) > 5000
+          ),
+          // Skyfury party buff
+          spell.cast(S.skyfury, () => this.getSkyfuryTarget(), () => this.getSkyfuryTarget() !== null),
+          new bt.Action(() => bt.Status.Success)
+        ),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Auto-target
+      new bt.Action(() => {
+        if (!me.target || !common.validTarget(me.target)) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
+        }
+        return bt.Status.Failure;
+      }),
+
+      // Null target bail
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      common.waitForCastOrChannel(),
+
+      // Combat timer + opener tracking
+      new bt.Action(() => {
+        if (me.inCombat() && !this._combatStart) this._combatStart = wow.frameTime;
+        if (!me.inCombat()) this._combatStart = 0;
+        return bt.Status.Failure;
+      }),
+
+      // Version + Debug
+      new bt.Action(() => {
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[Enh] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | Hero: ${this.isTotemic() ? 'Totemic' : 'Stormbringer'} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWEnhDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[Enh] MW:${this.getMW()} DW:${this.inDW()} Asc:${this.inAsc()} HH:${this.hasHotHand()} WF:${this.hasWhirlingFire()} WE:${this.hasWhirlingEarth()} WA:${this.hasWhirlingAir()} TI:${this.getTiPrimed()} SSfrac:${spell.getChargesFractional(S.stormstrike).toFixed(2)} E:${this.getEnemyCount()}`);
+          // Aura IDs verified: HH=215785 (proc, not talent 201900), DW=466772 (buff, not cast 384352)
+        }
+        return bt.Status.Failure;
+      }),
+
+      new bt.Decorator(
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          spell.interrupt(S.windShear),
+
+          // Purge — remove Magic buffs from enemies
+          spell.dispel(S.purge, false, DispelPriority.High, false, WoWDispelType.Magic),
+          spell.dispel(S.purge, false, DispelPriority.Medium, false, WoWDispelType.Magic),
+
+          // Cleanse Spirit — remove Curse from friendly allies
+          spell.dispel(S.cleanseSpirit, true, DispelPriority.High, false, WoWDispelType.Curse),
+          spell.dispel(S.cleanseSpirit, true, DispelPriority.Medium, false, WoWDispelType.Curse),
+
           this.defensives(),
-          
-          // Combat rotation selector based on settings and context
-          new bt.Selector(
-            // Funnel rotation (multiple targets but focusing damage)
-            new bt.Decorator(
-              req => this.shouldUseFunnel() && me.isWithinMeleeRange(this.getCurrentTarget()),
-              this.funnelRotation()
-            ),
-            
-            // AoE Totemic opener
-            new bt.Decorator(
-              req => me.isWithinMeleeRange(this.getCurrentTarget()) && 
-                this.getEnemiesInRange(8) >= 3 && 
-                this.hasTalent('Surging Totem') && 
-                this.hasCooldownsReady() && 
-                this.useCooldowns() &&
-                this.shouldUseTotemicHero() &&
-                this.isOpeningPhase(),
-              this.multiTargetTotemicOpen()
-            ),
-            
-            // AoE Totemic sustained
-            new bt.Decorator(
-              req => me.isWithinMeleeRange(this.getCurrentTarget()) && 
-                this.getEnemiesInRange(8) >= 3 && 
-                this.hasTalent('Surging Totem') &&
-                this.shouldUseTotemicHero(),
-              this.multiTargetTotemic()
-            ),
-            
-            // Single target Totemic opener
-            new bt.Decorator(
-              req => me.isWithinMeleeRange(this.getCurrentTarget()) && 
-                this.getEnemiesInRange(8) < 3 && 
-                this.hasTalent('Surging Totem') && 
-                this.hasCooldownsReady() && 
-                this.useCooldowns() &&
-                this.shouldUseTotemicHero() &&
-                this.isOpeningPhase(),
-              this.singleTargetTotemicOpen()
-            ),
-            
-            // Single target Totemic sustained
-            new bt.Decorator(
-              req => me.isWithinMeleeRange(this.getCurrentTarget()) && 
-                this.hasTalent('Surging Totem') &&
-                this.shouldUseTotemicHero(),
-              this.singleTargetTotemic()
-            ),
-            
-            // AoE standard opener
-            new bt.Decorator(
-              req => this.getEnemiesInRange(8) >= 3 && 
-                !this.hasTalent('Surging Totem') && 
-                this.hasCooldownsReady() && 
-                this.useCooldowns() &&
-                this.isOpeningPhase(),
-              this.multiTargetOpen()
-            ),
-            
-            // AoE standard sustained
-            new bt.Decorator(
-              req => this.getEnemiesInRange(8) >= 3 && 
-                me.isWithinMeleeRange(this.getCurrentTarget()) && 
-                !this.hasTalent('Surging Totem'),
-              this.multiTarget()
-            ),
-            
-            // Single target standard opener
-            new bt.Decorator(
-              req => this.getEnemiesInRange(8) < 3 && 
-                !this.hasTalent('Surging Totem') && 
-                this.hasCooldownsReady() && 
-                this.useCooldowns() &&
-                this.isOpeningPhase(),
-              this.singleTargetOpen()
-            ),
-            
-            // Single target standard sustained
-            new bt.Decorator(
-              req => me.isWithinMeleeRange(this.getCurrentTarget()),
-              this.singleTarget()
-            ),
-            
-            // Auto attack fallback
-            spell.cast('Auto Attack', this.getCurrentTarget, req => true)
-          )
+
+          // Trinkets: fire BEFORE DW — Algethar Puzzle Box has 2s cast, must pre-cast
+          // Trigger when DW is about to come off CD (within 3s) or already active
+          common.useTrinkets(() => this.getCurrentTarget(), () => {
+            if (!this.useCDs()) return false;
+            if (this.targetTTD() < 20000) return true;
+            if (this.inDW()) return true;
+            const dwCD = spell.getCooldown(S.doomWinds)?.timeleft || 99999;
+            return dwCD <= 3000;
+          }),
+
+          // Berserking: during DW window for burst alignment
+          spell.cast(S.berserking, () => me, () =>
+            this.useCDs() && this.inDW()
+          ),
+
+          // Dispatch: AoE → Totemic ST → Stormbringer ST
+          new bt.Decorator(
+            () => this.getEnemyCount() >= Settings.FWEnhAoECount,
+            this.aoeRotation(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.isTotemic(),
+            this.totemicST(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => !this.isTotemic(),
+            this.stormbringerST(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
         )
       )
     );
   }
 
-  // Utility methods
-  
-  shouldUseTotemicHero() {
-    return Settings.ShamanEnhancerUseTotemicHero === true;
-  }
-  
-  useCooldowns() {
-    return Settings.ShamanEnhancerUseCooldown === true;
-  }
-  
-  hasCooldownsReady() {
-    return (
-      spell.getCooldown('Feral Spirit').ready ||
-      spell.getCooldown('Doom Winds').ready ||
-      spell.getCooldown('Ascendance').ready
-      
+  // =============================================
+  // STORMBRINGER — Single Target
+  // SimC: actions.single_sb (24 lines)
+  // =============================================
+  stormbringerST() {
+    return new bt.Selector(
+      // 1. Primordial Storm: MW>=9 | (PS.remains<=4 & MW>=5)
+      spell.cast(S.primordialStorm, () => this.getCurrentTarget(), () => {
+        const mw = this.getMW();
+        const ps = me.getAura(A.primordialStorm);
+        return mw >= 9 || (ps && ps.remaining <= 4000 && mw >= 5);
+      }),
+
+      // 2. Voltaic Blaze: no Flame Shock & opener (time<5)
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget(), () =>
+        !this.targetHasFS() && this.isOpener()
+      ),
+
+      // 3. Flame Shock: !ticking
+      spell.cast(S.flameShock, () => this.getCurrentTarget(), () => {
+        if (spell.getTimeSinceLastCast(S.flameShock) < 3000) return false;
+        return !this.targetHasFS();
+      }),
+
+      // 4. Lava Lash: no Lashing Flames & opener
+      spell.cast(S.lavaLash, () => this.getCurrentTarget(), () => !this.targetHasLF() && this.isOpener()),
+
+      // 6. Sundering: Surging Elements | Feral Spirit talented
+      spell.cast(S.sundering, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.surgingElements) || spell.isSpellKnown(T.feralSpirit)
+      ),
+
+      // 7. Doom Winds (on CD, self-buff)
+      // Doom Winds (direct cast — spell.cast() wrapper blocks it)
+      new bt.Action(() => {
+        if (this.targetTTD() <= 5000) return bt.Status.Failure;
+        const dw = spell.getSpell(S.doomWinds);
+        if (!dw || !dw.cooldown.ready || !dw.isUsable) return bt.Status.Failure;
+        const t = this.getCurrentTarget();
+        if (t && dw.cast(t)) return bt.Status.Success;
+        if (dw.cast(me)) return bt.Status.Success;
+        return bt.Status.Failure;
+      }),
+
+      // 8. Crash Lightning: !buff | Storm Unleashed
+      spell.cast(S.crashLightning, () => this.getCurrentTarget(), () =>
+        !this.hasCLBuff() || spell.isSpellKnown(T.stormUnleashed)
+      ),
+
+      // 9. Voltaic Blaze: DW & MW>=threshold & MW!=10 & Thorim's
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget(), () => {
+        if (!this.inDW() || !this.hasThorims()) return false;
+        const mw = this.getMW();
+        const threshold = 10 - (1 + (spell.isSpellKnown(T.fireNova) ? 2 : 0));
+        return mw >= threshold && mw !== 10;
+      }),
+
+      // 10. Windstrike: MW>0 & Thorim's
+      spell.cast(S.windstrike, () => this.getCurrentTarget(), () =>
+        this.getMW() > 0 && this.hasThorims()
+      ),
+
+      // 11. Ascendance (on CD, self-buff)
+      // SimC: ascendance — UNCONDITIONAL (not burst-gated)
+      spell.cast(S.ascendance, () => me, () => this.targetTTD() > 15000),
+
+      // 12. Stormstrike: DW & Thorim's
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        this.inDW() && this.hasThorims()
+      ),
+
+      // 13. Crash Lightning: DW & Thorim's
+      spell.cast(S.crashLightning, () => this.getCurrentTarget(), () =>
+        this.inDW() && this.hasThorims()
+      ),
+
+      // 14. Tempest: MW=10
+      spell.cast(S.tempest, () => this.getCurrentTarget(), () => this.getMW() >= 10),
+
+      // 15. Lightning Bolt: MW=10
+      spell.cast(S.lightningBolt, () => this.getCurrentTarget(), () => this.getMW() >= 10),
+
+      // 16. Stormstrike: charges_fractional >= 1.8
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        spell.getChargesFractional(S.stormstrike) >= 1.8
+      ),
+
+      // 17. Lava Lash (direct cast — Hot Hand makes usable while CD shows remaining)
+      spell.cast(S.lavaLash, () => this.getCurrentTarget()),
+
+      // 18. Stormstrike
+      spell.cast(S.stormstrike, () => this.getCurrentTarget()),
+
+      // 19. Voltaic Blaze
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget()),
+
+      // 20. Sundering (filler)
+      spell.cast(S.sundering, () => this.getCurrentTarget()),
+
+      // 21. Lightning Bolt: MW>=8
+      spell.cast(S.lightningBolt, () => this.getCurrentTarget(), () => this.getMW() >= 8),
+
+      // 22. Crash Lightning
+      spell.cast(S.crashLightning, () => this.getCurrentTarget()),
+
+      // 23. Lightning Bolt: MW>=5
+      spell.cast(S.lightningBolt, () => this.getCurrentTarget(), () => this.getMW() >= 5),
+
+      // 24. Flame Shock (absolute filler)
+      spell.cast(S.flameShock, () => this.getCurrentTarget())
     );
   }
 
-  shouldUseFunnel() {
-    return Settings.ShamanEnhancerUseFunnel && 
-           this.getEnemiesInRange(10) > 1 && 
-           me.hasAura('Primordial Wave');
+  // =============================================
+  // TOTEMIC — Single Target
+  // SimC: actions.single_totemic (22 lines)
+  // =============================================
+  totemicST() {
+    return new bt.Selector(
+      // === Totemic ST (Method priority + SimC Thorim's DW burst) ===
+      // Method: method.gg/guides/enhancement-shaman/playstyle-and-rotation
+      // SimC: Thorim's Invocation DW interactions added back for burst damage
+
+      // 1. Voltaic Blaze: apply Flame Shock if missing
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget(), () => !this.targetHasFS()),
+
+      // Surging Totem: maintain (Method opener #2, must keep active)
+      spell.cast(S.surgingTotem, () => me, () => !me.hasAura(1221347)),
+
+      // 2. Lava Lash in Hot Hand OR Whirling Fire — HIGHEST melee priority (Method #2)
+      spell.cast(S.lavaLash, () => this.getCurrentTarget(), () =>
+        this.hasHotHand() || this.hasWhirlingFire()
+      ),
+
+      // Sundering: Whirling Earth proc or Surging Elements
+      spell.cast(S.sundering, () => this.getCurrentTarget(), () =>
+        this.hasWhirlingEarth() || spell.isSpellKnown(T.surgingElements)
+      ),
+
+      // Doom Winds: on CD (Method opener #5, direct cast bypass)
+      new bt.Action(() => {
+        if (this.targetTTD() <= 5000) return bt.Status.Failure;
+        const dw = spell.getSpell(S.doomWinds);
+        if (!dw || !dw.cooldown.ready || !dw.isUsable) return bt.Status.Failure;
+        const t = this.getCurrentTarget();
+        if (t && dw.cast(t)) return bt.Status.Success;
+        if (dw.cast(me)) return bt.Status.Success;
+        return bt.Status.Failure;
+      }),
+
+      // === DW BURST WINDOW — Thorim's Invocation synergies (SimC #12-13) ===
+      // During DW: CL triggers TI chain lightning, SS triggers TI nature damage
+      // These are HIGH priority during the 8s DW window
+      spell.cast(S.crashLightning, () => this.getCurrentTarget(), () =>
+        this.inDW() && this.hasThorims()
+      ),
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        this.inDW() && this.hasThorims()
+      ),
+      // SS without Thorim's during DW (Method #5)
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () => this.inDW()),
+
+      // === OUTSIDE DW — normal priority ===
+
+      // 3. Crash Lightning — maintain buff + Storm Unleashed (Method #3)
+      spell.cast(S.crashLightning, () => this.getCurrentTarget(), () =>
+        !this.hasCLBuff() || spell.isSpellKnown(T.stormUnleashed)
+      ),
+
+      // 4. Primordial Storm at MW>=10 or expiring (Method #4)
+      spell.cast(S.primordialStorm, () => this.getCurrentTarget(), () => {
+        const mw = this.getMW();
+        const ps = me.getAura(A.primordialStorm);
+        return mw >= 10 || (ps && ps.remaining < 3500 && mw >= 5);
+      }),
+
+      // Windstrike during Ascendance (if talented)
+      spell.cast(S.windstrike, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && this.inAsc()
+      ),
+
+      // Ascendance (if talented)
+      spell.cast(S.ascendance, () => me, () => this.isTiLB() && this.targetTTD() > 15000),
+
+      // 5. Stormstrike: charges capping prevention
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        spell.getChargesFractional(S.stormstrike) >= 1.8
+      ),
+
+      // 6. Lava Lash filler (Method #7)
+      spell.cast(S.lavaLash, () => this.getCurrentTarget()),
+
+      // 7. Stormstrike filler (Method #8)
+      spell.cast(S.stormstrike, () => this.getCurrentTarget()),
+
+      // Sundering filler: Surging Totem CD > 25s
+      spell.cast(S.sundering, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.surgingTotem)?.timeleft || 0) > 25000
+      ),
+
+      // 8. Voltaic Blaze filler (Method #9)
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget()),
+
+      // 9. Crash Lightning filler (extra cleave + CL buff refresh)
+      spell.cast(S.crashLightning, () => this.getCurrentTarget()),
+
+      // 10. Lightning Bolt — last resort MW dump (Method #6/#10)
+      spell.cast(S.lightningBolt, () => this.getCurrentTarget(), () => this.getMW() >= 10),
+      spell.cast(S.lightningBolt, () => this.getCurrentTarget(), () => this.getMW() >= 5),
+
+      // Absolute filler
+      spell.cast(S.flameShock, () => this.getCurrentTarget()),
+    );
   }
-  
-  isOpeningPhase() {
-    return CombatTimer.getCombatStartTime() < 20000;
+
+  // =============================================
+  // AOE — Both hero trees (shared with talent checks)
+  // SimC: actions.aoe (34 lines)
+  // =============================================
+  aoeRotation() {
+    return new bt.Selector(
+      // 1. Voltaic Blaze: Totemic & no Flame Shock
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget(), () =>
+        this.isTotemic() && !this.targetHasFS()
+      ),
+
+      // 2. Flame Shock: !ticking (Totemic applies FS passively — skip entirely)
+      new bt.Decorator(
+        () => !this.isTotemic(),
+        spell.cast(S.flameShock, () => this.getCurrentTarget(), () => {
+          if (spell.getTimeSinceLastCast(S.flameShock) < 3000) return false;
+          return !this.targetHasFS();
+        }),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+
+      // 3. Surging Totem (SimC: unconditional for Totemic — only when totem not active)
+      spell.cast(S.surgingTotem, () => me, () => this.isTotemic() && !me.hasAura(1221347)),
+
+      // 4. Ascendance: ti_chain_lightning (SimC: NOT burst-gated, only TI priming)
+      spell.cast(S.ascendance, () => me, () => this.isTiCL() && this.targetTTD() > 15000),
+
+      // 6. Sundering: Surging Elements | Whirling Earth
+      spell.cast(S.sundering, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.surgingElements) || this.hasWhirlingEarth()
+      ),
+
+      // 7. Lava Lash: Whirling Fire
+      spell.cast(S.lavaLash, () => this.getCurrentTarget(), () => this.hasWhirlingFire()),
+
+      // 8. Doom Winds (direct cast — spell.cast() wrapper blocks it)
+      new bt.Action(() => {
+        if (this.targetTTD() <= 5000) return bt.Status.Failure;
+        const dw = spell.getSpell(S.doomWinds);
+        if (!dw || !dw.cooldown.ready || !dw.isUsable) return bt.Status.Failure;
+        const t = this.getCurrentTarget();
+        if (t && dw.cast(t)) return bt.Status.Success;
+        if (dw.cast(me)) return bt.Status.Success;
+        return bt.Status.Failure;
+      }),
+
+      // 9. Crash Lightning: Thorim's & Whirling Air & (DW | Asc)
+      spell.cast(S.crashLightning, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && this.hasWhirlingAir() && (this.inDW() || this.inAsc())
+      ),
+
+      // 10. Windstrike: Thorim's & Whirling Air
+      spell.cast(S.windstrike, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && this.hasWhirlingAir()
+      ),
+
+      // 11. Stormstrike: Thorim's & DW & Whirling Air
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && this.inDW() && this.hasWhirlingAir()
+      ),
+
+      // 12. Lava Lash: Splitstream & Hot Hand
+      spell.cast(S.lavaLash, () => this.getCurrentTarget(), () => spell.isSpellKnown(T.splitstream) && this.hasHotHand()),
+
+      // 13. Tempest: MW>=10 & (!Asc | !DW) — Stormbringer only
+      spell.cast(S.tempest, () => this.getCurrentTarget(), () =>
+        !this.isTotemic() && this.getMW() >= 10 && (!this.inAsc() || !this.inDW())
+      ),
+
+      // 14. Primordial Storm: MW>=10
+      spell.cast(S.primordialStorm, () => this.getCurrentTarget(), () => this.getMW() >= 10),
+
+      // 15. Crash Lightning: Thorim's & (DW | Asc) & Splitstream & Hot Hand
+      spell.cast(S.crashLightning, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && (this.inDW() || this.inAsc()) &&
+        spell.isSpellKnown(T.splitstream) && this.hasHotHand()
+      ),
+
+      // 16. Windstrike: Thorim's & Splitstream & Hot Hand
+      spell.cast(S.windstrike, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && spell.isSpellKnown(T.splitstream) && this.hasHotHand()
+      ),
+
+      // 17. Stormstrike: Thorim's & DW & Splitstream & Hot Hand
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && this.inDW() && spell.isSpellKnown(T.splitstream) && this.hasHotHand()
+      ),
+
+      // 18. Chain Lightning: MW>=(9+totemic) & Splitstream & Hot Hand
+      spell.cast(S.chainLightning, () => this.getCurrentTarget(), () => {
+        const threshold = this.isTotemic() ? 10 : 9;
+        return this.getMW() >= threshold && spell.isSpellKnown(T.splitstream) && this.hasHotHand();
+      }),
+
+      // 19. Voltaic Blaze: Fire Nova talented
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.fireNova)
+      ),
+
+      // 20. Crash Lightning (high prio filler)
+      spell.cast(S.crashLightning, () => this.getCurrentTarget()),
+
+      // 21. Windstrike: Thorim's
+      spell.cast(S.windstrike, () => this.getCurrentTarget(), () => this.hasThorims()),
+
+      // 22. Stormstrike: Thorim's & DW
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () =>
+        this.hasThorims() && this.inDW()
+      ),
+
+      // 23. Chain Lightning: MW>=(9+totemic)
+      spell.cast(S.chainLightning, () => this.getCurrentTarget(), () => {
+        const threshold = this.isTotemic() ? 10 : 9;
+        return this.getMW() >= threshold;
+      }),
+
+      // 24. Sundering: Feral Spirit talented
+      spell.cast(S.sundering, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.feralSpirit)
+      ),
+
+      // 25. Voltaic Blaze (filler)
+      spell.cast(S.voltaicBlaze, () => this.getCurrentTarget()),
+
+      // 26. Lava Lash: Searing Totem active (Totemic, totem recently cast)
+      spell.cast(S.lavaLash, () => this.getCurrentTarget(), () => this.isTotemic() && spell.getTimeSinceLastCast(S.surgingTotem) < 25000),
+
+      // 27. Windstrike (filler)
+      spell.cast(S.windstrike, () => this.getCurrentTarget()),
+
+      // 28. Stormstrike: charges_fractional>=1.8 | Converging Storms max
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () => {
+        if (spell.getChargesFractional(S.stormstrike) >= 1.8) return true;
+        const cs = me.getAura(A.convergingStorms);
+        return !!(cs && cs.stacks >= 6);
+      }),
+
+      // 29. Sundering: Surging Totem CD > 25
+      spell.cast(S.sundering, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.surgingTotem)?.timeleft || 0) > 25000
+      ),
+
+      // 30. Stormstrike: !Totemic
+      spell.cast(S.stormstrike, () => this.getCurrentTarget(), () => !this.isTotemic()),
+
+      // 31. Lava Lash (filler — direct cast)
+      spell.cast(S.lavaLash, () => this.getCurrentTarget()),
+
+      // 32. Stormstrike (filler)
+      spell.cast(S.stormstrike, () => this.getCurrentTarget()),
+
+      // 33. Chain Lightning: MW>=5
+      spell.cast(S.chainLightning, () => this.getCurrentTarget(), () => this.getMW() >= 5),
+
+      // 34. Flame Shock (absolute filler — Stormbringer only)
+      new bt.Decorator(
+        () => !this.isTotemic(),
+        spell.cast(S.flameShock, () => this.getCurrentTarget()),
+        new bt.Action(() => bt.Status.Failure)
+      )
+    );
   }
-  
-  // Defensive rotation
+
+  // =============================================
+  // DEFENSIVES
+  // =============================================
   defensives() {
     return new bt.Selector(
-      spell.cast('Astral Shift', on => me, req => 
-        Settings.ShamanEnhancerUseAstralShift && me.pctHealth <= 50
+      spell.cast(S.astralShift, () => me, () =>
+        Settings.FWEnhAstralShift && me.pctHealth <= Settings.FWEnhAstralShiftHP
       ),
-      spell.cast('Healing Surge', on => me, req =>
-        Settings.ShamanEnhancerSelfheal && 
-        me.pctHealth <= Settings.ShamanEnhancerSelfhealPercentage && 
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      )
+      spell.cast(S.healingSurge, () => me, () => {
+        if (!Settings.FWEnhHealingSurge) return false;
+        if (spell.getTimeSinceLastCast(S.healingSurge) < 4000) return false;
+        if (this.getMW() < 5) return false;
+        const threshold = this.inBurst()
+          ? Math.min(Settings.FWEnhHealingSurgeHP + 15, 60)
+          : Settings.FWEnhHealingSurgeHP;
+        return me.pctHealth <= threshold;
+      }),
+      new bt.Action(() => bt.Status.Failure)
     );
   }
 
-  // Funnel rotation - focused on Lightning Bolt/Chain Lightning with Maelstrom
-  funnelRotation() {
-    return new bt.Selector(
-      // Use trinkets and racials
-      this.useRacials(),
-      this.useTrinkets(),
-      
-      // Main Funnel rotation from APL
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        this.hasTalent('Elemental Spirits')
-      ),
-      
-      spell.cast(444995, this.getCurrentTarget, req =>
-        this.hasTalent('Surging Totem') && spell.getSpell('Surging Totem').overrideId == 444995
-      ),
-      
-      spell.cast('Ascendance', this.getCurrentTarget),
-      
-      spell.cast('Windstrike', this.getCurrentTarget, req =>
-        (this.hasTalent('Thorims Invocation') && me.getAuraStacks(auras.maelstromweapon) > 0) ||
-        me.getAuraStacks('Converging Storms') >= 6
-      ),
-      
-      spell.cast('Tempest', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) === 10 ||
-        (me.getAuraStacks(auras.maelstromweapon) >= 5 && me.getAuraStacks('Awakening Storms') === 2)
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6) &&
-        me.hasAura('Primordial Wave') &&
-        me.getAuraStacks(auras.maelstromweapon) === 10 &&
-        (!me.hasAura('Splintered Elements') || this.fightRemains() <= 12)
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5 &&
-        this.hasTalent('Elemental Spirits') &&
-        this.feralSpiritActive() >= 4
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        this.hasTalent('Supercharge') &&
-        me.getAuraStacks(auras.maelstromweapon) === 10 &&
-        this.expectedLbFunnel() > this.expectedClFunnel()
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        (this.hasTalent('Supercharge') && me.getAuraStacks(auras.maelstromweapon) === 10) ||
-        (me.hasAura('Arc Discharge') && me.getAuraStacks(auras.maelstromweapon) >= 5)
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        (this.hasTalent('Molten Assault') && this.getCurrentTarget().hasAura('Flame Shock') && 
-         this.activeDotCount('Flame Shock') < this.activeEnemiesCount() && this.activeDotCount('Flame Shock') < 6) ||
-        (this.hasTalent('Ashen Catalyst') && me.getAuraStacks('Ashen Catalyst') === 10)
-      ),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        !me.hasAura('Primordial Wave')
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        (!this.hasTalent('Elemental Spirits') || 
-         (this.hasTalent('Elemental Spirits') && 
-          (spell.getCharges('Elemental Blast') === spell.getMaxCharges('Elemental Blast') || me.hasAura(auras.feralspirits)))) &&
-        me.getAuraStacks(auras.maelstromweapon) === 10
-      ),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget),
-      spell.cast('Doom Winds', this.getCurrentTarget),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.getAuraStacks('Converging Storms') === 6
-      ),
-      
-      spell.cast('Lava Burst', this.getCurrentTarget, req =>
-        (me.getAuraStacks('Molten Weapon') > me.getAuraStacks('Crackling Surge')) &&
-        me.getAuraStacks(auras.maelstromweapon) === 10
-      ),
-      
-      // Continue with standard abilities
-      this.standardAbilities()
-    );
+  // =============================================
+  // HERO TALENT DETECTION
+  // =============================================
+  isTotemic() {
+    return me.hasAura(A.totemicMomentum) || me.hasAura(A.amplificationCore) ||
+      spell.isSpellKnown(S.surgingTotem);
+  }
+  isStormbringer() { return !this.isTotemic(); }
+
+  // =============================================
+  // BURST STATE
+  // =============================================
+  inBurst() { return this.inDW() || this.inAsc() || this.isSurgingTotemActive(); }
+  inDW() { return me.hasAura(A.doomWinds); }
+  inAsc() { return me.hasAura(A.ascendance); }
+  isSurgingTotemActive() {
+    return this.isTotemic() && spell.getTimeSinceLastCast(S.surgingTotem) < 25000;
   }
 
-  // Multi target action list for Totemic opener
-  multiTargetTotemicOpen() {
-    return new bt.Selector(
-      this.useRacials(),
-      this.useTrinkets(),
-      
-      spell.cast(444995, this.getCurrentTarget, req => spell.getSpell('Surging Totem').overrideId == 444995),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.hasTalent('Swirling Maelstrom') &&
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 8
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        (me.getAuraStacks('Electrostatic Wager') > 9 && me.hasAura('Doom Winds')) ||
-        !me.hasAura('Crash Lightning')
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 8
-      ),
-      
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        me.hasAura('Hot Hand') ||
-        (me.hasAura(auras.legacyfrostwitch) && me.hasAura('Whirling Fire'))
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10
-      ),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Hailstorm') &&
-        me.hasAura('Hailstorm') &&
-        this.searingTotemActive()
-      ),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.searingTotemActive() &&
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-      
-      spell.cast('Ice Strike', this.getCurrentTarget),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) < 10 &&
-        !me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget)
-    );
+  // =============================================
+  // THORIM'S INVOCATION PRIMING (ti_lb / ti_cl)
+  // Tracks last MW spender to determine what Thorim's auto-fires
+  // =============================================
+  hasThorims() { return spell.isSpellKnown(T.thorimInvocation); }
+
+  getTiPrimed() {
+    const lb = spell.getTimeSinceLastCast(S.lightningBolt);
+    const cl = spell.getTimeSinceLastCast(S.chainLightning);
+    const tp = this.isTotemic() ? 60000 : spell.getTimeSinceLastCast(S.tempest);
+    const eb = spell.getTimeSinceLastCast(S.elementalBlast);
+    let minTime = 60000;
+    let result = 'none';
+    if (lb < minTime) { minTime = lb; result = 'lb'; }
+    if (tp < minTime) { minTime = tp; result = 'lb'; } // Tempest = LB for TI
+    if (eb < minTime) { minTime = eb; result = 'lb'; } // EB = LB for TI
+    if (cl < minTime) { minTime = cl; result = 'cl'; }
+    if (minTime >= 60000) return 'none';
+    return result;
   }
 
-  // Multi target action list for Totemic sustained
-  multiTargetTotemic() {
-    return new bt.Selector(
-      // If in opening phase or certain cooldowns are available, use the opener
-      new bt.Decorator(
-        req => (spell.getCooldown('Doom Winds').ready || 
-                // spell.getCooldown('Sundering').ready || 
-                !me.hasAura('Hot Hand')) &&
-               this.isOpeningPhase(),
-        this.multiTargetTotemicOpen()
-      ),
-      this.useRacials(),
-      this.useTrinkets(),
-      spell.cast(444995, this.getCurrentTarget, req => spell.getSpell('Surging Totem').overrideId == 444995),
-      
-      spell.cast('Ascendance', this.getCurrentTarget, req =>
-        this.canTiChainLightning()
-      ),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.hasTalent('Ashen Catalyst') || this.hasTalent('Primordial Wave'))
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        this.hasTalent('Crashing Storms') &&
-        this.getEnemiesInRange(8) >= (15 - 5 * (this.hasTalent('Unruly Winds') ? 1 : 0))
-      ),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        ((spell.getCooldown('Doom Winds').timeleft > 30000 || spell.getCooldown('Doom Winds').timeleft < 7000) &&
-         (spell.getCooldown('Primordial Wave').timeleft < 2000 || me.hasAura('Primordial Storm') || !this.hasTalent('Primordial Storm')))
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        !this.hasTalent('Elemental Spirits')
-      ),
-      
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        spell.getCooldown('Doom Winds').timeleft > 3000
-      ),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        (!this.hasTalent('Elemental Spirits') || 
-         (this.hasTalent('Elemental Spirits') && 
-          (spell.getSpell('Elemental Blast').charges.charges === spell.getSpell('Elemental Blast').charges.maxcharges || 
-           this.feralSpiritActive() >= 2))) &&
-        me.getAuraStacks(auras.maelstromweapon) === 10 &&
-        (!this.hasTalent('Crashing Storms') || this.getEnemiesInRange(8) <= 3)
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        me.hasAura(auras.hothand)
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks('Electrostatic Wager') > 8
-      ),
-      
-      // Rest of the abilities for sustained AoE
-      spell.cast('Sundering', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') || 
-        (this.hasTalent('Earthsurge') && 
-         (me.hasAura(auras.legacyfrostwitch) || !this.hasTalent(auras.legacyfrostwitch)) &&
-         this.surgingTotemActive() > 0)
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        me.getAuraStacks('Electrostatic Wager') > 4 &&
-        !me.hasAura('CL Crash Lightning') &&
-        me.hasAura('Doom Winds')
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        !me.hasAura('Primordial Storm')
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') ||
-        !me.hasAura('Crash Lightning') ||
-        (this.hasTalent('Alpha Wolf') && this.feralSpiritActive() > 0 && this.alphaWolfMinRemains() === 0)
-      ),
-      
-      spell.cast('Voltaic Blaze', this.getCurrentTarget),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6) &&
-        this.searingTotemActive()
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        this.hasTalent('Molten Assault') && this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Hailstorm') && me.hasAura('Hailstorm') && this.searingTotemActive()
-      ),
-      
-      // Standard abilities for AoE situation
-      this.standardAoeAbilities()
-    );
+  isTiLB() { return this.getTiPrimed() === 'lb'; }
+  isTiCL() { return this.getTiPrimed() === 'cl'; }
+
+  // =============================================
+  // OPENER CHECK (SimC: time<5)
+  // =============================================
+  isOpener() {
+    return this._combatStart > 0 && (wow.frameTime - this._combatStart) < 5000;
   }
 
-  // Single target action list for Totemic opener
-  singleTargetTotemicOpen() {
-    return new bt.Selector(
-      this.useRacials(),
-      this.useTrinkets(),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        !me.hasAura('Surging Totem') &&
-        this.hasTalent('Lashing Flames') &&
-        !this.getCurrentTarget().hasAura('Lashing Flames')
-      ),
-      
-      spell.cast(444995, this.getCurrentTarget, req => spell.getSpell('Surging Totem').overrideId == 444995),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget, req => me.hasAura(auras.legacyfrostwitch)),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        me.hasAura(auras.hothand)
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') &&
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) === 10
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget)
-    );
+  // =============================================
+  // PROC / BUFF CHECKS
+  // =============================================
+  hasHotHand() { return me.hasAura(A.hotHand); }
+  hasWhirlingFire() { return me.hasAura(A.whirlingFire); }
+  hasWhirlingEarth() { return me.hasAura(A.whirlingEarth); }
+  hasWhirlingAir() { return me.hasAura(A.whirlingAir); }
+
+  hasCLBuff() {
+    return me.hasAura(A.crashLightning) || me.hasAura(A.crashLightningAlt);
   }
 
-  // Single target action list for Totemic sustained
-  // Multi target standard opener
-  multiTargetOpen() {
-    return new bt.Selector(
-      this.useRacials(),
-      this.useTrinkets(),
-  
-      // Flame Shock if not ticking
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-  
-      // Crash Lightning with conditions
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        (me.getAuraStacks('Electrostatic Wager') > 9 && me.hasAura('Doom Winds')) || 
-        !me.hasAura('Crash Lightning')
-      ),
-  
-      // Voltaic Blaze for flame shock spreading
-      spell.cast('Voltaic Blaze', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') < 3
-      ),
-  
-      // Lava Lash for flame shock spreading
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        this.hasTalent('Molten Assault') &&
-        (this.hasTalent('Primordial Wave') || this.hasTalent('Fire Nova')) &&
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') < this.activeEnemiesCount()) &&
-        this.activeDotCount('Flame Shock') < 3
-      ),
-  
-      // Primordial Wave for buff
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 4 &&
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-  
-      // Major cooldowns
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9
-      ),
-      
-      spell.cast('Ascendance', this.getCurrentTarget, req =>
-        (this.getCurrentTarget().hasAura('Flame Shock') || !this.hasTalent('Molten Assault')) &&
-        this.canTiChainLightning() &&
-        (me.hasAura(auras.legacyfrostwitch) || !this.hasTalent('Legacy of the Frost Witch')) &&
-        !me.hasAura('Doom Winds')
-      ),
-      
-      // Maelstrom spenders
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9 &&
-        (me.hasAura(auras.legacyfrostwitch) || !this.hasTalent('Legacy of the Frost Witch'))
-      ),
-      
-      spell.cast('Tempest', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9 &&
-        !me.getAuraStacks('Arc Discharge') > 0
-      ),
-      
-      // Core rotational abilities
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks('Electrostatic Wager') > 4
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget, req =>
-        this.hasTalent('Thorims Invocation') && this.canTiChainLightning()
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5 &&
-        (!me.hasAura('Primordial Storm') || !me.hasAura('Legacy of the Frost Witch')) &&
-        me.hasAura('Doom Winds')
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9 &&
-        (!me.hasAura('Primordial Storm') || !me.hasAura('Legacy of the Frost Witch'))
-      ),
-      
-      // Final abilities
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.getAuraStacks('Converging Storms') === 6 && me.getAuraStacks('Stormblast') > 1
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget),
-      spell.cast('Voltaic Blaze', this.getCurrentTarget),
-      spell.cast('Stormstrike', this.getCurrentTarget)
-    );
+  // =============================================
+  // FLAME SHOCK / LASHING FLAMES on target
+  // =============================================
+  targetHasFS() {
+    const t = this.getCurrentTarget();
+    if (!t) return false;
+    return !!(t.getAuraByMe(A.flameShock) ||
+      t.auras.find(a => a.spellId === A.flameShock && a.casterGuid?.equals(me.guid)));
   }
 
-  // Multi target standard sustained
-  multiTarget() {
-    return new bt.Selector(
-      // If in opening phase, use the opener
-      new bt.Decorator(
-        req => this.isOpeningPhase(),
-        this.multiTargetOpen()
-      ),
-      
-      // Major cooldowns
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        this.hasTalent('Elemental Spirits') || this.hasTalent('Alpha Wolf')
-      ),
-      
-      // Core rotational abilities
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Molten Assault') && !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Ascendance', this.getCurrentTarget, req =>
-        (this.getCurrentTarget().hasAura('Flame Shock') || !this.hasTalent('Molten Assault')) && 
-        this.canTiChainLightning()
-      ),
-      
-      spell.cast('Tempest', this.getCurrentTarget, req =>
-        !me.getAuraStacks('Arc Discharge') >= 1 && 
-        ((me.getAuraStacks(auras.maelstromweapon) === 10 && !this.hasTalent('Raging Maelstrom')) || 
-         (me.getAuraStacks(auras.maelstromweapon) >= 9)) ||
-        (me.getAuraStacks(auras.maelstromweapon) >= 5)
-      ),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        spell.getCooldown('Doom Winds').timeleft > 30000 || spell.getCooldown('Doom Winds').timeleft < 7000
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock') && 
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-      
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 && 
-        (me.hasAura('Doom Winds') || spell.getCooldown('Doom Winds').timeleft > 15000 || 
-         this.getAuraRemainingTime('Primordial Storm') < 3000)
-      ),
-      
-      // AOE rotational abilities
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        (this.hasTalent('Converging Storms') && me.getAuraStacks('Electrostatic Wager') > 6) || 
-        !me.hasAura('Crash Lightning')
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget, req =>
-        this.hasTalent('Thorims Invocation') && 
-        me.getAuraStacks(auras.maelstromweapon) > 0 && 
-        this.canTiChainLightning()
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        this.hasTalent('Converging Storms') && this.hasTalent('Alpha Wolf')
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.getAuraStacks('Converging Storms') === 6 && 
-        me.getAuraStacks('Stormblast') > 0 && 
-        me.hasAura(auras.legacyfrostwitch) && 
-        me.getAuraStacks(auras.maelstromweapon) <= 8
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) <= 8
-      ),
-      
-      spell.cast('Voltaic Blaze', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) <= 8
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5 && 
-        !me.hasAura('Primordial Storm') && 
-        (spell.getCooldown('Crash Lightning').timeleft >= 1000 || !this.hasTalent('Alpha Wolf'))
-      ),
-      
-      // Additional abilities
-      this.standardAoeAbilities()
-    );
+  targetHasLF() {
+    const t = this.getCurrentTarget();
+    if (!t) return false;
+    return !!(t.getAuraByMe(A.lashingFlames) ||
+      t.auras.find(a => a.spellId === A.lashingFlames && a.casterGuid?.equals(me.guid)));
   }
 
-  // Single target standard opener
-  singleTargetOpen() {
-    return new bt.Selector(
-      this.useRacials(),
-      this.useTrinkets(),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Voltaic Blaze', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') < 3 && !me.hasAura('Ascendance')
-      ),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 4 &&
-        this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.activeDotCount('Flame Shock') === this.activeEnemiesCount() || this.activeDotCount('Flame Shock') === 6)
-      ),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Ascendance', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9 &&
-        (me.hasAura(auras.legacyfrostwitch) || !this.hasTalent('Legacy of the Frost Witch'))
-      ),
-      
-      // Core rotational abilities
-      spell.cast('Windstrike', this.getCurrentTarget),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Tempest', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        Settings.ShamanEnhancer4Set
-      ),
-      
-      spell.cast('Voltaic Blaze', this.getCurrentTarget),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        this.hasTalent('Elemental Assault') &&
-        this.hasTalent('Molten Assault') &&
-        this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Ice Strike', this.getCurrentTarget)
-    );
-  }
-
-  // Single target standard sustained
-  singleTarget() {
-    return new bt.Selector(
-      // If in opening phase, use the opener
-      new bt.Decorator(
-        req => this.isOpeningPhase(),
-        this.singleTargetOpen()
-      ),
-      this.useRacials(),
-      this.useTrinkets(),
-      // Primordial Storm management
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 ||
-        (this.getAuraRemainingTime('Primordial Storm') <= 4000 && me.getAuraStacks(auras.maelstromweapon) >= 5)
-      ),
-      
-      // DoT management
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.hasTalent('Ashen Catalyst') || this.hasTalent('Primordial Wave') || this.hasTalent('Lashing Flames'))
-      ),
-      
-      // Major cooldowns
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        spell.getCooldown('Doom Winds').timeleft > 30000 || spell.getCooldown('Doom Winds').timeleft < 7000
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget, req =>
-        this.hasTalent('Thorims Invocation') && me.getAuraStacks(auras.maelstromweapon) > 0 && this.canTiLightningBolt()
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch) &&
-        (spell.getCooldown('Feral Spirit').timeleft > 30000 || spell.getCooldown('Feral Spirit').timeleft < 2000)
-      ),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Ascendance', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock') ||
-        !this.hasTalent('Primordial Wave') ||
-        !this.hasTalent('Ashen Catalyst')
-      ),
-      
-      // Maelstrom spenders
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        ((!this.hasTalent('Overflowing Maelstrom') && me.getAuraStacks(auras.maelstromweapon) >= 5) || 
-         me.getAuraStacks(auras.maelstromweapon) >= 9)
-      ),
-      
-      spell.cast('Tempest', this.getCurrentTarget, req =>
-        me.hasAura('Tempest') && me.getAuraStacks(auras.maelstromweapon) >= 9
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 9 &&
-        !me.hasAura('Primordial Storm') &&
-        me.getAuraStacks('Arc Discharge') > 1
-      ),
-      
-      spell.cast("Lava Lash", () => (me.hasAura("Hot Hand") && (me.getAuraStacks("Ashen Catalyst") === me.getMaxAuraStacks("Ashen Catalyst"))) || 
-        (this.getCurrentTarget().getAura("Flame Shock") && this.getCurrentTarget().getAura("Flame Shock").remaining <= 2 && !this.hasTalent("Voltaic Blaze")) || 
-        (this.hasTalent("Lashing Flames") && (!this.getCurrentTarget().hasAura("Lashing Flames")))),
-      
-      spell.cast("Crash Lightning", () => (me.hasAura("Doom Winds") && me.getAuraStacks("Electrostatic Wager") > 1) || me.getAuraStacks("Electrostatic Wager") > 8),
-      
-      spell.cast("Stormstrike", () => me.hasAura("Doom Winds") || me.getAuraStacks("Stormblast") > 0),
-      
-      spell.cast("Crash Lightning", () => this.hasTalent("Unrelenting Storms") && this.hasTalent("Alpha Wolf") && this.alphaWolfMinRemains() === 0),
-      
-      spell.cast("Lava Lash", () => me.hasAura("Hot Hand")),
-      
-      spell.cast("Crash Lightning", () => this.hasSetBonus("tww2_4pc")),
-      
-      spell.cast("Voltaic Blaze"),
-      
-      spell.cast("Stormstrike"),
-      
-      spell.cast("Lava Lash", () => this.hasTalent("Elemental Assault") && this.hasTalent("Molten Assault") && this.getCurrentTarget().hasAuraByMe("Flame Shock")),
-      
-      spell.cast("Ice Strike"),
-      
-      spell.cast("Lightning Bolt", () => me.getAuraStacks("Maelstrom Weapon") >= 5 && !me.hasAura("Primordial Storm")),
-      
-      spell.cast("Frost Shock", () => me.hasAura("Hailstorm")),
-      
-      spell.cast("Flame Shock", () => !this.getCurrentTarget().hasAuraByMe("Flame Shock")),
-      
-      spell.cast("Sundering"),
-      
-      spell.cast("Crash Lightning"),
-      
-      spell.cast("Frost Shock"),
-      
-      spell.cast("Fire Nova", () => this.getCurrentTarget().hasAuraByMe("Flame Shock")),
-      
-      spell.cast("Earth Elemental"),
-      
-      spell.cast("Flame Shock"),
-      
-      // Standard abilities
-      this.standardSingleTargetAbilities()
-    );
-  }
-
-  // Helper method for single target totemic sustained rotation
-  singleTargetTotemic() {
-    console.debug('DOOMWINDS CD: '+ spell.getCooldown('Doom Winds').timeleft);
-    return new bt.Selector(
-      // If in opening phase, use the opener
-      new bt.Decorator(
-        req => this.isOpeningPhase(),
-        this.singleTargetTotemicOpen()
-      ),
-      this.useRacials(),
-      this.useTrinkets(),
-      spell.cast(444995, this.getCurrentTarget, req => spell.getSpell('Surging Totem').overrideId == 444995),
-      
-      spell.cast('Ascendance', this.getCurrentTarget, req =>
-        this.canTiLightningBolt() &&
-        this.surgingTotemActive() > 4000 &&
-        (me.getAuraStacks('Totemic Rebound') >= 3 || me.getAuraStacks(auras.maelstromweapon) > 0)
-      ),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock') &&
-        (this.hasTalent('Ashen Catalyst') || this.hasTalent('Primordial Wave'))
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        me.hasAura(auras.hothand)
-      ),
-      
-      spell.cast('Feral Spirit', this.getCurrentTarget, req =>
-        ((spell.getCooldown('Doom Winds').timeleft > 23000 || spell.getCooldown('Doom Winds').timeleft < 7000) &&
-         (spell.getCooldown('Primordial Wave').timeleft < 20000 || me.hasAura('Primordial Storm') || !this.hasTalent('Primordial Storm')))
-      ),
-      
-      spell.cast('Primordial Wave', this.getCurrentTarget, req =>
-        this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Doom Winds', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Primordial Storm', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        (me.hasAura(auras.legacyfrostwitch) || !this.hasTalent(auras.legacyfrostwitch)) &&
-        (spell.getCooldown('Doom Winds').timeleft >= 15000 || me.hasAura('Doom Winds'))
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget, req =>
-        me.hasAura('Ascendance') &&
-        this.surgingTotemActive() > 0 &&
-        this.hasTalent('Earthsurge') &&
-        me.hasAura(auras.legacyfrostwitch) &&
-        me.getAuraStacks('Totemic Rebound') >= 5 &&
-        me.getAuraStacks('Earthen Weapon') >= 2
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget, req =>
-        this.hasTalent('Thorims Invocation') &&
-        me.getAuraStacks(auras.maelstromweapon) > 0 &&
-        this.canTiLightningBolt()
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget, req =>
-        me.hasAura(auras.legacyfrostwitch) &&
-        ((spell.getCooldown('Ascendance').timeleft >= 10000 && this.hasTalent('Ascendance')) || !this.hasTalent('Ascendance')) &&
-        this.surgingTotemActive() > 0 &&
-        me.getAuraStacks('Totemic Rebound') >= 3 &&
-        !me.hasAura('Ascendance')
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        this.hasTalent('Unrelenting Storms') &&
-        this.hasTalent('Alpha Wolf') &&
-        this.alphaWolfMinRemains() === 0
-      ),
-      
-      spell.cast('Lava Burst', this.getCurrentTarget, req =>
-        !this.hasTalent('Thorims Invocation') &&
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        !me.hasAura('Whirling Air')
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        ((!this.hasTalent('Overflowing Maelstrom') && me.getAuraStacks(auras.maelstromweapon) >= 5) ||
-         (me.getAuraStacks(auras.maelstromweapon) >= 9)) && 
-        this.getChargesFractional('Elemental Blast') >= 1.8
-      ),
-      
-           // spell.cast('Elemental Blast', this.getCurrentTarget, req => 
-      //   ((!this.hasTalent('Overflowing Maelstrom') && me.getAuraStacks(auras.maelstromweapon) >= 5) ||
-      //    (me.getAuraStacks(auras.maelstromweapon) >= 9)) && 
-      //   this.getChargesFractional('Elemental Blast') >= 1.8
-      // ),
-
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        (!me.hasAura('Primordial Storm') || this.getAuraRemainingTime('Primordial Storm') > 4000)
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') && me.hasAura(auras.legacyfrostwitch)
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 10 &&
-        (!me.hasAura('Primordial Storm') || this.getAuraRemainingTime('Primordial Storm') > 4000)
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req => 
-        me.getAuraStacks('Electrostatic Wager') > 4
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') || me.getAuraStacks(auras.stormblast) > 1
-      ),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        me.hasAura('Whirling Fire') || me.getAuraStacks('Ashen Catalyst') >= 8
-      ),
-      
-      // Standard abilities
-      spell.cast('Windstrike', this.getCurrentTarget),
-      spell.cast('Stormstrike', this.getCurrentTarget),
-      spell.cast('Lava Lash', this.getCurrentTarget),
-      spell.cast('Crash Lightning', this.getCurrentTarget, req => Settings.ShamanEnhancer4Set),
-      spell.cast('Voltaic Blaze', this.getCurrentTarget),
-      spell.cast('Crash Lightning', this.getCurrentTarget, req => this.hasTalent('Unrelenting Storms')),
-      spell.cast('Ice Strike', this.getCurrentTarget, req => !me.hasAura('Ice Strike')),
-      spell.cast('Crash Lightning', this.getCurrentTarget),
-      spell.cast('Frost Shock', this.getCurrentTarget),
-      spell.cast('Fire Nova', this.getCurrentTarget, req => this.getCurrentTarget().hasAura('Flame Shock')),
-      //spell.cast('Earth Elemental', this.getCurrentTarget),
-      spell.cast('Flame Shock', this.getCurrentTarget, req => !this.hasTalent('Voltaic Blaze'))
-    );
-  }
-
-// Standard abilities for AoE
-  standardAoeAbilities() {
-    return new bt.Selector(
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        this.hasTalent('Stormblast') && this.hasTalent('Stormflurry')
-      ),
-      
-      spell.cast('Voltaic Blaze', this.getCurrentTarget),
-      
-      spell.cast('Lava Lash', this.getCurrentTarget, req =>
-        this.hasTalent('Lashing Flames') || 
-        (this.hasTalent('Molten Assault') && this.getCurrentTarget().hasAura('Flame Shock'))
-      ),
-      
-      spell.cast('Ice Strike', this.getCurrentTarget, req =>
-        this.hasTalent('Hailstorm') && !me.hasAura('Ice Strike')
-      ),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Hailstorm') && me.hasAura('Hailstorm')
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Molten Assault') && !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        (this.hasTalent('Fire Nova') || this.hasTalent('Primordial Wave')) &&
-        (this.activeDotCount('Flame Shock') < this.activeEnemiesCount()) &&
-        this.activeDotCount('Flame Shock') < 6
-      ),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') >= 3
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.hasAura('Crash Lightning') && 
-        (this.hasTalent('Deeply Rooted Elements') || 
-         me.getAuraStacks('Converging Storms') === me.getAuraMaxStacks('Converging Storms'))
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        this.hasTalent('Crashing Storms') && me.hasAura('CL Crash Lightning')
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget),
-      spell.cast('Stormstrike', this.getCurrentTarget),
-      spell.cast('Ice Strike', this.getCurrentTarget),
-      spell.cast('Lava Lash', this.getCurrentTarget),
-      spell.cast('Crash Lightning', this.getCurrentTarget),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') >= 2
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5 && !me.hasAura('Primordial Storm')
-      ),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        !this.hasTalent('Hailstorm')
-      )
-    );
-  }
-
-  // Standard abilities for single target
-  standardSingleTargetAbilities() {
-    return new bt.Selector(
-      spell.cast('Crash Lightning', this.getCurrentTarget),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        me.hasAura('Hailstorm')
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget),
-      
-      spell.cast('Earth Elemental', this.getCurrentTarget)
-    );
-  }
-
-  // Standard abilities (for use in funnel rotation)
-  standardAbilities() {
-    return new bt.Selector(
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') ||
-        !me.hasAura('Crash Lightning') ||
-        (this.hasTalent('Alpha Wolf') && this.feralSpiritActive() > 0 && this.alphaWolfMinRemains() === 0) ||
-        (this.hasTalent('Converging Storms') && me.getAuraStacks('Converging Storms') < me.getAuraMaxStacks('Converging Storms'))
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget, req =>
-        me.hasAura('Doom Winds') || this.hasTalent('Earthsurge')
-      ),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') === 6 || 
-        (this.activeDotCount('Flame Shock') >= 4 && this.activeDotCount('Flame Shock') === this.activeEnemiesCount())
-      ),
-      
-      spell.cast('Ice Strike', this.getCurrentTarget, req =>
-        this.hasTalent('Hailstorm') && !me.hasAura('Ice Strike')
-      ),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Hailstorm') && me.hasAura('Hailstorm')
-      ),
-      
-      spell.cast('Sundering', this.getCurrentTarget),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        this.hasTalent('Molten Assault') && !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        (this.hasTalent('Fire Nova') || this.hasTalent('Primordial Wave')) &&
-        (this.activeDotCount('Flame Shock') < this.activeEnemiesCount()) &&
-        this.activeDotCount('Flame Shock') < 6
-      ),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') >= 3
-      ),
-      
-      spell.cast('Stormstrike', this.getCurrentTarget, req =>
-        me.hasAura('Crash Lightning') && this.hasTalent('Deeply Rooted Elements')
-      ),
-      
-      spell.cast('Crash Lightning', this.getCurrentTarget, req =>
-        this.hasTalent('Crashing Storms') && me.hasAura('CL Crash Lightning') && this.getEnemiesInRange(8) >= 4
-      ),
-      
-      spell.cast('Windstrike', this.getCurrentTarget),
-      spell.cast('Stormstrike', this.getCurrentTarget),
-      spell.cast('Ice Strike', this.getCurrentTarget),
-      spell.cast('Lava Lash', this.getCurrentTarget),
-      spell.cast('Crash Lightning', this.getCurrentTarget),
-      
-      spell.cast('Fire Nova', this.getCurrentTarget, req =>
-        this.activeDotCount('Flame Shock') >= 2
-      ),
-      
-      spell.cast('Elemental Blast', this.getCurrentTarget, req =>
-        (!this.hasTalent('Elemental Spirits') || 
-         (this.hasTalent('Elemental Spirits') && 
-          (spell.getCharges('Elemental Blast') === spell.getMaxCharges('Elemental Blast') || me.hasAura(auras.feralspirits)))) &&
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Lava Burst', this.getCurrentTarget, req =>
-        (me.getAuraStacks('Molten Weapon') > me.getAuraStacks('Crackling Surge')) &&
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Lightning Bolt', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5 &&
-        (this.expectedLbFunnel() > this.expectedClFunnel())
-      ),
-      
-      spell.cast('Chain Lightning', this.getCurrentTarget, req =>
-        me.getAuraStacks(auras.maelstromweapon) >= 5
-      ),
-      
-      spell.cast('Flame Shock', this.getCurrentTarget, req =>
-        !this.getCurrentTarget().hasAura('Flame Shock')
-      ),
-      
-      spell.cast('Frost Shock', this.getCurrentTarget, req =>
-        !this.hasTalent('Hailstorm')
-      )
-    );
-  }
-
-  useRacials() {
-    return new bt.Selector(
-      spell.cast("Blood Fury", this.getCurrentTarget, req => me.hasAura('Blood Fury') && (
-        me.hasAura('Ascendance') || 
-        me.hasAura(auras.feralspirits) || 
-        me.hasAura('Doom Winds') || 
-        this.minTalentedCdRemains() >= spell.getCooldown('Blood Fury').timeleft ||
-        (!this.hasTalent('Ascendance') && !this.hasTalent('Feral Spirit') && !this.hasTalent('Doom Winds'))
-      )),
-      
-      spell.cast("Berserking", this.getCurrentTarget, req => me.hasAura('Berserking') && (
-        me.hasAura('Ascendance') || 
-        me.hasAura(auras.feralspirits) || 
-        me.hasAura('Doom Winds') || 
-        this.minTalentedCdRemains() >= spell.getCooldown('Berserking').timeleft ||
-        (!this.hasTalent('Ascendance') && !this.hasTalent('Feral Spirit') && !this.hasTalent('Doom Winds'))
-      )),
-      spell.cast("Berserking", this.getCurrentTarget),
-      spell.cast("Fireblood", this.getCurrentTarget, req => me.hasAura('Fireblood') && (
-        me.hasAura('Ascendance') || 
-        me.hasAura(auras.feralspirits) || 
-        me.hasAura('Doom Winds') || 
-        this.minTalentedCdRemains() >= spell.getCooldown('Fireblood').timeleft ||
-        (!this.hasTalent('Ascendance') && !this.hasTalent('Feral Spirit') && !this.hasTalent('Doom Winds'))
-      )),
-      
-      spell.cast("Ancestral Call", this.getCurrentTarget, req => me.hasAura('Ancestral Call') && (
-        me.hasAura('Ascendance') || 
-        me.hasAura(auras.feralspirits) || 
-        me.hasAura('Doom Winds') || 
-        this.minTalentedCdRemains() >= spell.getSpell('Ancestral Call').duration ||
-        (!this.hasTalent('Ascendance') && !this.hasTalent('Feral Spirit') && !this.hasTalent('Doom Winds'))
-       )
-      ));
-  }
-
-  // Helper methods for APL conditions
-  hasTalent(talentName) {
-    return me.hasAura(talentName);
-  }
-  
-  useTrinkets() {
-    return new bt.Selector(
-      common.useEquippedItemByName("Signet of the Priory"),
-      // Generic trinket use based on APL logic
-      // common.useEquippedTrinket(1, req => 
-      //   !this.isTrinketWeird(1) && 
-      //   this.hasTrinketUseBuff(1) && 
-      //   (me.hasAura('Ascendance') || 
-      //    me.hasAura('Feral Spirit') || 
-      //    me.hasAura('Doom Winds') || 
-      //    this.minTalentedCdRemains() >= this.getTrinketCooldown(1) ||
-      //    (!this.hasTalent('Ascendance') && !this.hasTalent('Feral Spirit') && !this.hasTalent('Doom Winds')))
-      // ),
-      
-      // common.useEquippedTrinket(2, req => 
-      //   !this.isTrinketWeird(2) && 
-      //   this.hasTrinketUseBuff(2) && 
-      //   (me.hasAura('Ascendance') || 
-      //    me.hasAura('Feral Spirit') || 
-      //    me.hasAura('Doom Winds') || 
-      //    this.minTalentedCdRemains() >= this.getTrinketCooldown(2) ||
-      //    (!this.hasTalent('Ascendance') && !this.hasTalent('Feral Spirit') && !this.hasTalent('Doom Winds')))
-      // ),
-      
-      // Specific named trinkets from APL
-      // common.useEquippedItemByName("Elementium Pocket Anvil"),
-      
-      // common.useEquippedItemByName("Algethar Puzzle Box", req => 
-      //   (!me.hasAura('Ascendance') && 
-      //    !me.hasAura('Feral Spirit') && 
-      //    !me.hasAura('Doom Winds')) || 
-      //   (this.hasTalent('Ascendance') && 
-      //    spell.getCooldown('Ascendance').timeleft < 2000 * spell.getGCD('Stormstrike'))
-      // ),
-      
-      // common.useEquippedItemByName("Beacon to the Beyond", req => 
-      //   (!me.hasAura('Ascendance') && 
-      //    !me.hasAura('Feral Spirit') && 
-      //    !me.hasAura('Doom Winds'))
-      // ),
-      
-      // common.useEquippedItemByName("Manic Grieftorch", req => 
-      //   (!me.hasAura('Ascendance') && 
-      //    !me.hasAura('Feral Spirit') && 
-      //    !me.hasAura('Doom Winds'))
-      // ),
-      
-      // // Non-use buff trinkets
-      // common.useEquippedTrinket(1, req => !this.isTrinketWeird(1) && !this.hasTrinketUseBuff(1)),
-      // common.useEquippedTrinket(2, req => !this.isTrinketWeird(2) && !this.hasTrinketUseBuff(2))
-    );
-  }
-  
-  // Helper for checking if trinket is in the "weird" list per APL
-  isTrinketWeird(slotNum) {
-    const trinketName = this.getTrinketName(slotNum).toLowerCase();
-    return (
-      trinketName.includes("algethar puzzle box") ||
-      trinketName.includes("manic grieftorch") ||
-      trinketName.includes("elementium pocket anvil") ||
-      trinketName.includes("beacon to the beyond")
-    );
-  }
-  
-  // Helper to check if trinket has a use buff effect
-  hasTrinketUseBuff(slotNum) {
-    // This is a simplified implementation since we can't directly check trinket data
-    // In a real implementation, this would check if the trinket has a buff effect when used
-    return true; 
-  }
-  
-  // Helper to get trinket cooldown duration
-  getTrinketCooldown(slotNum) {
-    // Simplified implementation
-    return slotNum === 1 ? 
-      spell.getCooldown(this.getTrinketName(1)).duration : 
-      spell.getCooldown(this.getTrinketName(2)).duration;
-  }
-  
-  // Helper to get trinket name
-  getTrinketName(slotNum) {
-    // Simplified implementation - in a real version would access trinket name
-    return slotNum === 1 ? "Trinket1" : "Trinket2";
-  }
-  
-  // Helper to calculate minimum remaining cooldown of talented abilities
-  minTalentedCdRemains() {
-    let minRemains = 999999; // Large number as default
-    
-    if (this.hasTalent('Feral Spirit')) {
-      const feralRemains = spell.getCooldown('Feral Spirit').timeleft % (4000 * (this.hasTalent('Witch Doctors Ancestry') ? 1 : 0));
-      minRemains = Math.min(minRemains, feralRemains);
+  // =============================================
+  // MAELSTROM WEAPON (cached per tick)
+  // =============================================
+  getMW() {
+    if (this._mwFrame === wow.frameTime) return this._cachedMW;
+    this._mwFrame = wow.frameTime;
+    const aura = me.getAura(A.maelstromWeapon);
+    this._cachedMW = aura ? (aura.stacks || 0) : 0;
+    if (this._cachedMW === 0) {
+      const found = me.auras.find(a => a.spellId === A.maelstromWeapon);
+      this._cachedMW = found ? (found.stacks || 0) : 0;
     }
-    
-    if (this.hasTalent('Doom Winds')) {
-      minRemains = Math.min(minRemains, spell.getCooldown('Doom Winds').timeleft);
-    }
-    
-    if (this.hasTalent('Ascendance')) {
-      minRemains = Math.min(minRemains, spell.getCooldown('Ascendance').timeleft);
-    }
-    
-    return minRemains;
+    return this._cachedMW;
   }
-  
-  
-  
-  // Helper functions for Thor's Invocation logic
-  canTiLightningBolt() {
-    return this.hasTalent('Thorims Invocation') &&
-           me.getAuraStacks(auras.maelstromweapon) > 0 &&
-           this.getEnemiesInRange(8) < 2; // Single target
-  }
-  
-  canTiChainLightning() {
-    return this.hasTalent('Thorims Invocation') &&
-           me.getAuraStacks(auras.maelstromweapon) > 0 &&
-           this.getEnemiesInRange(8) >= 2; // AoE
-  }
-  
-  // Helper function to get current target
+
+  // =============================================
+  // TARGET (cached per tick)
+  // =============================================
   getCurrentTarget() {
-    const targetPredicate = unit => common.validTarget(unit) && me.isWithinMeleeRange(unit) && me.isFacing(unit);
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
     const target = me.target;
-    if (target !== null && targetPredicate(target)) {
-      return target;
-    }
-    return combat.targets.find(targetPredicate) || null;
-  }
-
-  // Counts active enemies within a specific range around the current target
-  activeEnemiesCount(range = 8) {
-    return combat.targets.filter(unit => me.distanceTo2D(unit) <= range && unit.inCombatWithMe).length;
-  }
-
-  // Counts how many targets currently have the specified DoT
-  activeDotCount(auraName, range = 40) {
-    return combat.targets.filter(unit => 
-      unit.hasAura(auraName) && me.distanceTo2D(unit) <= range && unit.inCombatWithMe
-    ).length;
-  }
-
-  // Returns the number of enemies in range of the player
-  getEnemiesInRange(range) {
-    return me.getUnitsAroundCount(range);
-  }
-  
-  // Counts enemies around the target
-  enemiesAroundTarget(range) {
-    const target = this.getCurrentTarget();
-    return target ? target.getUnitsAroundCount(range) : 0;
-  }
-
-  // Gets the count of active Feral Spirits
-  feralSpiritActive() {
-    
-        // Sucht alle Einheiten, die vom Spieler beschworen wurden
-        let count = 0;
-        
-        // Durchsuche alle Objekte im ObjectManager
-        objMgr.objects.forEach(obj => {
-            // Prüfe, ob das Objekt eine Einheit ist
-            if (obj instanceof wow.CGUnit) {
-                // Prüfe, ob die Einheit vom Spieler beschworen wurde und ein Feral Spirit ist
-                if (obj.createdBy && 
-                    me.guid && 
-                    obj.createdBy.equals(me.guid) && 
-                    obj.name === 'Feral Spirit') {
-                    count++;
-                }
-            }
-        });
-        return count;
-  }
-
-  // Checks if Surging Totem is active and returns remaining time
-  surgingTotemActive() {
-    let count = 0;  
-    // Durchsuche alle Objekte im ObjectManager
-    objMgr.objects.forEach(obj => {
-        // Prüfe, ob das Objekt eine Einheit ist
-        if (obj instanceof wow.CGUnit) {
-            // Prüfe, ob die Einheit vom Spieler beschworen wurde und ein Feral Spirit ist
-            if (obj.createdBy && 
-                me.guid && 
-                obj.createdBy.equals(me.guid) && 
-                obj.name === 'Surging Totem') {
-                count++;
-            }
-        }
-    });
-
-    return count;
-  }
-
-  // Checks if Searing Totem is active
-  searingTotemActive() {
-    
-      
-    let count = 0;  
-    // Durchsuche alle Objekte im ObjectManager
-    objMgr.objects.forEach(obj => {
-        // Prüfe, ob das Objekt eine Einheit ist
-        if (obj instanceof wow.CGUnit) {
-            // Prüfe, ob die Einheit vom Spieler beschworen wurde und ein Feral Spirit ist
-            if (obj.createdBy && 
-                me.guid && 
-                obj.createdBy.equals(me.guid) && 
-                obj.name === 'Surging Totem') {
-                count++;
-            }
-        }
-    });
-
-    return count > 0 ? true : false;
-  }
-
-  // Returns the minimum remaining time of Alpha Wolf aura on all Feral Spirits
-  alphaWolfMinRemains() {
-    const alphaWolves = wow.Pet.activePets.filter(pet => pet.name === 'Alpha Wolf');
-    if (alphaWolves.length === 0) return 0;
-    return Math.min(...alphaWolves.map(wolf => wolf.auraRemainingTime));
-  }
-
-  // Returns the expected Lightning Bolt funnel damage (for Funnel APL logic)
-  expectedLbFunnel() {
-    // Simplified implementation based on APL variables
-    const natureMod = (1 + (this.getCurrentTarget().hasAura('Chaos Brand') ? 0.05 : 0)) * 
-                      (1 + (this.getCurrentTarget().hasAura('Hunters Mark') && 
-                            this.getCurrentTarget().pctHealth >= 80 ? 0.05 : 0));
-    
-    // Base LB damage (simplified)
-    const lbDamage = 100; 
-    
-    return lbDamage * (1 + (this.getCurrentTarget().hasAura('Lightning Rod') ? 
-           natureMod * (1 + (me.hasAura('Primordial Wave') ? 
-                            this.activeDotCount('Flame Shock') * 0.2 : 0)) * 0.2 : 0));
-  }
-
-  // Returns the expected Chain Lightning funnel damage (for Funnel APL logic)
-  expectedClFunnel() {
-    // Simplified implementation based on APL variables
-    const natureMod = (1 + (this.getCurrentTarget().hasAura('Chaos Brand') ? 0.05 : 0)) * 
-                      (1 + (this.getCurrentTarget().hasAura('Hunters Mark') && 
-                            this.getCurrentTarget().pctHealth >= 80 ? 0.05 : 0));
-    
-    // Base CL damage (simplified)
-    const clDamage = 80;
-    
-    // Max targets for CL based on talents
-    const maxTargets = Math.max(this.getEnemiesInRange(8), (3 + 2 * (this.hasTalent('Crashing Storms') ? 1 : 0)));
-    
-    return clDamage * (1 + (this.getCurrentTarget().hasAura('Lightning Rod') ? 
-           natureMod * maxTargets * 0.2 : 0));
-  }
-
-  // Gets the remaining time of an aura on the player
-  getAuraRemainingTime(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.remaining : 0;
-  }
-
-  startCombatTimer() {
-    console.debug("----- START TIMER -----");
-    if (currentCombatTime != 0)
-      return
-    
-    combatStartTime = Date.now();
-    currentCombatTime = 0;
-    
-    // Clear any existing timer to prevent duplicates
-    if (combatTimer) {
-      clearInterval(combatTimer);
-    }
-    
-    // Start a new timer that updates currentCombatTime every 10ms
-    this.combatTimer = setInterval(() => {
-      currentCombatTime = Date.now() - combatStartTime;
-    }, 10);
-  }
-  
-  // Function to stop combat timer
-  stopCombatTimer() {
-    console.debug("----- STOP TIMER -----");
-    if (combatTimer) {
-      clearInterval(combatTimer);
-     combatTimer = null;
-    }
-    combatStartTime = 0;
-    currentCombatTime = 0;
-  }
-
-  getChargesFractional(spellName) {
-    const spell = spell.getSpell(spellName);
-    if (!spell || !spell.charges) return 0;
-    
-    const currentCharges = spell.charges.charges || 0;
-    const maxCharges = spell.charges.maxCharges || 0;
-    
-    if (currentCharges >= maxCharges) return currentCharges;
-    
-    const remainingTime = spell.charges.start + spell.charges.duration - wow.frameTime;
-    const chargeDuration = spell.charges.duration;
-    const fractionalPart = 1 - (remainingTime / chargeDuration);
-    
-    return currentCharges + fractionalPart;
-  }
-
-  trackTotems() {
-    const activeTotems = [];
-    
-    objMgr.objects.forEach(obj => {
-      if (obj instanceof wow.CGUnit && 
-          obj.createdBy && 
-          me.guid && 
-          obj.createdBy.equals(me.guid)) {
-        
-        // Check if it's any type of totem
-        if (obj.name.includes('Totem')) {
-          // Get health percentage to determine totem lifetime
-          const healthPct = obj.pctHealth;
-          const distanceToPlayer = me.distanceTo(obj);
-          
-          activeTotems.push({
-            guid: obj.guid,
-            name: obj.name,
-            position: obj.position,
-            distance: distanceToPlayer,
-            health: healthPct
-          });
-        }
+    if (target !== null && common.validTarget(target) && me.distanceTo2D(target) <= 10) {
+      // Valid manual target — use it if facing, skip tick if not (DON'T switch)
+      if (me.isFacing(target)) {
+        this._cachedTarget = target;
+        return target;
       }
-    });
-    
-    return activeTotems;
+      this._cachedTarget = null;
+      return null; // Not facing manual target — wait, don't auto-switch
+    }
+    // No valid manual target (dead/null/out of range) — auto-pick
+    if (me.inCombat()) {
+      const t = combat.targets.find(u => common.validTarget(u) && me.distanceTo2D(u) <= 10 && me.isFacing(u));
+      if (t) { wow.GameUI.setTarget(t); this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
   }
-  
-  // Find specifically the Surging Totem and get detailed information
-  getSurgingTotemInfo() {
-    let totemInfo = null;
-    
-    objMgr.objects.forEach(obj => {
-      if (obj instanceof wow.CGUnit && 
-          obj.createdBy && 
-          me.guid && 
-          obj.createdBy.equals(me.guid) && 
-          obj.name === 'Surging Totem') {
-        
-        const distanceToPlayer = me.distanceTo(obj);
-        
-        totemInfo = {
-          guid: obj.guid,
-          position: obj.position,
-          distance: distanceToPlayer,
-          health: obj.pctHealth,
-          entryId: obj.entryId,
-          // Calculate remaining time (approximation based on health)
-          remainingTime: (obj.pctHealth / 100) * 120000 // Assuming 120sec max duration
-        };
-      }
-    });
-    
-    return totemInfo;
+
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(10) + 1 : 0;
+    return this._cachedEnemyCount;
   }
-  
-  // Manage totem relocation
-  manageSurgingTotem() {
-    return new bt.Selector(
-      new bt.Action(() => {
-        // Don't attempt relocation if player is moving
-        if (me.isMoving()) {
-          return bt.Status.Failure;
-        }
-  
-        const totemInfo = this.getSurgingTotemInfo();
-        
-        // If totem is active and far away
-        if (totemInfo && totemInfo.distance > 15) {
-          
-          // Check if we should relocate based on remaining time
-          const shouldRelocate = totemInfo.remainingTime > 30000; // Only relocate if >30 seconds left
-          
-          if (shouldRelocate) {
-            console.info(`Relocating Surging Totem - ${totemInfo.distance.toFixed(1)} yards away, ${(totemInfo.remainingTime/1000).toFixed(1)}s remaining`);
-            
-            // Try to cast the totem again if available
-            const surgingTotem = spell.getSpell('Surging Totem');
-            const totemicRecall = spell.getSpell('Totemic Recall');
-            
-            // First recall existing totems if that ability exists
-            if (totemicRecall && totemicRecall.isKnown && totemicRecall.cooldown.ready) {
-              totemicRecall.cast();
-              return bt.Status.Success;
-            }
-            
-            // If there's no recall ability, try to place a new totem
-            if (surgingTotem && surgingTotem.isKnown && surgingTotem.cooldown.ready) {
-              surgingTotem.cast();
-              return bt.Status.Success;
-            }
-          }
-        }
-        
-        return bt.Status.Failure;
-      })
-    );
+
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
   }
-  
-  // Get the count of active totems by name
-  getTotemCount(totemName) {
-    let count = 0;
-    
-    objMgr.objects.forEach(obj => {
-      if (obj instanceof wow.CGUnit && 
-          obj.createdBy && 
-          me.guid && 
-          obj.createdBy.equals(me.guid) && 
-          obj.name === totemName) {
-        count++;
-      }
-    });
-    
-    return count;
+
+  useCDs() { return combat.burstToggle || Settings.FWEnhAutoCDs; }
+
+  // =============================================
+  // SKYFURY (OOC buff)
+  // =============================================
+  getSkyfuryTarget() {
+    if (spell.getTimeSinceLastCast(S.skyfury) < 60000) return null;
+    if (!this._hasBuff(me, S.skyfury)) return me;
+    // Skyfury is a raid-wide buff — casting once applies to everyone. Only check self.
+    return null;
   }
-  
+
+  _hasBuff(unit, id) {
+    if (!unit) return false;
+    if (unit.hasVisibleAura(id) || unit.hasAura(id)) return true;
+    if (unit.auras.find(a => a.spellId === id)) return true;
+    // Skyfury: cast ID may differ from buff aura — fallback to name match
+    if (id === S.skyfury) return unit.auras.find(a =>
+      a.name.includes("Skyfury") || a.name.includes("Himmelszorn") || a.spellId === A.skyfury
+    ) !== undefined;
+    return false;
+  }
 }

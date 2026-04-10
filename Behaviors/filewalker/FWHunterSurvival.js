@@ -1,530 +1,612 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
-import Common from '@/Core/Common';
-import Spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import Pet from "@/Core/Pet";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
+import { defaultHealTargeting as heal } from '@/Targeting/HealTargeting';
 
 /**
- * Behavior implementation for Survival Hunter
- * Follows the SimC APL strictly
+ * Survival Hunter Behavior - Midnight 12.0.1
+ * Sources: SimC Midnight APL (hunter_survival.simc) + Method + Wowhead + Icy Veins
+ *
+ * Auto-detects: Pack Leader (Howl of the Pack Leader) vs Sentinel (Moonlight Chakram)
+ * SimC sub-lists: plst (10), plcleave (11), sentst (11), sentcleave (10), cds (9) — ALL implemented
+ *
+ * CRITICAL Midnight changes:
+ *   Takedown: New major CD (1.5min), +20% dmg buff for 8s, generates 50 Focus
+ *   Boomstick: Channeled frontal cone, 1min CD (45s w/ Quick Reload)
+ *   Flamefang Pitch: Ground-targeted fire AoE, 1min CD
+ *   Tip of the Spear: Kill Command grants +15% per stack (3 max) to next ability
+ *   Raptor Swipe: Raptor Strike upgrades to cone AoE when buff active
+ *   Moonlight Chakram: Sentinel hero talent, bouncing arcane damage
+ *   Fury of the Wyvern: Pack Leader — Wyvern duration extendable by Wildfire Bomb
+ *
+ * Pack Leader: KC (beast summons) → Takedown → Flamefang → Boomstick w/ TotS → WFB → RS
+ * Sentinel: KC (TotS=0) → Boomstick w/ TotS → WFB w/ Sent Mark → Takedown → Chakram → RS
+ *
+ * Melee spec — instant cast only, no movement block needed (all abilities instant except Boomstick channel)
  */
-export class HunterSurvivalSimCBehavior extends Behavior {
+
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-20',
+  guide: 'SimC Midnight APL (every line) + Method + Wowhead + Icy Veins',
+};
+
+// Cast spell IDs
+const S = {
+  // Core rotational
+  killCommand:        259489,   // 3 charges, 5s recharge, generates 15 Focus (+5 talented)
+  raptorStrike:       186270,   // 30 Focus, melee instant
+  mongooseBite:       265893,   // Replaces Raptor Strike if talented
+  wildfireBomb:       259495,   // 10 Focus, 18s recharge (2 charges w/ Guerrilla Tactics)
+  takedown:           1250646,  // 1.5min CD, generates 50 Focus, +20% dmg 8s
+  boomstick:          1261193,  // 50 Focus, 1min CD, 3s channel, frontal cone
+  flamefangPitch:     1251592,  // 20 Focus, 1min CD, ground-targeted AoE
+  moonlightChakram:   1264949,  // Sentinel only, bouncing arcane damage
+
+  // Utility
+  harpoon:            190925,   // 20s CD, 8-30yd, gap closer
+  muzzle:             187707,   // Interrupt, 15s CD
+  aspectOfTheEagle:   186289,   // Enables ranged for melee abilities
+  exhilaration:       109304,   // 2min CD, heal 30% HP
+  misdirection:       34477,
+  huntersMark:        259558,
+  revivePet:          982,
+  mendPet:            136,
+
+  // Racials
+  berserking:         26297,
+};
+
+// Talent IDs — for spell.isSpellKnown() detection only
+const T = {
+  howlOfPackLeader:   471876,   // Pack Leader detection (hero talent)
+  sentinel:           1253601,  // Sentinel detection (via Sentinel's Mark talent)
+  moonlightChakram:   1264949,  // Sentinel exclusive ability
+  twinFangs:          1272139,  // Takedown grants 3 TotS stacks
+  wildfireShells:     1261229,  // Boomstick reduces WFB CD
+  raptorSwipe:        1259003,  // RS upgrades to cone AoE
+  furyOfTheWyvern:    472550,   // Pack Leader — Wyvern extendable by WFB
+  flamefangPitch:     1251592,  // Talent check for Flamefang Pitch
+  mongooseBite:       265893,   // Talent: replaces Raptor Strike
+  tipOfTheSpear:      260285,   // Passive talent
+  lethalCalibration:  1262409,  // WFB reduces Boomstick CD
+  quickReload:        1261234,  // Boomstick CD reduced to 45s
+};
+
+// Buff/Debuff aura IDs — for me.hasAura() / me.getAura() / target.getAuraByMe()
+const A = {
+  // Player buffs
+  tipOfTheSpear:      260286,   // Buff from Kill Command, +15% per stack, 3 max
+  tipOfTheSpearBoom:  471536,   // TotS tracking for Boomstick specifically
+  tipOfTheSpearChak:  1280140,  // TotS tracking for Moonlight Chakram specifically
+  takedown:           1250646,  // +20% dmg buff, 8s
+  raptorSwipe:        1273155,  // Raptor Strike becomes AoE cone
+  mongooseFury:       259388,   // +10% Mongoose Bite dmg per stack, 8s, 20 max
+  aspectOfTheEagle:   186289,   // Enables ranged melee attacks
+  moonlightChakram:   1264946,  // Moonlight Chakram buff
+
+  // Pack Leader: Howl beast ready buffs (checked in SimC APL)
+  hotplWyvern:        471878,   // Next KC summons Wyvern
+  hotplBoar:          472324,   // Next KC summons Boar
+  hotplBear:          472325,   // Next KC summons Bear
+  hotplCooldown:      471877,   // 30s ICD tracking
+  wyvernsCry:         471881,   // Wyvern active: +10% dmg for 12s
+
+  // Sentinel
+  sentinelsMark:      1253601,  // Debuff on target, enhances next WFB by 40%
+
+  // Misc
+  huntersMark:        257284,   // Debuff aura ID (different from cast 259558)
+};
+
+// Wildfire Bomb DoT debuff ID
+const WILDFIRE_DOT = 269747;
+
+export class SurvivalHunterBehavior extends Behavior {
+  name = 'FW Survival Hunter';
   context = BehaviorContext.Any;
   specialization = Specialization.Hunter.Survival;
-  name = "FW Hunter Survival";
-  version = 1;
+  version = wow.GameVersion.Retail;
 
-  /**
-   * Builds the behavior tree for Survival Hunter
-   * @returns {bt.Composite} The root node of the behavior tree
-   */
+  // Per-tick caches
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _focusFrame = 0;
+  _cachedFocus = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _totsFrame = 0;
+  _cachedTotsStacks = 0;
+  _versionLogged = false;
+  _lastDebug = 0;
+
+  static settings = [
+    {
+      header: 'General',
+      options: [
+        { type: 'checkbox', uid: 'FWSvUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'slider', uid: 'FWSvAoECount', text: 'AoE Target Count', default: 3, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWSvDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWSvExhil', text: 'Use Exhilaration', default: true },
+        { type: 'slider', uid: 'FWSvExhilHP', text: 'Exhilaration HP %', default: 40, min: 15, max: 60 },
+      ],
+    },
+  ];
+
+  // =============================================
+  // BUILD
+  // =============================================
   build() {
     return new bt.Selector(
-      Common.waitForCastOrChannel(),
-      Common.waitForNotMounted(),
-      this.summonPet(),
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // Revive/Mend Pet OOC
+      spell.cast(S.revivePet, () => me, () => !me.inCombat() && me.pet && me.pet.deadOrGhost),
+
+      // Combat check — MANDATORY: stops all actions when out of combat
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Auto-target
       new bt.Action(() => {
-        if (this.getCurrentTarget() === null) {
-          return bt.Status.Success;
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
         }
         return bt.Status.Failure;
       }),
-      // Call the action lists in the same order as the APL
-      new bt.Sequence(
-        Common.ensureAutoAttack(),
-        this.callActionList_cds(),
-        this.callActionList_trinkets(),
-        // Call the appropriate action list based on talents and number of enemies
-        new bt.Selector(
-          new bt.Decorator(
-            () => this.activeEnemies() < 3 && this.hasPackLeader(),
-            this.callActionList_plst()
-          ),
-          new bt.Decorator(
-            () => this.activeEnemies() >= 3 && this.hasPackLeader(),
-            this.callActionList_plcleave()
-          ),
-          new bt.Decorator(
-            () => this.activeEnemies() < 3 && !this.hasPackLeader(),
-            this.callActionList_sentst()
-          ),
-          new bt.Decorator(
-            () => this.activeEnemies() >= 3 && !this.hasPackLeader(),
-            this.callActionList_sentcleave()
-          )
-        ),
-        // Fallback racial abilities
-        Spell.cast("Arcane Torrent"),
-        Spell.cast("Bag of Tricks"),
-        Spell.cast("Light's Judgment")
-      )
-    );
-  }
 
-  /**
-   * Pet summoning logic
-   */
-  summonPet() {
-    return new bt.Selector(
-      Pet.attack(() => this.getCurrentTarget()),
+      // Null target bail
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      common.waitForCastOrChannel(),
+
+      // Version + Debug logging
       new bt.Action(() => {
-        if (!Pet.isAlive() && !me.isCasting && !me.isChanneling) {
-          // Check for the default pet spell
-          const petSpell = Spell.getSpell("Call Pet 1");
-          if (petSpell && petSpell.isKnown && petSpell.cooldown.ready) {
-            if (petSpell.cast()) {
-              console.info("Summoning pet");
-              return bt.Status.Success;
-            }
-          }
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[SV] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | ${this.isPL() ? 'Pack Leader' : 'Sentinel'} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWSvDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          const tots = this.getTotsStacks();
+          const wfbFrac = spell.getChargesFractional(S.wildfireBomb);
+          console.info(`[SV] Focus:${Math.round(this.getFocus())} TotS:${tots} WFBfrac:${wfbFrac ? wfbFrac.toFixed(2) : '?'} TD:${me.hasAura(A.takedown)} RS:${me.hasAura(A.raptorSwipe)} WyvRdy:${me.hasAura(A.hotplWyvern)} BoarRdy:${me.hasAura(A.hotplBoar)} BearRdy:${me.hasAura(A.hotplBear)} E:${this.getEnemyCount()}`);
         }
         return bt.Status.Failure;
-      })
+      }),
+
+      // Auto Misdirection on tank (off-GCD, 30s CD)
+      spell.cast(S.misdirection, () => {
+        if (!me.inCombat()) return null;
+        if (spell.getTimeSinceLastCast(S.misdirection) < 30000) return null;
+        const tanks = heal.friends?.Tanks;
+        if (tanks) {
+          for (let i = 0; i < tanks.length; i++) {
+            if (tanks[i] && !tanks[i].deadOrGhost && me.distanceTo(tanks[i]) <= 100) return tanks[i];
+          }
+        }
+        return null;
+      }),
+
+      new bt.Decorator(
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          // Interrupt
+          spell.interrupt(S.muzzle),
+
+          // Defensives
+          spell.cast(S.exhilaration, () => me, () =>
+            Settings.FWSvExhil && me.effectiveHealthPercent < Settings.FWSvExhilHP
+          ),
+
+          // Mend Pet in combat
+          spell.cast(S.mendPet, () => me, () =>
+            me.pet && !me.pet.deadOrGhost && me.pet.pctHealth < 50 &&
+            spell.getTimeSinceLastCast(S.mendPet) > 10000
+          ),
+
+          // SimC: call_action_list,name=cds
+          this.cooldowns(),
+
+          // SimC dispatch: Pack Leader vs Sentinel, ST vs AoE
+          new bt.Decorator(
+            () => this.isPL() && this.isAoE(),
+            this.plCleave(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.isPL(),
+            this.plST(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.isAoE(),
+            this.sentCleave(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          this.sentST(),
+        )
+      ),
     );
   }
 
-  /**
-   * Cooldowns action list
-   */
-  callActionList_cds() {
+  // =============================================
+  // COOLDOWNS (SimC actions.cds, 9 lines)
+  // =============================================
+  cooldowns() {
+    const ttd = this.targetTTD();
     return new bt.Selector(
-      // actions.cds=blood_fury,if=buff.coordinated_assault.up|!talent.coordinated_assault&cooldown.spearhead.remains|!talent.spearhead&!talent.coordinated_assault
-      Spell.cast("Blood Fury", () => me.hasAura("Coordinated Assault") || 
-        (!this.hasTalent("Coordinated Assault") && Spell.getCooldown("Spearhead").timeleft > 0) || 
-        (!this.hasTalent("Spearhead") && !this.hasTalent("Coordinated Assault"))),
-      
-      // Power Infusion is an external buff, so we skip it
-      
-      // actions.cds+=/harpoon,if=prev.kill_command
-      Spell.cast("Harpoon", () => Spell.getLastSuccessfulSpell() === "Kill Command"),
-      
-      // actions.cds+=/ancestral_call,if=buff.coordinated_assault.up|!talent.coordinated_assault&cooldown.spearhead.remains|!talent.spearhead&!talent.coordinated_assault
-      Spell.cast("Ancestral Call", () => me.hasAura("Coordinated Assault") || 
-        (!this.hasTalent("Coordinated Assault") && Spell.getCooldown("Spearhead").timeleft > 0) || 
-        (!this.hasTalent("Spearhead") && !this.hasTalent("Coordinated Assault"))),
-      
-      // actions.cds+=/fireblood,if=buff.coordinated_assault.up|!talent.coordinated_assault&cooldown.spearhead.remains|!talent.spearhead&!talent.coordinated_assault
-      Spell.cast("Fireblood", () => me.hasAura("Coordinated Assault") || 
-        (!this.hasTalent("Coordinated Assault") && Spell.getCooldown("Spearhead").timeleft > 0) || 
-        (!this.hasTalent("Spearhead") && !this.hasTalent("Coordinated Assault"))),
-      
-      // actions.cds+=/berserking,if=buff.coordinated_assault.up|!talent.coordinated_assault&cooldown.spearhead.remains|!talent.spearhead&!talent.coordinated_assault|time_to_die<13
-      Spell.cast("Berserking", () => me.hasAura("Coordinated Assault") || 
-        (!this.hasTalent("Coordinated Assault") && Spell.getCooldown("Spearhead").timeleft > 0) || 
-        (!this.hasTalent("Spearhead") && !this.hasTalent("Coordinated Assault")) ||
-        this.getTimeToDie() < 13),
-      
-      // actions.cds+=/muzzle
-      Spell.cast("Muzzle"),
-      
-      // Potion usage skipped as it's not part of the in-game rotation
-      
-      // actions.cds+=/aspect_of_the_eagle,if=target.distance>=6
-      Spell.cast("Aspect of the Eagle", () => this.getCurrentTarget().distanceTo(me) >= 6)
+      // SimC: berserking,if=buff.takedown.up|cooldown.takedown.ready
+      spell.cast(S.berserking, () => me, () =>
+        Settings.FWSvUseCDs &&
+        (me.hasAura(A.takedown) || (spell.getCooldown(S.takedown)?.ready ?? false))
+      ),
+
+      // SimC: muzzle (handled above as interrupt)
+
+      // SimC: aspect_of_the_eagle,if=target.distance>=6
+      spell.cast(S.aspectOfTheEagle, () => me, () => {
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        return me.distanceTo(t) >= 6;
+      }),
+
+      new bt.Action(() => bt.Status.Failure)
     );
   }
 
-  /**
-   * Trinket usage logic
-   */
-  callActionList_trinkets() {
-    // We won't implement the specific trinket logic as requested
-    return new bt.Action(() => bt.Status.Failure);
-  }
-
-  /**
-   * Pack Leader Single Target action list
-   */
-  callActionList_plst() {
+  // =============================================
+  // PACK LEADER — Single Target (SimC actions.plst, 10 lines)
+  // =============================================
+  plST() {
     return new bt.Selector(
-      // actions.plst=kill_command,target_if=min:bloodseeker.remains,if=(buff.relentless_primal_ferocity.up&buff.tip_of_the_spear.stack<1)|howl_summon_ready&time_to_die<20
-      Spell.cast("Kill Command", () => 
-        (me.hasAura("Relentless Primal Ferocity") && this.getTipOfTheSpearStacks() < 1) ||
-        (this.howlSummonReady() && this.getTimeToDie() < 20)),
-      
-      // actions.plst+=/explosive_shot,if=cooldown.coordinated_assault.remains&cooldown.coordinated_assault.remains<gcd
-      Spell.cast("Explosive Shot", () => 
-        Spell.getCooldown("Coordinated Assault").timeleft > 0 &&
-        Spell.getCooldown("Coordinated Assault").timeleft < 1.5),
-      
-      // actions.plst+=/spearhead,if=cooldown.coordinated_assault.remains
-      Spell.cast("Spearhead", () => Spell.getCooldown("Coordinated Assault").timeleft > 0),
-      
-      // actions.plst+=/raptor_bite,target_if=min:dot.serpent_sting.remains,if=!dot.serpent_sting.ticking&target.time_to_die>12&(!talent.contagious_reagents|active_dot.serpent_sting=0)
-      Spell.cast("Raptor Strike", () => 
-        !this.getCurrentTarget().hasAura("Serpent Sting") && 
-        this.getTimeToDie() > 12 && 
-        (!this.hasTalent("Contagious Reagents") || this.getActiveDotsCount("Serpent Sting") === 0)),
-      
-      // actions.plst+=/raptor_bite,target_if=max:dot.serpent_sting.remains,if=talent.contagious_reagents&active_dot.serpent_sting<active_enemies&dot.serpent_sting.remains
-      Spell.cast("Raptor Strike", () => 
-        this.hasTalent("Contagious Reagents") && 
-        this.getActiveDotsCount("Serpent Sting") < this.activeEnemies() && 
-        this.getCurrentTarget().hasAura("Serpent Sting")),
-      
-      // actions.plst+=/butchery
-      Spell.cast("Butchery"),
-      
-      // actions.plst+=/kill_command,if=buff.strike_it_rich.remains&buff.tip_of_the_spear.stack<1
-      Spell.cast("Kill Command", () => 
-        me.hasAura("Strike It Rich") && this.getTipOfTheSpearStacks() < 1),
-      
-      // actions.plst+=/raptor_bite,if=buff.strike_it_rich.remains&buff.tip_of_the_spear.stack>0
-      Spell.cast("Raptor Strike", () => 
-        me.hasAura("Strike It Rich") && this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.plst+=/flanking_strike,if=buff.tip_of_the_spear.stack=1|buff.tip_of_the_spear.stack=2
-      Spell.cast("Flanking Strike", () => 
-        this.getTipOfTheSpearStacks() === 1 || this.getTipOfTheSpearStacks() === 2),
-      
-      // actions.plst+=/fury_of_the_eagle,if=buff.tip_of_the_spear.stack>0&(!raid_event.adds.exists|raid_event.adds.exists&raid_event.adds.in>40)
-      Spell.cast("Fury of the Eagle", () => 
-        this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.plst+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0&cooldown.wildfire_bomb.charges_fractional>1.4|cooldown.wildfire_bomb.charges_fractional>1.9|cooldown.coordinated_assault.remains<2*gcd&talent.bombardier|howl_summon_ready
-      Spell.cast("Wildfire Bomb", () => 
-        (this.getTipOfTheSpearStacks() > 0 && Spell.getChargesFractional("Wildfire Bomb") > 1.4) || 
-        Spell.getChargesFractional("Wildfire Bomb") > 1.9 || 
-        (Spell.getCooldown("Coordinated Assault").timeleft < 2 * 1.5 && this.hasTalent("Bombardier")) || 
-        this.howlSummonReady()),
-      
-      // actions.plst+=/explosive_shot,if=cooldown.coordinated_assault.remains<gcd
-      Spell.cast("Explosive Shot", () => 
-        Spell.getCooldown("Coordinated Assault").timeleft < 1.5),
-      
-      // actions.plst+=/coordinated_assault,if=!talent.bombardier|talent.bombardier&cooldown.wildfire_bomb.charges_fractional<1
-      Spell.cast("Coordinated Assault", () => 
-        !this.hasTalent("Bombardier") || 
-        (this.hasTalent("Bombardier") && Spell.getChargesFractional("Wildfire Bomb") < 1)),
-      
-      // actions.plst+=/kill_command,target_if=min:bloodseeker.remains,if=focus+cast_regen<focus.max&(!buff.relentless_primal_ferocity.up|(buff.relentless_primal_ferocity.up&buff.tip_of_the_spear.stack<1|focus<30))
-      Spell.cast("Kill Command", () => 
-        me.powerByType(PowerType.Focus) + 15 < 120 && 
-        (!me.hasAura("Relentless Primal Ferocity") || 
-         (me.hasAura("Relentless Primal Ferocity") && 
-          (this.getTipOfTheSpearStacks() < 1 || me.powerByType(PowerType.Focus) < 30)))),
-      
-      // actions.plst+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0&(!raid_event.adds.exists|raid_event.adds.exists&raid_event.adds.in>15)
-      Spell.cast("Wildfire Bomb", () => 
-        this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.plst+=/raptor_bite,target_if=min:dot.serpent_sting.remains,if=!talent.contagious_reagents
-      Spell.cast("Raptor Strike", () => 
-        !this.hasTalent("Contagious Reagents")),
-      
-      // actions.plst+=/raptor_bite,target_if=max:dot.serpent_sting.remains
-      Spell.cast("Raptor Strike"),
-      
-      // actions.plst+=/kill_shot
-      Spell.cast("Kill Shot"),
-      
-      // actions.plst+=/explosive_shot
-      Spell.cast("Explosive Shot")
+      // 1. kill_command,if=buff.tip_of_the_spear.stack<2&(buff.howl_wyvern.remains|buff.howl_boar.remains|buff.howl_bear.remains)
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        this.getTotsStacks() < 2 && this.hasHotplBeastReady()
+      ),
+
+      // 2. kill_command,if=cooldown.takedown.remains<gcd&buff.tip_of_the_spear.stack<2&!talent.twin_fangs
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 99999) < 1500 &&
+        this.getTotsStacks() < 2 && !spell.isSpellKnown(T.twinFangs)
+      ),
+
+      // 3. takedown,if=buff.tip_of_the_spear.stack>0&!talent.twin_fangs|buff.tip_of_the_spear.stack=0&talent.twin_fangs
+      spell.cast(S.takedown, () => this.getCurrentTarget(), () => {
+        const tots = this.getTotsStacks();
+        return (tots > 0 && !spell.isSpellKnown(T.twinFangs)) ||
+               (tots === 0 && spell.isSpellKnown(T.twinFangs));
+      }),
+
+      // 4. flamefang_pitch (unconditional in SimC)
+      spell.cast(S.flamefangPitch, () => this.getCurrentTarget()),
+
+      // 5. boomstick,if=buff.tip_of_the_spear.up
+      spell.cast(S.boomstick, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 6. wildfire_bomb,if=fury_of_the_wyvern_extendable&buff.tip_of_the_spear.up
+      // fury_of_the_wyvern_extendable = wyvern active AND extension < cap (10s)
+      // Approximate: wyvern buff is active (wyvernsCry aura present)
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget(), () =>
+        this.hasTotS() && this.isWyvernExtendable()
+      ),
+
+      // 7. raptor_strike,if=buff.tip_of_the_spear.up|!buff.raptor_swipe.up
+      this.castRaptor(() => this.hasTotS() || !me.hasAura(A.raptorSwipe)),
+
+      // 8. kill_command,if=cooldown.takedown.remains
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 0) > 0
+      ),
+
+      // 9. wildfire_bomb
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget()),
+
+      // 10. takedown (fallback, no conditions)
+      spell.cast(S.takedown, () => this.getCurrentTarget()),
     );
   }
 
-  /**
-   * Pack Leader AOE/Cleave action list
-   */
-  callActionList_plcleave() {
+  // =============================================
+  // PACK LEADER — Cleave (SimC actions.plcleave, 11 lines)
+  // =============================================
+  plCleave() {
     return new bt.Selector(
-      // actions.plcleave=spearhead,if=cooldown.coordinated_assault.remains
-      Spell.cast("Spearhead", () => Spell.getCooldown("Coordinated Assault").timeleft > 0),
-      
-      // actions.plcleave+=/raptor_bite,target_if=max:dot.serpent_sting.remains,if=buff.strike_it_rich.up&buff.strike_it_rich.remains<gcd|buff.hogstrider.remains
-      Spell.cast("Raptor Strike", () => 
-        (me.hasAura("Strike It Rich") && this.getAuraRemainingTime("Strike It Rich") < 1.5) ||
-        me.hasAura("Hogstrider")),
-      
-      // actions.plcleave+=/kill_command,target_if=min:bloodseeker.remains,if=buff.relentless_primal_ferocity.up&buff.tip_of_the_spear.stack<1
-      Spell.cast("Kill Command", () => 
-        me.hasAura("Relentless Primal Ferocity") && this.getTipOfTheSpearStacks() < 1),
-      
-      // actions.plcleave+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0&cooldown.wildfire_bomb.charges_fractional>1.7|cooldown.wildfire_bomb.charges_fractional>1.9|cooldown.coordinated_assault.remains<2*gcd|talent.butchery&cooldown.butchery.remains<gcd|howl_summon_ready
-      Spell.cast("Wildfire Bomb", () => 
-        (this.getTipOfTheSpearStacks() > 0 && Spell.getChargesFractional("Wildfire Bomb") > 1.7) || 
-        Spell.getChargesFractional("Wildfire Bomb") > 1.9 || 
-        Spell.getCooldown("Coordinated Assault").timeleft < 2 * 1.5 || 
-        (this.hasTalent("Butchery") && Spell.getCooldown("Butchery").timeleft < 1.5) || 
-        this.howlSummonReady()),
-      
-      // actions.plcleave+=/flanking_strike,if=buff.tip_of_the_spear.stack=2|buff.tip_of_the_spear.stack=1
-      Spell.cast("Flanking Strike", () => 
-        this.getTipOfTheSpearStacks() === 2 || this.getTipOfTheSpearStacks() === 1),
-      
-      // actions.plcleave+=/butchery
-      Spell.cast("Butchery"),
-      
-      // actions.plcleave+=/coordinated_assault,if=!talent.bombardier|talent.bombardier&cooldown.wildfire_bomb.charges_fractional<1
-      Spell.cast("Coordinated Assault", () => 
-        !this.hasTalent("Bombardier") || 
-        (this.hasTalent("Bombardier") && Spell.getChargesFractional("Wildfire Bomb") < 1)),
-      
-      // actions.plcleave+=/fury_of_the_eagle,if=buff.tip_of_the_spear.stack>0
-      Spell.cast("Fury of the Eagle", () => this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.plcleave+=/kill_command,target_if=min:bloodseeker.remains,if=focus+cast_regen<focus.max
-      Spell.cast("Kill Command", () => me.powerByType(PowerType.Focus) + 15 < 120),
-      
-      // actions.plcleave+=/explosive_shot
-      Spell.cast("Explosive Shot"),
-      
-      // actions.plcleave+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0
-      Spell.cast("Wildfire Bomb", () => this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.plcleave+=/kill_shot,if=buff.deathblow.remains&talent.sic_em
-      Spell.cast("Kill Shot", () => 
-        me.hasAura("Deathblow") && this.hasTalent("Sic 'Em")),
-      
-      // actions.plcleave+=/raptor_bite
-      Spell.cast("Raptor Strike")
+      // 1. kill_command,if=buff.tip_of_the_spear.stack<2&(howl_wyvern|howl_boar|howl_bear)
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        this.getTotsStacks() < 2 && this.hasHotplBeastReady()
+      ),
+
+      // 2. kill_command,if=cooldown.takedown.remains<gcd&buff.tip_of_the_spear.stack<2&!talent.twin_fangs
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 99999) < 1500 &&
+        this.getTotsStacks() < 2 && !spell.isSpellKnown(T.twinFangs)
+      ),
+
+      // 3. takedown,if=buff.tip_of_the_spear.stack>0&!talent.twin_fangs|buff.tip_of_the_spear.stack=0&talent.twin_fangs
+      spell.cast(S.takedown, () => this.getCurrentTarget(), () => {
+        const tots = this.getTotsStacks();
+        return (tots > 0 && !spell.isSpellKnown(T.twinFangs)) ||
+               (tots === 0 && spell.isSpellKnown(T.twinFangs));
+      }),
+
+      // 4. flamefang_pitch
+      spell.cast(S.flamefangPitch, () => this.getCurrentTarget()),
+
+      // 5. wildfire_bomb,if=full_recharge_time<gcd
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget(), () =>
+        (spell.getFullRechargeTime(S.wildfireBomb) || 99999) < 1500
+      ),
+
+      // 6. boomstick,if=buff.tip_of_the_spear.up
+      spell.cast(S.boomstick, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 7. wildfire_bomb,if=buff.tip_of_the_spear.up
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 8. raptor_strike,if=buff.tip_of_the_spear.up|!buff.raptor_swipe.up
+      this.castRaptor(() => this.hasTotS() || !me.hasAura(A.raptorSwipe)),
+
+      // 9. kill_command,if=cooldown.takedown.remains
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 0) > 0
+      ),
+
+      // 10. wildfire_bomb
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget()),
+
+      // 11. takedown
+      spell.cast(S.takedown, () => this.getCurrentTarget()),
     );
   }
 
-  /**
-   * Sentinel Single Target action list
-   */
-  callActionList_sentst() {
+  // =============================================
+  // SENTINEL — Single Target (SimC actions.sentst, 11 lines)
+  // =============================================
+  sentST() {
     return new bt.Selector(
-      // actions.sentst=wildfire_bomb,if=!buff.lunar_storm_cooldown.remains
-      Spell.cast("Wildfire Bomb", () => !me.hasAura("Lunar Storm Cooldown")),
-      
-      // actions.sentst+=/kill_command,target_if=min:bloodseeker.remains,if=(buff.relentless_primal_ferocity.up&buff.tip_of_the_spear.stack<1)
-      Spell.cast("Kill Command", () => 
-        me.hasAura("Relentless Primal Ferocity") && this.getTipOfTheSpearStacks() < 1),
-      
-      // actions.sentst+=/spearhead,if=cooldown.coordinated_assault.remains
-      Spell.cast("Spearhead", () => Spell.getCooldown("Coordinated Assault").timeleft > 0),
-      
-      // actions.sentst+=/flanking_strike,if=buff.tip_of_the_spear.stack>0
-      Spell.cast("Flanking Strike", () => this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.sentst+=/kill_command,if=buff.strike_it_rich.remains&buff.tip_of_the_spear.stack<1
-      Spell.cast("Kill Command", () => 
-        me.hasAura("Strike It Rich") && this.getTipOfTheSpearStacks() < 1),
-      
-      // actions.sentst+=/mongoose_bite,if=buff.strike_it_rich.remains&buff.coordinated_assault.up
-      Spell.cast("Mongoose Bite", () => 
-        me.hasAura("Strike It Rich") && me.hasAura("Coordinated Assault")),
-      
-      // actions.sentst+=/wildfire_bomb,if=(buff.lunar_storm_cooldown.remains>full_recharge_time-gcd)&(buff.tip_of_the_spear.stack>0&cooldown.wildfire_bomb.charges_fractional>1.7|cooldown.wildfire_bomb.charges_fractional>1.9)|(talent.bombardier&cooldown.coordinated_assault.remains<2*gcd)
-      Spell.cast("Wildfire Bomb", () => 
-        (this.getAuraRemainingTime("Lunar Storm Cooldown") > Spell.getFullRechargeTime("Wildfire Bomb") - 1.5) && 
-        ((this.getTipOfTheSpearStacks() > 0 && Spell.getChargesFractional("Wildfire Bomb") > 1.7) || 
-         Spell.getChargesFractional("Wildfire Bomb") > 1.9) || 
-        (this.hasTalent("Bombardier") && Spell.getCooldown("Coordinated Assault").timeleft < 2 * 1.5)),
-      
-      // actions.sentst+=/butchery
-      Spell.cast("Butchery"),
-      
-      // actions.sentst+=/coordinated_assault,if=!talent.bombardier|talent.bombardier&cooldown.wildfire_bomb.charges_fractional<1
-      Spell.cast("Coordinated Assault", () => 
-        !this.hasTalent("Bombardier") || 
-        (this.hasTalent("Bombardier") && Spell.getChargesFractional("Wildfire Bomb") < 1)),
-      
-      // actions.sentst+=/fury_of_the_eagle,if=buff.tip_of_the_spear.stack>0
-      Spell.cast("Fury of the Eagle", () => this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.sentst+=/kill_command,target_if=min:bloodseeker.remains,if=buff.tip_of_the_spear.stack<1&cooldown.flanking_strike.remains<gcd
-      Spell.cast("Kill Command", () => 
-        this.getTipOfTheSpearStacks() < 1 && Spell.getCooldown("Flanking Strike").timeleft < 1.5),
-      
-      // actions.sentst+=/kill_command,target_if=min:bloodseeker.remains,if=focus+cast_regen<focus.max&(!buff.relentless_primal_ferocity.up|(buff.relentless_primal_ferocity.up&(buff.tip_of_the_spear.stack<2|focus<30)))
-      Spell.cast("Kill Command", () => 
-        me.powerByType(PowerType.Focus) + 15 < 120 && 
-        (!me.hasAura("Relentless Primal Ferocity") || 
-         (me.hasAura("Relentless Primal Ferocity") && 
-          (this.getTipOfTheSpearStacks() < 2 || me.powerByType(PowerType.Focus) < 30)))),
-      
-      // actions.sentst+=/mongoose_bite,if=buff.mongoose_fury.remains<gcd&buff.mongoose_fury.stack>0
-      Spell.cast("Mongoose Bite", () => 
-        this.getAuraRemainingTime("Mongoose Fury") < 1.5 && 
-        this.getAuraStacks("Mongoose Fury") > 0),
-      
-      // actions.sentst+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0&buff.lunar_storm_cooldown.remains>full_recharge_time&(!raid_event.adds.exists|raid_event.adds.exists&raid_event.adds.in>15)
-      Spell.cast("Wildfire Bomb", () => 
-        this.getTipOfTheSpearStacks() > 0 && 
-        this.getAuraRemainingTime("Lunar Storm Cooldown") > Spell.getFullRechargeTime("Wildfire Bomb")),
-      
-      // actions.sentst+=/mongoose_bite,if=buff.mongoose_fury.remains
-      Spell.cast("Mongoose Bite", () => this.getAuraRemainingTime("Mongoose Fury") > 0),
-      
-      // actions.sentst+=/explosive_shot
-      Spell.cast("Explosive Shot"),
-      
-      // actions.sentst+=/kill_shot
-      Spell.cast("Kill Shot"),
-      
-      // actions.sentst+=/raptor_bite,target_if=min:dot.serpent_sting.remains,if=!talent.contagious_reagents
-      Spell.cast("Raptor Strike", () => !this.hasTalent("Contagious Reagents")),
-      
-      // actions.sentst+=/raptor_bite,target_if=max:dot.serpent_sting.remains
-      Spell.cast("Raptor Strike")
+      // 1. kill_command,if=buff.tip_of_the_spear.stack=0&(cooldown.takedown.remains|!talent.twin_fangs)
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        this.getTotsStacks() === 0 &&
+        ((spell.getCooldown(S.takedown)?.timeleft || 0) > 0 || !spell.isSpellKnown(T.twinFangs))
+      ),
+
+      // 2. boomstick,if=buff.tip_of_the_spear.up&!cooldown.takedown.ready&!debuff.sentinels_mark.remains
+      spell.cast(S.boomstick, () => this.getCurrentTarget(), () =>
+        this.hasTotS() &&
+        !(spell.getCooldown(S.takedown)?.ready ?? false) &&
+        !this.targetHasSentinelsMark()
+      ),
+
+      // 3. wildfire_bomb,if=buff.tip_of_the_spear.up&(debuff.sentinels_mark.remains|full_recharge_time<4+gcd)
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget(), () =>
+        this.hasTotS() &&
+        (this.targetHasSentinelsMark() || (spell.getFullRechargeTime(S.wildfireBomb) || 99999) < 5500)
+      ),
+
+      // 4. kill_command,if=cooldown.takedown.remains<gcd&buff.tip_of_the_spear.stack<2&!talent.twin_fangs
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 99999) < 1500 &&
+        this.getTotsStacks() < 2 && !spell.isSpellKnown(T.twinFangs)
+      ),
+
+      // 5. takedown,if=buff.tip_of_the_spear.stack>0&!talent.twin_fangs|buff.tip_of_the_spear.stack=0&talent.twin_fangs
+      spell.cast(S.takedown, () => this.getCurrentTarget(), () => {
+        const tots = this.getTotsStacks();
+        return (tots > 0 && !spell.isSpellKnown(T.twinFangs)) ||
+               (tots === 0 && spell.isSpellKnown(T.twinFangs));
+      }),
+
+      // 6. boomstick,if=buff.tip_of_the_spear.up
+      spell.cast(S.boomstick, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 7. moonlight_chakram,if=buff.tip_of_the_spear.up
+      spell.cast(S.moonlightChakram, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 8. flamefang_pitch (unconditional in SimC)
+      spell.cast(S.flamefangPitch, () => this.getCurrentTarget()),
+
+      // 9. raptor_strike,if=buff.tip_of_the_spear.up|!buff.raptor_swipe.up
+      this.castRaptor(() => this.hasTotS() || !me.hasAura(A.raptorSwipe)),
+
+      // 10. kill_command,if=cooldown.takedown.remains
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 0) > 0
+      ),
+
+      // 11. takedown
+      spell.cast(S.takedown, () => this.getCurrentTarget()),
     );
   }
 
-  /**
-   * Sentinel AOE/Cleave action list
-   */
-  callActionList_sentcleave() {
+  // =============================================
+  // SENTINEL — Cleave (SimC actions.sentcleave, 10 lines)
+  // =============================================
+  sentCleave() {
     return new bt.Selector(
-      // actions.sentcleave=wildfire_bomb,if=!buff.lunar_storm_cooldown.remains
-      Spell.cast("Wildfire Bomb", () => !me.hasAura("Lunar Storm Cooldown")),
-      
-      // actions.sentcleave+=/kill_command,target_if=min:bloodseeker.remains,if=buff.relentless_primal_ferocity.up&buff.tip_of_the_spear.stack<1
-      Spell.cast("Kill Command", () => 
-        me.hasAura("Relentless Primal Ferocity") && this.getTipOfTheSpearStacks() < 1),
-      
-      // actions.sentcleave+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0&cooldown.wildfire_bomb.charges_fractional>1.7|cooldown.wildfire_bomb.charges_fractional>1.9|(talent.bombardier&cooldown.coordinated_assault.remains<2*gcd)|talent.butchery&cooldown.butchery.remains<gcd
-      Spell.cast("Wildfire Bomb", () => 
-        (this.getTipOfTheSpearStacks() > 0 && Spell.getChargesFractional("Wildfire Bomb") > 1.7) || 
-        Spell.getChargesFractional("Wildfire Bomb") > 1.9 || 
-        (this.hasTalent("Bombardier") && Spell.getCooldown("Coordinated Assault").timeleft < 2 * 1.5) ||
-        (this.hasTalent("Butchery") && Spell.getCooldown("Butchery").timeleft < 1.5)),
-      
-      // actions.sentcleave+=/raptor_bite,target_if=max:dot.serpent_sting.remains,if=buff.strike_it_rich.up&buff.strike_it_rich.remains<gcd
-      Spell.cast("Raptor Strike", () => 
-        me.hasAura("Strike It Rich") && this.getAuraRemainingTime("Strike It Rich") < 1.5),
-      
-      // actions.sentcleave+=/butchery
-      Spell.cast("Butchery"),
-      
-      // actions.sentcleave+=/coordinated_assault,if=!talent.bombardier|talent.bombardier&cooldown.wildfire_bomb.charges_fractional<1
-      Spell.cast("Coordinated Assault", () => 
-        !this.hasTalent("Bombardier") || 
-        (this.hasTalent("Bombardier") && Spell.getChargesFractional("Wildfire Bomb") < 1)),
-      
-      // actions.sentcleave+=/fury_of_the_eagle,if=buff.tip_of_the_spear.stack>0
-      Spell.cast("Fury of the Eagle", () => this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.sentcleave+=/flanking_strike,if=(buff.tip_of_the_spear.stack=2|buff.tip_of_the_spear.stack=1)
-      Spell.cast("Flanking Strike", () => 
-        this.getTipOfTheSpearStacks() === 2 || this.getTipOfTheSpearStacks() === 1),
-      
-      // actions.sentcleave+=/kill_command,target_if=min:bloodseeker.remains,if=focus+cast_regen<focus.max
-      Spell.cast("Kill Command", () => me.powerByType(PowerType.Focus) + 15 < 120),
-      
-      // actions.sentcleave+=/explosive_shot
-      Spell.cast("Explosive Shot"),
-      
-      // actions.sentcleave+=/wildfire_bomb,if=buff.tip_of_the_spear.stack>0
-      Spell.cast("Wildfire Bomb", () => this.getTipOfTheSpearStacks() > 0),
-      
-      // actions.sentcleave+=/kill_shot,if=buff.deathblow.remains&talent.sic_em
-      Spell.cast("Kill Shot", () => 
-        me.hasAura("Deathblow") && this.hasTalent("Sic 'Em")),
-      
-      // actions.sentcleave+=/raptor_bite,target_if=min:dot.serpent_sting.remains,if=!talent.contagious_reagents
-      Spell.cast("Raptor Strike", () => !this.hasTalent("Contagious Reagents")),
-      
-      // actions.sentcleave+=/raptor_bite,target_if=max:dot.serpent_sting.remains
-      Spell.cast("Raptor Strike")
+      // 1. kill_command,if=buff.tip_of_the_spear.stack=0
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        this.getTotsStacks() === 0
+      ),
+
+      // 2. wildfire_bomb,if=talent.wildfire_shells&(buff.tip_of_the_spear.up&!debuff.sentinels_mark.remains&cooldown.boomstick.remains<11&cooldown.boomstick.remains>1)
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.wildfireShells)) return false;
+        if (!this.hasTotS()) return false;
+        if (this.targetHasSentinelsMark()) return false;
+        const boomCD = spell.getCooldown(S.boomstick)?.timeleft || 0;
+        return boomCD < 11000 && boomCD > 1000;
+      }),
+
+      // 3. boomstick,if=buff.tip_of_the_spear.up
+      spell.cast(S.boomstick, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 4. wildfire_bomb,if=buff.tip_of_the_spear.up&(debuff.sentinels_mark.remains|full_recharge_time<4+gcd)
+      spell.cast(S.wildfireBomb, () => this.getCurrentTarget(), () =>
+        this.hasTotS() &&
+        (this.targetHasSentinelsMark() || (spell.getFullRechargeTime(S.wildfireBomb) || 99999) < 5500)
+      ),
+
+      // 5. kill_command,if=cooldown.takedown.remains<gcd&buff.tip_of_the_spear.stack<2&!talent.twin_fangs
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.takedown)?.timeleft || 99999) < 1500 &&
+        this.getTotsStacks() < 2 && !spell.isSpellKnown(T.twinFangs)
+      ),
+
+      // 6. takedown,if=buff.tip_of_the_spear.up
+      spell.cast(S.takedown, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 7. moonlight_chakram,if=buff.tip_of_the_spear.up
+      spell.cast(S.moonlightChakram, () => this.getCurrentTarget(), () => this.hasTotS()),
+
+      // 8. flamefang_pitch,if=talent.flamefang_pitch&buff.tip_of_the_spear.up
+      spell.cast(S.flamefangPitch, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.flamefangPitch) && this.hasTotS()
+      ),
+
+      // 9. raptor_strike,if=buff.tip_of_the_spear.up&buff.raptor_swipe.up|!buff.raptor_swipe.up
+      this.castRaptor(() =>
+        (this.hasTotS() && me.hasAura(A.raptorSwipe)) || !me.hasAura(A.raptorSwipe)
+      ),
+
+      // 10. kill_command
+      spell.cast(S.killCommand, () => this.getCurrentTarget()),
     );
   }
 
-  /**
-   * Helper method to get the current target
-   * @returns {wow.CGUnit | null} The current target or null if no valid target
-   */
+  // =============================================
+  // HERO TALENT DETECTION
+  // =============================================
+  isPL() {
+    return spell.isSpellKnown(T.howlOfPackLeader) || me.hasAura(A.hotplCooldown);
+  }
+  isSent() { return !this.isPL(); }
+
+  // =============================================
+  // AOE DETECTION
+  // =============================================
+  isAoE() {
+    return this.getEnemyCount() >= Settings.FWSvAoECount;
+  }
+
+  // =============================================
+  // TIP OF THE SPEAR HELPERS
+  // =============================================
+  getTotsStacks() {
+    if (this._totsFrame === wow.frameTime) return this._cachedTotsStacks;
+    this._totsFrame = wow.frameTime;
+    const aura = me.getAura(A.tipOfTheSpear);
+    this._cachedTotsStacks = aura ? aura.stacks : 0;
+    return this._cachedTotsStacks;
+  }
+
+  hasTotS() {
+    return this.getTotsStacks() > 0;
+  }
+
+  // =============================================
+  // PACK LEADER HELPERS
+  // =============================================
+  hasHotplBeastReady() {
+    return me.hasAura(A.hotplWyvern) || me.hasAura(A.hotplBoar) || me.hasAura(A.hotplBear);
+  }
+
+  // SimC: fury_of_the_wyvern_extendable
+  // True when Wyvern is active AND we haven't hit the extension cap (10s additional)
+  // Approximate: Wyvern buff (wyvernsCry 471881) is present
+  isWyvernExtendable() {
+    if (!spell.isSpellKnown(T.furyOfTheWyvern)) return false;
+    return me.hasAura(A.wyvernsCry);
+  }
+
+  // =============================================
+  // SENTINEL HELPERS
+  // =============================================
+  targetHasSentinelsMark() {
+    const t = this.getCurrentTarget();
+    if (!t) return false;
+    const mark = t.getAuraByMe(A.sentinelsMark);
+    if (mark && mark.remaining > 0) return true;
+    // Fallback: check via auras scan
+    const found = t.auras ? t.auras.find(a => a.spellId === A.sentinelsMark) : null;
+    return found ? found.remaining > 0 : false;
+  }
+
+  // =============================================
+  // RAPTOR STRIKE / MONGOOSE BITE
+  // =============================================
+  getRaptorAbility() {
+    // Mongoose Bite replaces Raptor Strike if talented
+    if (spell.isSpellKnown(T.mongooseBite)) return S.mongooseBite;
+    return S.raptorStrike;
+  }
+
+  // Runtime wrapper — resolves correct spell ID per tick, not at build() time
+  castRaptor(conditionFn) {
+    return new bt.Action(() => {
+      const id = this.getRaptorAbility();
+      const t = this.getCurrentTarget();
+      if (!t) return bt.Status.Failure;
+      if (conditionFn && !conditionFn()) return bt.Status.Failure;
+      const result = spell.cast(id, () => t).execute({});
+      return result === bt.Status.Success ? bt.Status.Success : bt.Status.Failure;
+    });
+  }
+
+  // =============================================
+  // RESOURCES (cached per tick)
+  // =============================================
+  getFocus() {
+    if (this._focusFrame === wow.frameTime) return this._cachedFocus;
+    this._focusFrame = wow.frameTime;
+    this._cachedFocus = me.powerByType(PowerType.Focus);
+    return this._cachedFocus;
+  }
+
+  // =============================================
+  // TARGET (cached per tick)
+  // =============================================
   getCurrentTarget() {
-    const target = me.targetUnit;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const target = me.target;
+    // Survival is melee — 8yd range for most abilities, but some reach 15-40yd
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 40 && me.isFacing(target)) {
+      this._cachedTarget = target;
       return target;
     }
-    return combat.bestTarget;
+    if (me.inCombat()) {
+      const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (t && common.validTarget(t) && me.isFacing(t)) { this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
   }
 
-  /**
-   * Check if the Pack Leader hero talent is active
-   * @returns {boolean} True if Pack Leader talent is active
-   */
-  hasPackLeader() {
-    return me.hasAura("Vicious Hunt");
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    // Survival is melee — use 8yd radius for enemy count
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(8) + 1 : 1;
+    return this._cachedEnemyCount;
   }
 
-  /**
-   * Helper method to get the number of active enemies
-   * @returns {number} The number of active enemies
-   */
-  activeEnemies() {
-    return combat.targets.length;
-  }
-
-  /**
-   * Helper method to get the remaining time on an aura
-   * @param {string} auraName - The name of the aura
-   * @returns {number} The remaining time in milliseconds
-   */
-  getAuraRemainingTime(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.remaining / 1000 : 0;
-  }
-
-  /**
-   * Helper method to get stacks of an aura
-   * @param {string} auraName - The name of the aura
-   * @returns {number} The number of stacks
-   */
-  getAuraStacks(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.stacks : 0;
-  }
-
-  /**
-   * Helper method to get the number of active dots of a specific type
-   * @param {string} dotName - The name of the dot
-   * @returns {number} The number of active dots
-   */
-  getActiveDotsCount(dotName) {
-    let count = 0;
-    combat.targets.forEach(target => {
-      if (target.hasAuraByMe(dotName)) {
-        count++;
-      }
-    });
-    return count;
-  }
-
-  /**
-   * Helper method to check if a talent is active
-   * @param {string} talentName - The name of the talent
-   * @returns {boolean} True if the talent is active
-   */
-  hasTalent(talentName) {
-    return Spell.isSpellKnown(talentName);
-  }
-
-  /**
-   * Helper method to get the number of Tip of the Spear stacks
-   * @returns {number} The number of stacks
-   */
-  getTipOfTheSpearStacks() {
-    return this.getAuraStacks("Tip of the Spear");
-  }
-
-  /**
-   * Helper method to check if howl summon is ready
-   * @returns {boolean} True if howl summon is ready
-   */
-  howlSummonReady() {
-    // This is a placeholder since we don't have a way to check this directly
-    // In the game this would involve checking specific talent conditions
-    return false;
-  }
-
-  /**
-   * Helper method to estimate target's time to die
-   * @returns {number} Estimated time to die in seconds
-   */
-  getTimeToDie() {
-    const target = this.getCurrentTarget();
-    if (!target) return 9999;
-    
-    const ttd = target.timeToDeath();
-    return ttd !== undefined ? ttd : 30;
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
   }
 }

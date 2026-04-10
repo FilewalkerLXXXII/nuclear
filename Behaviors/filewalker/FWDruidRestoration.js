@@ -1,2131 +1,1137 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
 import common from '@/Core/Common';
-import spell from "@/Core/Spell";
-import objMgr from "@/Core/ObjectManager";
-import { me } from "@/Core/ObjectManager";
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import { defaultHealTargeting as heal } from "@/Targeting/HealTargeting";
-import { ShapeshiftForm } from "@/Enums/UnitEnums";
-import { DispelPriority } from "@/Data/Dispels";
-import { WoWDispelType } from "@/Enums/Auras";
-import Settings from "@/Core/Settings";
+import { me } from '@/Core/ObjectManager';
+import { defaultHealTargeting as heal } from '@/Targeting/HealTargeting';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
+import { DispelPriority } from '@/Data/Dispels';
+import { WoWDispelType } from '@/Enums/Auras';
 
-const EFFLORESCENCE_RADIUS = 11;
+/**
+ * Restoration Druid Behavior - Midnight 12.0.1
+ * Sources: Method Guide (rotation + talents) + Wowhead (spell data) + Dreamgrove Compendium
+ *
+ * Auto-detects: Keeper of the Grove vs Wildstalker
+ *   KotG: Grove Guardians (102693), Dream Surge, Cenarius' Might — raid-focused throughput
+ *   Wildstalker: Symbiotic Blooms, Strategic Infusion, Bursting Growth — M+/catweave
+ *
+ * Tiered healing: Emergency (<20%) → Critical (<40%) → Urgent (<65%) → Maintenance (<85%) → DPS (>85%)
+ * Major CDs (Tranquility, Incarnation: Tree of Life) OFF by default for raid assignment
+ *
+ * Key mechanics implemented:
+ *  - Mastery: Harmony — more HoTs on target = more healing; maintain 3+ HoTs on tanks
+ *  - Lifebloom: maintain on tank, refresh in last 4.5s for bloom + pandemic
+ *  - Rejuvenation: primary ramp tool, pandemic at 3.6s (30% of 12s)
+ *  - Wild Growth: 7s HoT on 5 targets (7 in ToL), 10s CD
+ *  - Swiftmend: instant heal, 2 charges (15s recharge), spawns Grove Guardian (KotG)
+ *    With Verdant Infusion: extends HoTs by 8s instead of consuming them
+ *  - Efflorescence: ground AoE, 30s duration; with Lifetreading auto-moves to LB target
+ *  - Soul of the Forest: Swiftmend → +60% next Regrowth/Rejuv; Power of the Archdruid spreads to 2 extra
+ *  - Cenarion Ward: 30s CD, procs 8s HoT when target takes damage
+ *  - Nature's Swiftness: instant Regrowth + 60% more healing (48s CD)
+ *  - Incarnation: Tree of Life: +10% healing, instant Regrowth, +40% Rejuv, 30s duration
+ *  - Tranquility: 6s channel, raid heal; Flourish extends all HoTs by 2s per tick
+ *  - Convoke the Spirits: 4s channel, 16 random druid spells (favors form)
+ *  - Innervate: free mana for 8s, 6min CD
+ *  - Ironbark: 20% DR on ally, 90s CD, 12s duration
+ *  - Nature's Cure: dispels Magic, Curse, Poison (8s CD)
+ *  - DPS: Moonfire DoT, Sunfire DoT, Wrath filler
+ *  - Catweave (optional): Cat Form → Rake, Shred, Rip, Ferocious Bite
+ *  - Master Shapeshifter: Wrath generates mana
+ *  - Cast cancellation: cancel DPS casts when healing needed
+ */
 
-// Aura IDs for tracking
-const auras = {
-  rejuvenation: 774,
-  wildGrowth: 48438,
-  regrowth: 8936,
-  lifebloom: 33763,
-  clearcasting: 16870,
-  abundance: 207383,
-  springBlossoms: 207386,
-  cultivation: 200389,
-  cenarionWard: 102352,
-  ironbark: 102342,
-  barkskin: 22812,
-  incarnationTree: 33891,
-  efflorescence: 145205,
-  soulOfTheForest: 114108,
-  photosynthesis: 274902,
-  adaptiveSwarm: 325748,
-  flourish: 197721,
-  overgrowth: 203651,
-  groveGuardian: 400021, // Grove Guardian spell aura ID
-  groveGuardianPet: 400022 // Guardian Pet active aura ID
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'Method + Wowhead + Dreamgrove Compendium — Restoration Druid',
 };
 
-export class DruidRestorationBehavior extends Behavior {
+// Cast spell IDs
+const S = {
+  // Core heals
+  rejuvenation:       774,
+  regrowth:           8936,
+  wildGrowth:         48438,
+  lifebloom:          33763,
+  swiftmend:          18562,
+  efflorescence:      81262,
+  cenarionWard:       102351,
+  nourish:            50464,
+  // Cooldowns
+  tranquility:        740,
+  incarnation:        33891,     // Incarnation: Tree of Life
+  flourish:           197721,    // Now passive on Tranquility — extends HoTs 2s/tick
+  convoke:            391528,    // Convoke the Spirits (all specs)
+  naturesSwiftness:   132158,
+  innervate:          29166,
+  groveGuardians:     102693,    // Talent: summon treant (3 charges, 20s recharge)
+  // Defensives
+  ironbark:           102342,    // Ally external: 20% DR, 12s, 90s CD
+  barkskin:           22812,     // Self: 20% DR, 12s, 60s CD
+  renewal:            108238,    // Self-heal
+  // Dispel
+  naturesCure:        88423,     // Magic + Curse + Poison (8s CD)
+  // DPS
+  moonfire:           8921,
+  sunfire:            93402,
+  wrath:              5176,      // Resto Wrath
+  starfire:           194153,
+  solarBeam:          78675,     // Interrupt (talent)
+  // Forms
+  catForm:            768,
+  bearForm:           5487,
+  moonkinForm:        24858,
+  // Cat abilities (catweave)
+  rake:               1822,
+  shred:              5221,
+  rip:                1079,
+  ferociousBite:      22568,
+  swipeCat:           106785,
+  // Utility
+  markOfTheWild:      1126,
+  stampedingRoar:     106898,
+  // Racials
+  berserking:         26297,
+};
+
+// Aura IDs (may differ from cast IDs)
+const A = {
+  rejuvenation:       774,
+  regrowth:           8936,
+  wildGrowth:         48438,
+  lifebloom:          33763,
+  cenarionWard:       102351,    // Ward buff on target (102352 = the HoT proc)
+  cenarionWardHoT:    102352,    // Active HoT after damage taken
+  efflorescence:      81262,
+  // Buff auras
+  naturesSwiftness:   132158,
+  incarnation:        33891,     // Tree of Life buff
+  soulOfTheForest:    114108,    // Proc from Swiftmend — +60% next Regrowth/Rejuv
+  clearCasting:       16870,     // Omen of Clarity — free Regrowth
+  abundanceBuff:      207640,    // Per-Rejuv stacking crit bonus
+  // Debuff auras
+  moonfireDebuff:     164812,
+  sunfireDebuff:      164815,
+  // Hero talent detection
+  groveGuardiansKnown: 102693,  // KotG exclusive talent
+  // Defensive
+  ironbark:           102342,
+  barkskin:           22812,
+  // Forms
+  catForm:            768,
+  bearForm:           5487,
+  moonkinForm:        24858,
+  treeOfLife:         33891,
+  // Marks
+  markOfTheWild:      1126,
+  // Rake debuff
+  rakeDebuff:         155722,
+  ripDebuff:          1079,
+};
+
+const MIN_DOT_TTD = 6000;
+
+export class RestorationDruidBehavior extends Behavior {
+  name = 'FW Restoration Druid';
   context = BehaviorContext.Any;
   specialization = Specialization.Druid.Restoration;
   version = wow.GameVersion.Retail;
-  name = "FW Resto Druid"
 
-  // Variables for tracking rotation state
-  _variables = {};
-  lastTravelFormAttempt = 0;
+  // Per-tick caches
+  _healFrame = 0;
+  _cachedLowest = null;
+  _cachedLowestHP = 100;
+  _cachedTankLowest = null;
+  _cachedTankLowestHP = 100;
+  _cachedBelow20 = 0;
+  _cachedBelow40 = 0;
+  _cachedBelow65 = 0;
+  _cachedBelow85 = 0;
+  _dpsTargetFrame = 0;
+  _cachedDpsTarget = null;
+  _manaFrame = 0;
+  _cachedMana = 100;
+  _lbTargetFrame = 0;
+  _cachedLBTarget = null;
+  _rejuvTargetFrame = 0;
+  _cachedRejuvTargets = {};
+  _wgTargetFrame = 0;
+  _cachedWGTarget = null;
+  _versionLogged = false;
+  _lastDebug = 0;
+  _efflFrame = 0;
+  _cachedEfflActive = false;
 
-  // Settings configuration for UI
   static settings = [
     {
-      header: "Build Selection",
+      header: 'Healing Thresholds',
       options: [
-        {
-          type: "dropdown",
-          uid: "DruidRestoBuildType",
-          text: "Build Type",
-          values: ["Raid Healing", "Mythic+ Healing", "Tank Healing", "PvP Healing"],
-          default: "Raid Healing"
-        }
-      ]
+        { type: 'slider', uid: 'FWRdEmergencyHP', text: 'Emergency HP %', default: 20, min: 5, max: 40 },
+        { type: 'slider', uid: 'FWRdCriticalHP', text: 'Critical HP %', default: 40, min: 15, max: 60 },
+        { type: 'slider', uid: 'FWRdUrgentHP', text: 'Urgent HP %', default: 65, min: 30, max: 80 },
+        { type: 'slider', uid: 'FWRdMaintenanceHP', text: 'Maintenance HP %', default: 85, min: 50, max: 95 },
+        { type: 'slider', uid: 'FWRdDpsThreshold', text: 'DPS when all above %', default: 85, min: 70, max: 100 },
+      ],
     },
     {
-      header: "Single Target Healing",
+      header: 'Major Cooldowns (OFF = manual/raid assignment)',
       options: [
-        {
-          type: "slider",
-          uid: "DruidRestoRejuvenationPercent",
-          text: "Rejuvenation Threshold",
-          min: 0,
-          max: 100,
-          default: 90
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoRegrowthPercent",
-          text: "Regrowth Threshold",
-          min: 0,
-          max: 100,
-          default: 75
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoSwiftmendPercent",
-          text: "Swiftmend Threshold",
-          min: 0,
-          max: 100,
-          default: 65
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoPanicThreshold",
-          text: "Emergency Healing Threshold",
-          min: 0,
-          max: 100,
-          default: 30
-        }
-      ]
+        { type: 'checkbox', uid: 'FWRdUseTranq', text: 'Auto Tranquility', default: false },
+        { type: 'slider', uid: 'FWRdTranqHP', text: 'Tranquility avg HP %', default: 40, min: 15, max: 60 },
+        { type: 'slider', uid: 'FWRdTranqCount', text: 'Tranquility min targets', default: 3, min: 1, max: 5 },
+        { type: 'checkbox', uid: 'FWRdUseIncarn', text: 'Auto Tree of Life', default: false },
+        { type: 'checkbox', uid: 'FWRdUseConvoke', text: 'Auto Convoke the Spirits', default: false },
+        { type: 'checkbox', uid: 'FWRdUseInnervate', text: 'Auto Innervate (self)', default: true },
+        { type: 'slider', uid: 'FWRdInnervateMana', text: 'Innervate below mana %', default: 50, min: 10, max: 80 },
+      ],
     },
     {
-      header: "AoE Healing",
+      header: 'Externals & Defensives',
       options: [
-        {
-          type: "slider",
-          uid: "DruidRestoWildGrowthMinTargets",
-          text: "Wild Growth Minimum Targets",
-          min: 1,
-          max: 10,
-          default: 3
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoWildGrowthPercent",
-          text: "Wild Growth Health Threshold",
-          min: 0,
-          max: 100,
-          default: 85
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoEfflorescenceMinTargets",
-          text: "Efflorescence Minimum Targets",
-          min: 1,
-          max: 10,
-          default: 3
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoEfflorescencePercent",
-          text: "Efflorescence Health Threshold",
-          min: 0,
-          max: 100,
-          default: 90
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoTransquilityMinTargets",
-          text: "Tranquility Minimum Targets",
-          min: 1,
-          max: 10,
-          default: 5
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoTransquilityPercent",
-          text: "Tranquility Health Threshold",
-          min: 0,
-          max: 100,
-          default: 60
-        }
-      ]
+        { type: 'checkbox', uid: 'FWRdUseIronbark', text: 'Auto Ironbark', default: true },
+        { type: 'slider', uid: 'FWRdIronbarkHP', text: 'Ironbark HP %', default: 30, min: 10, max: 50 },
+        { type: 'checkbox', uid: 'FWRdUseBarkskin', text: 'Use Barkskin', default: true },
+        { type: 'slider', uid: 'FWRdBarkskinHP', text: 'Barkskin HP %', default: 50, min: 10, max: 80 },
+      ],
     },
     {
-      header: "HoT Management",
+      header: 'DPS',
       options: [
-        {
-          type: "slider",
-          uid: "DruidRestoMaxRejuvenationTargets",
-          text: "Maximum Rejuvenation Targets",
-          min: 1,
-          max: 20,
-          default: 8
-        },
-        {
-          type: "checkbox", 
-          uid: "DruidRestoScaleRejuvWithRaidSize",
-          text: "Scale Max Rejuvenation with Raid Size",
-          default: true
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoIncreasedRejuvWithAbundance",
-          text: "Increase Max Rejuvenation with Abundance",
-          default: true
-        }
-      ]
+        { type: 'checkbox', uid: 'FWRdDPS', text: 'DPS when idle', default: true },
+        { type: 'checkbox', uid: 'FWRdCatweave', text: 'Catweave DPS', default: false },
+      ],
     },
     {
-      header: "Tank Healing",
+      header: 'Debug',
       options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoPrioritizeTanks",
-          text: "Prioritize Keeping HoTs on Tanks",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoIronbarkThreshold",
-          text: "Ironbark Health Threshold",
-          min: 0,
-          max: 100,
-          default: 40
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoCenarionWardThreshold",
-          text: "Cenarion Ward Health Threshold",
-          min: 0,
-          max: 100,
-          default: 90
-        }
-      ]
+        { type: 'checkbox', uid: 'FWRdDebug', text: 'Debug Logging', default: false },
+      ],
     },
-    {
-      header: "Cooldown Management",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseFlourish",
-          text: "Use Flourish",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoFlourishMinHoTs",
-          text: "Flourish Minimum HoTs Active",
-          min: 1,
-          max: 15,
-          default: 6
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseTreeOfLife",
-          text: "Use Incarnation: Tree of Life",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoTreeOfLifeMinTargets",
-          text: "Tree of Life Minimum Injured Targets",
-          min: 1,
-          max: 10,
-          default: 4
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseConvoke",
-          text: "Use Convoke the Spirits",
-          default: true
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseAdaptiveSwarm",
-          text: "Use Adaptive Swarm",
-          default: true
-        }
-      ]
-    },
-    {
-      header: "Grove Guardian Settings",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseGroveGuardian",
-          text: "Use Grove Guardian",
-          default: true
-        },
-        {
-          type: "dropdown",
-          uid: "DruidRestoGroveGuardianMode",
-          text: "Grove Guardian Mode",
-          values: ["Auto", "Healing Priority", "DPS Priority"],
-          default: "Auto"
-        }
-      ]
-    },
-    {
-      header: "Defensive Cooldowns",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseBarkskin",
-          text: "Use Barkskin",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoBarkskinThreshold",
-          text: "Barkskin Health Threshold",
-          min: 0,
-          max: 100,
-          default: 60
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseRenewal",
-          text: "Use Renewal",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoRenewalThreshold",
-          text: "Renewal Health Threshold",
-          min: 0,
-          max: 100,
-          default: 50
-        }
-      ]
-    },
-    {
-      header: "Dispel Settings",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseNaturesCure",
-          text: "Use Nature's Cure",
-          default: true
-        },
-        {
-          type: "dropdown",
-          uid: "DruidRestoDispelPriority",
-          text: "Dispel Priority",
-          values: ["Low", "Medium", "High"],
-          default: "Medium"
-        }
-      ]
-    },
-    {
-      header: "Movement and Forms",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseTravelForm",
-          text: "Use Travel Form",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoTravelFormCooldown",
-          text: "Travel Form Check Cooldown (seconds)",
-          min: 1,
-          max: 10,
-          default: 3
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoTravelFormMinDistance",
-          text: "Minimum Distance for Travel Form",
-          min: 10,
-          max: 100,
-          default: 30
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseCatFormOOC",
-          text: "Use Cat Form Out of Combat",
-          default: false
-        }
-      ]
-    },
-    {
-      header: "DPS Settings",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoEnableDPS",
-          text: "Enable DPS During Downtime",
-          default: true
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoUseSunfire",
-          text: "Use Sunfire",
-          default: true
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoSunfireRefreshThreshold",
-          text: "Sunfire Refresh Threshold (seconds)",
-          min: 1,
-          max: 10,
-          default: 4
-        },
-        {
-          type: "slider",
-          uid: "DruidRestoMoonfireRefreshThreshold",
-          text: "Moonfire Refresh Threshold (seconds)",
-          min: 1,
-          max: 10,
-          default: 4
-        }
-      ]
-    },
-    {
-      header: "Talent Detection",
-      options: [
-        {
-          type: "checkbox",
-          uid: "DruidRestoManualTalentConfig",
-          text: "Manually Configure Talents",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentPhotosynthesis",
-          text: "Photosynthesis",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentCenarionWard",
-          text: "Cenarion Ward",
-          default: true
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentCultivation",
-          text: "Cultivation",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentGroveGuardian",
-          text: "Grove Guardian",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentFlourish",
-          text: "Flourish",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentTreeOfLife",
-          text: "Incarnation: Tree of Life",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentAdaptiveSwarm",
-          text: "Adaptive Swarm",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentConvoke",
-          text: "Convoke the Spirits",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentSoulOfTheForest",
-          text: "Soul of the Forest",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentSpringBlossoms",
-          text: "Spring Blossoms",
-          default: true
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentAbundance",
-          text: "Abundance",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentOvergrowth",
-          text: "Overgrowth",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentGroveGuardians",
-          text: "Grove Guardians",
-          default: false
-        },
-        {
-          type: "checkbox",
-          uid: "DruidRestoTalentRenewal",
-          text: "Renewal",
-          default: false
-        }
-      ]
-    }
   ];
-  build() {
-    // Initialize talent detection and variables
-    this.initializeVariables();
-    this.initializeTalents();
-    // Get the selected build type
-    const buildType = Settings.DruidRestoBuildType || "Raid Healing";
-    
-    return new bt.Selector(
-      // These checks should happen regardless of GCD state
-      common.waitForNotSitting(),
-      common.waitForNotMounted(),
-      common.waitForCastOrChannel(),
-      
-      // Add Grove Guardian handling outside of GCD check
-      // This ensures it can be summoned regardless of GCD state
-      
-     
-      // Now add the GCD check for all other abilities
-      new bt.Decorator(
-        
-        ret => !spell.isGlobalCooldown(),
-        //this.handleGroveGuardian(),
-        new bt.Selector(
-          // this.handleFormManagement(),
-          this.handleDefensiveCooldowns(),
-          this.handleEmergencyHealing(),
-          this.handleDispels(),
-          this.handleBuffs(),
-          
-          // Major cooldowns that aren't Grove Guardian
-          this.handleMajorCooldowns(),
-          
-          // Adapt rotation based on build type
-          buildType === "Raid Healing" ? this.raidHealingRotation() :
-          buildType === "Mythic+ Healing" ? this.mythicPlusRotation() :
-          buildType === "Tank Healing" ? this.tankHealingRotation() :
-          buildType === "PvP Healing" ? this.pvpHealingRotation() :
-          this.generalHealingRotation(),
-          
-          // Fallback to DPS if no healing needed
-          this.handleDamageDealing()
-        )
-      )
-    );
+
+  // ===== Hero Talent Detection =====
+  isKeeperOfTheGrove() {
+    return spell.isSpellKnown(S.groveGuardians);
   }
-  
-  /******************************************
-   * Talent and Variable Management
-   ******************************************/
-  
-  initializeTalents() {
-    this.talents = {
-      hasAbundance: false,
-      hasPhotosynthesis: false,
-      hasCenarionWard: false,
-      hasFlourish: false,
-      hasEfflorescence: false,
-      hasRenewal: false,
-      hasAdaptiveSwarm: false,
-      hasConvoke: false,
-      hasSoulOfTheForest: false,
-      hasTreeOfLife: false,
-      hasSpringBlossoms: false,
-      hasOvergrowth: false,
-      hasCultivation: false,
-      hasGroveGuardian: false
+
+  isWildstalker() {
+    return !this.isKeeperOfTheGrove();
+  }
+
+  // ===== Per-Tick Caching =====
+  _refreshHealCache() {
+    if (this._healFrame === wow.frameTime) return;
+    this._healFrame = wow.frameTime;
+
+    let lowest = null;
+    let lowestHP = 100;
+    let tankLowest = null;
+    let tankLowestHP = 100;
+    let below20 = 0;
+    let below40 = 0;
+    let below65 = 0;
+    let below85 = 0;
+    let selfCounted = false;
+
+    const friends = heal.friends.All;
+    for (let i = 0; i < friends.length; i++) {
+      const unit = friends[i];
+      if (!unit || unit.deadOrGhost || me.distanceTo(unit) > 40) continue;
+      if (unit.guid && unit.guid.equals && unit.guid.equals(me.guid)) selfCounted = true;
+      const hp = unit.effectiveHealthPercent;
+      if (hp < lowestHP) { lowestHP = hp; lowest = unit; }
+      if (hp <= 20) below20++;
+      if (hp <= 40) below40++;
+      if (hp <= 65) below65++;
+      if (hp <= 85) below85++;
+    }
+
+    if (!selfCounted) {
+      const selfHP = me.effectiveHealthPercent;
+      if (selfHP < lowestHP) { lowestHP = selfHP; lowest = me; }
+      if (selfHP <= 20) below20++;
+      if (selfHP <= 40) below40++;
+      if (selfHP <= 65) below65++;
+      if (selfHP <= 85) below85++;
+    }
+
+    const tanks = heal.friends.Tanks;
+    for (let i = 0; i < tanks.length; i++) {
+      const unit = tanks[i];
+      if (!unit || unit.deadOrGhost || me.distanceTo(unit) > 40) continue;
+      const hp = unit.effectiveHealthPercent;
+      if (hp < tankLowestHP) { tankLowestHP = hp; tankLowest = unit; }
+    }
+
+    this._cachedLowest = lowest;
+    this._cachedLowestHP = lowestHP;
+    this._cachedTankLowest = tankLowest;
+    this._cachedTankLowestHP = tankLowestHP;
+    this._cachedBelow20 = below20;
+    this._cachedBelow40 = below40;
+    this._cachedBelow65 = below65;
+    this._cachedBelow85 = below85;
+
+    // Invalidate dependent caches
+    this._rejuvTargetFrame = 0;
+    this._cachedRejuvTargets = {};
+    this._lbTargetFrame = 0;
+    this._wgTargetFrame = 0;
+  }
+
+  getManaPercent() {
+    if (this._manaFrame === wow.frameTime) return this._cachedMana;
+    this._manaFrame = wow.frameTime;
+    const max = me.maxPowerByType ? me.maxPowerByType(PowerType.Mana) : 1;
+    this._cachedMana = max > 0 ? (me.powerByType(PowerType.Mana) / max) * 100 : 100;
+    return this._cachedMana;
+  }
+
+  // ===== Target Helpers =====
+  getHealTarget(maxHP) {
+    this._refreshHealCache();
+    if (this._cachedLowestHP <= maxHP) return this._cachedLowest;
+    return null;
+  }
+
+  getTankTarget(maxHP) {
+    this._refreshHealCache();
+    if (this._cachedTankLowestHP <= maxHP) return this._cachedTankLowest;
+    return null;
+  }
+
+  getFriendsBelow(hp) {
+    this._refreshHealCache();
+    if (hp <= 20) return this._cachedBelow20;
+    if (hp <= 40) return this._cachedBelow40;
+    if (hp <= 65) return this._cachedBelow65;
+    if (hp <= 85) return this._cachedBelow85;
+    let count = 0;
+    const friends = heal.friends.All;
+    for (let i = 0; i < friends.length; i++) {
+      const unit = friends[i];
+      if (unit && !unit.deadOrGhost && me.distanceTo(unit) <= 40 &&
+          unit.effectiveHealthPercent <= hp) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  // Lifebloom tank target — maintain on tank, pandemic refresh at < 4.5s (30% of 15s)
+  getLifebloomTarget() {
+    if (this._lbTargetFrame === wow.frameTime) return this._cachedLBTarget;
+    this._lbTargetFrame = wow.frameTime;
+
+    if (spell.getTimeSinceLastCast(S.lifebloom) < 2000) {
+      this._cachedLBTarget = null;
+      return null;
+    }
+
+    const tanks = heal.friends.Tanks;
+    let result = null;
+    for (let i = 0; i < tanks.length; i++) {
+      const tank = tanks[i];
+      if (!tank || tank.deadOrGhost || me.distanceTo(tank) > 40) continue;
+      const lbAura = tank.getAuraByMe(A.lifebloom);
+      if (!lbAura || lbAura.remaining < 4500) {
+        result = tank;
+        break;
+      }
+    }
+    // If no tank needs LB, check if any tank has it at all
+    if (!result) {
+      for (let i = 0; i < tanks.length; i++) {
+        const tank = tanks[i];
+        if (!tank || tank.deadOrGhost || me.distanceTo(tank) > 40) continue;
+        const lbAura = tank.getAuraByMe(A.lifebloom);
+        if (!lbAura) {
+          result = tank;
+          break;
+        }
+      }
+    }
+    // Fallback: if no tanks, maintain on lowest
+    if (!result && tanks.length === 0) {
+      this._refreshHealCache();
+      if (this._cachedLowest) {
+        const lbAura = this._cachedLowest.getAuraByMe(A.lifebloom);
+        if (!lbAura || lbAura.remaining < 4500) {
+          result = this._cachedLowest;
+        }
+      }
+    }
+    this._cachedLBTarget = result;
+    return result;
+  }
+
+  // Rejuvenation target — prioritize tanks without Rejuv, then lowest HP without Rejuv
+  // Pandemic: refresh at < 3.6s (30% of 12s)
+  getRejuvTarget(maxHP) {
+    this._refreshHealCache();
+    const key = maxHP;
+    if (this._rejuvTargetFrame === wow.frameTime && key in this._cachedRejuvTargets) {
+      return this._cachedRejuvTargets[key];
+    }
+    this._rejuvTargetFrame = wow.frameTime;
+
+    let result = null;
+    // Tanks first (healed at higher threshold)
+    const tanks = heal.friends.Tanks;
+    for (let i = 0; i < tanks.length; i++) {
+      const tank = tanks[i];
+      if (tank && !tank.deadOrGhost && me.distanceTo(tank) <= 40 &&
+          tank.effectiveHealthPercent <= Math.min(maxHP + 10, 95)) {
+        const rejuvAura = tank.getAuraByMe(A.rejuvenation);
+        if (!rejuvAura || rejuvAura.remaining < 3600) { result = tank; break; }
+      }
+    }
+    // Then lowest friend needing Rejuv
+    if (!result) {
+      const friends = heal.friends.All;
+      for (let i = 0; i < friends.length; i++) {
+        const unit = friends[i];
+        if (unit && !unit.deadOrGhost && me.distanceTo(unit) <= 40 &&
+            unit.effectiveHealthPercent <= maxHP) {
+          const rejuvAura = unit.getAuraByMe(A.rejuvenation);
+          if (!rejuvAura || rejuvAura.remaining < 3600) { result = unit; break; }
+        }
+      }
+    }
+    this._cachedRejuvTargets[key] = result;
+    return result;
+  }
+
+  // Wild Growth target — best cluster of injured allies
+  getWildGrowthTarget(maxHP) {
+    if (this._wgTargetFrame === wow.frameTime) return this._cachedWGTarget;
+    this._wgTargetFrame = wow.frameTime;
+
+    let best = null;
+    let bestCount = 0;
+    const friends = heal.friends.All;
+    for (let i = 0; i < friends.length; i++) {
+      const unit = friends[i];
+      if (!unit || unit.deadOrGhost || me.distanceTo(unit) > 40) continue;
+      if (unit.effectiveHealthPercent > maxHP) continue;
+      let count = 0;
+      for (let j = 0; j < friends.length; j++) {
+        const ally = friends[j];
+        if (ally && !ally.deadOrGhost && ally.effectiveHealthPercent <= maxHP &&
+            unit.distanceTo(ally) <= 30) {
+          count++;
+        }
+      }
+      if (count > bestCount) { bestCount = count; best = unit; }
+    }
+    this._cachedWGTarget = (bestCount >= 2) ? best : null;
+    return this._cachedWGTarget;
+  }
+
+  // Swiftmend target — needs a HoT on them (Rejuv, Regrowth, or WG)
+  getSwiftmendTarget(maxHP) {
+    const friends = heal.friends.All;
+    for (let i = 0; i < friends.length; i++) {
+      const unit = friends[i];
+      if (!unit || unit.deadOrGhost || me.distanceTo(unit) > 40) continue;
+      if (unit.effectiveHealthPercent > maxHP) continue;
+      // Swiftmend requires a HoT present (unless using Verdant Infusion which extends)
+      if (unit.getAuraByMe(A.rejuvenation) || unit.getAuraByMe(A.regrowth) ||
+          unit.getAuraByMe(A.wildGrowth)) {
+        return unit;
+      }
+    }
+    return null;
+  }
+
+  // Cenarion Ward target — put on tank or lowest (if they don't have it)
+  getCenarionWardTarget() {
+    if (spell.getTimeSinceLastCast(S.cenarionWard) < 3000) return null;
+    const tanks = heal.friends.Tanks;
+    for (let i = 0; i < tanks.length; i++) {
+      const tank = tanks[i];
+      if (tank && !tank.deadOrGhost && me.distanceTo(tank) <= 40) {
+        const cwAura = tank.getAura(A.cenarionWard);
+        const cwHot = tank.getAura(A.cenarionWardHoT);
+        if (!cwAura && !cwHot) return tank;
+      }
+    }
+    return null;
+  }
+
+  getDpsTarget() {
+    if (this._dpsTargetFrame === wow.frameTime) return this._cachedDpsTarget;
+    this._dpsTargetFrame = wow.frameTime;
+    const target = me.target;
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 40) {
+      this._cachedDpsTarget = target;
+      return target;
+    }
+    this._cachedDpsTarget = (combat.bestTarget) || (combat.targets && combat.targets[0]) || null;
+    return this._cachedDpsTarget;
+  }
+
+  // ===== Mana Management =====
+  hasManaFor(spellType) {
+    const mana = this.getManaPercent();
+    if (mana < 8) return false;
+    if (mana < 20 && spellType === 'wildGrowth') return false;
+    if (mana < 15 && spellType === 'rejuv') return false;
+    return true;
+  }
+
+  isLowMana() {
+    return this.getManaPercent() < 35;
+  }
+
+  // ===== Buff Helpers =====
+  hasNaturesSwiftness() {
+    return me.hasAura(A.naturesSwiftness);
+  }
+
+  hasSoulOfTheForest() {
+    return me.hasAura(A.soulOfTheForest);
+  }
+
+  hasClearCasting() {
+    return me.hasAura(A.clearCasting);
+  }
+
+  inTreeOfLife() {
+    return me.hasAura(A.incarnation);
+  }
+
+  // ===== Form Checks =====
+  inCatForm() {
+    return me.hasAura(A.catForm);
+  }
+
+  inBearForm() {
+    return me.hasAura(A.bearForm);
+  }
+
+  needsFormExit() {
+    return this.inCatForm() || this.inBearForm();
+  }
+
+  // ===== Cast Cancellation =====
+  shouldStopCasting() {
+    if (!me.isCastingOrChanneling) return false;
+    const currentCast = me.currentCastOrChannel;
+    if (!currentCast || currentCast.timeleft < 500) return false;
+
+    const castId = currentCast.spellId;
+    const isDamageCast = castId === S.wrath || castId === S.starfire;
+
+    if (isDamageCast && this._cachedLowestHP < Settings.FWRdCriticalHP) return true;
+    return false;
+  }
+
+  // ===== Debuff Helpers =====
+  getDebuffRemaining(target, spellId) {
+    if (!target) return 0;
+    const debuffMap = {
+      [S.moonfire]: A.moonfireDebuff,
+      [S.sunfire]: A.sunfireDebuff,
+      [S.rake]: A.rakeDebuff,
+      [S.rip]: A.ripDebuff,
     };
-    
-    // If manual configuration is enabled, use settings values
-    if (Settings.DruidRestoManualTalentConfig) {
-      this.talents.hasAbundance = Settings.DruidRestoTalentAbundance;
-      this.talents.hasPhotosynthesis = Settings.DruidRestoTalentPhotosynthesis;
-      this.talents.hasCenarionWard = Settings.DruidRestoTalentCenarionWard;
-      this.talents.hasFlourish = Settings.DruidRestoTalentFlourish;
-      this.talents.hasRenewal = Settings.DruidRestoTalentRenewal;
-      this.talents.hasAdaptiveSwarm = Settings.DruidRestoTalentAdaptiveSwarm;
-      this.talents.hasConvoke = Settings.DruidRestoTalentConvoke;
-      this.talents.hasSoulOfTheForest = Settings.DruidRestoTalentSoulOfTheForest;
-      this.talents.hasTreeOfLife = Settings.DruidRestoTalentTreeOfLife;
-      this.talents.hasSpringBlossoms = Settings.DruidRestoTalentSpringBlossoms;
-      this.talents.hasOvergrowth = Settings.DruidRestoTalentOvergrowth;
-      this.talents.hasGroveGuardian = Settings.DruidRestoTalentGroveGuardians; // Fixed typo here
-      this.talents.hasCultivation = Settings.DruidRestoTalentCultivation;
-    } else {
-      // Otherwise detect from player auras
-      this.talents.hasAbundance = me.hasAura("Abundance");
-      this.talents.hasPhotosynthesis = me.hasAura("Photosynthesis");
-      this.talents.hasCenarionWard = me.hasAura("Cenarion Ward");
-      this.talents.hasFlourish = me.hasAura("Flourish");
-      this.talents.hasEfflorescence = true;
-      this.talents.hasRenewal = me.hasAura("Renewal");
-      this.talents.hasAdaptiveSwarm = me.hasAura("Adaptive Swarm");
-      this.talents.hasConvoke = me.hasAura("Convoke the Spirits");
-      this.talents.hasSoulOfTheForest = me.hasAura("Soul of the Forest");
-      this.talents.hasTreeOfLife = me.hasAura("Incarnation: Tree of Life");
-      this.talents.hasSpringBlossoms = me.hasAura("Spring Blossoms");
-      this.talents.hasOvergrowth = me.hasAura("Overgrowth");
-      this.talents.hasGroveGuardian = me.hasAura("Grove Guardians");
-      this.talents.hasCultivation = me.hasAura("Cultivation");
+    const debuffId = debuffMap[spellId] || spellId;
+    let d = target.getAuraByMe(debuffId);
+    if (!d && debuffId !== spellId) d = target.getAuraByMe(spellId);
+    return d ? d.remaining : 0;
+  }
+
+  // ===== OOC Buff Helper =====
+  _hasBuff(unit, id) {
+    if (!unit) return false;
+    if (unit.hasVisibleAura(id) || unit.hasAura(id)) return true;
+    if (unit.auras && unit.auras.find(a => a.spellId === id)) return true;
+    return false;
+  }
+
+  // MotW target (same pattern as Balance)
+  getMotwTarget() {
+    if (spell.getTimeSinceLastCast(S.markOfTheWild) < 5000) return null;
+    if (!this._hasBuff(me, A.markOfTheWild)) return me;
+    const friends = heal.friends.All;
+    for (let i = 0; i < friends.length; i++) {
+      const unit = friends[i];
+      if (unit && !unit.deadOrGhost && me.distanceTo(unit) <= 40 &&
+          !this._hasBuff(unit, A.markOfTheWild)) {
+        return unit;
+      }
     }
+    return null;
   }
-  
-  initializeVariables() {
-    // Create the variables storage if it doesn't exist
-    this._variables = {};
-    
-    // Set initial values
-    this.lastTravelFormAttempt = 0;
-    this.shouldSummon = false;
-    this.setVariable("efflorescencePlacementChecked", false);
-  }
-  
-  hasVariable(variableName) {
-    if (!this._variables) {
-      this._variables = {};
+
+  // Ironbark target — lowest ally below threshold
+  getIronbarkTarget() {
+    if (!Settings.FWRdUseIronbark) return null;
+    const friends = heal.friends.All;
+    for (let i = 0; i < friends.length; i++) {
+      const unit = friends[i];
+      if (unit && !unit.deadOrGhost && me.distanceTo(unit) <= 40 &&
+          unit.effectiveHealthPercent <= Settings.FWRdIronbarkHP &&
+          !unit.hasAura(A.ironbark)) {
+        return unit;
+      }
     }
-    
-    const key = variableName.toString();
-    return this._variables[key] === true;
+    return null;
   }
-  
-  setVariable(variableName, value = true) {
-    if (!this._variables) {
-      this._variables = {};
-    }
-    
-    const key = variableName.toString();
-    this._variables[key] = value === true;
+
+  // Efflorescence active check (did we cast recently? 30s duration)
+  isEfflorescenceActive() {
+    if (this._efflFrame === wow.frameTime) return this._cachedEfflActive;
+    this._efflFrame = wow.frameTime;
+    this._cachedEfflActive = spell.getTimeSinceLastCast(S.efflorescence) < 28000;
+    return this._cachedEfflActive;
   }
-  
-  clearVariable(variableName) {
-    if (!this._variables) {
-      this._variables = {};
-    }
-    
-    const key = variableName.toString();
-    delete this._variables[key];
-  }
-  /******************************************
-   * Form Management
-   ******************************************/
-  
-  handleFormManagement() {
+
+  // ===== BUILD =====
+  build() {
     return new bt.Selector(
-      // Get out of non-humanoid forms when in combat and need to heal
-      new bt.Decorator(
-        req => me.inCombat && me.shapeshiftForm !== 0 && this.needHealing(),
-        spell.cast("Cancel Shapeshift")
-      ),
-      
-      // Stay in humanoid form during combat
+      // Pre-combat
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // OOC buffs (Mark of the Wild spreading)
+      this.oocBuffs(),
+
+      // Combat gate — proceed if self or any party member in combat
       new bt.Action(() => {
-        if (me.inCombat && me.shapeshiftForm === 0) {
+        if (me.inCombat()) return bt.Status.Failure;
+        const tanks = heal.friends.Tanks;
+        for (let i = 0; i < tanks.length; i++) {
+          if (tanks[i] && tanks[i].inCombat()) return bt.Status.Failure;
+        }
+        const friends = heal.friends.All;
+        for (let i = 0; i < friends.length; i++) {
+          if (friends[i] && friends[i].inCombat()) return bt.Status.Failure;
+        }
+        return bt.Status.Success; // nobody in combat — block
+      }),
+
+      // Cast cancellation — cancel DPS casts when critical healing needed
+      new bt.Decorator(
+        () => this.shouldStopCasting(),
+        new bt.Action(() => {
+          me.stopCasting();
           return bt.Status.Success;
+        })
+      ),
+
+      // Cast/channel check
+      common.waitForCastOrChannel(),
+
+      // Version log (once)
+      new bt.Action(() => {
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          const hero = this.isKeeperOfTheGrove() ? 'Keeper of the Grove' : 'Wildstalker';
+          console.info(`[RestoDruid] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | Hero: ${hero} | ${SCRIPT_VERSION.guide}`);
         }
         return bt.Status.Failure;
       }),
-      
-      // Use Travel Form with extensive checks to prevent spamming
+
+      // Refresh heal cache + debug
+      new bt.Action(() => {
+        this._refreshHealCache();
+        if (Settings.FWRdDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          const mana = Math.round(this.getManaPercent());
+          const lowestHP = Math.round(this._cachedLowestHP);
+          const tankHP = Math.round(this._cachedTankLowestHP);
+          const dpsMode = this._cachedLowestHP >= Settings.FWRdDpsThreshold;
+          const tol = this.inTreeOfLife();
+          const ns = this.hasNaturesSwiftness();
+          const sotf = this.hasSoulOfTheForest();
+          const cc = this.hasClearCasting();
+          console.info(`[RestoDruid] Lowest:${lowestHP}% Tank:${tankHP}% <40:${this._cachedBelow40} <65:${this._cachedBelow65} Mana:${mana}% ToL:${tol} NS:${ns} SotF:${sotf} CC:${cc} DPS:${dpsMode}`);
+        }
+        return bt.Status.Failure;
+      }),
+
+      // GCD gate
       new bt.Decorator(
-        req => {
-          const currentTime = Date.now() / 1000;
-          
-          return Settings.DruidRestoUseTravelForm && 
-                 !me.inCombat && 
-                 me.isMoving && 
-                 me.shapeshiftForm !== ShapeshiftForm.Travel && 
-                 !me.isMounted &&
-                 !me.isIndoors &&
-                 (currentTime - this.lastTravelFormAttempt > Settings.DruidRestoTravelFormCooldown) &&
-                 (!me.hasTarget || me.distanceTo(me.target) > Settings.DruidRestoTravelFormMinDistance);
-        },
-        new bt.Sequence(
-          new bt.Action(() => {
-            // Update the last attempt time
-            this.lastTravelFormAttempt = Date.now() / 1000;
-            return bt.Status.Success;
-          }),
-          spell.cast("Travel Form")
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          // 1. Interrupt (Solar Beam if talented)
+          spell.interrupt(S.solarBeam),
+
+          // 2. Dispels (Nature's Cure — Magic, Curse, Poison)
+          this.dispels(),
+
+          // 3. Movement handling (instants only)
+          this.movementHealing(),
+
+          // 4. Emergency healing (Tier 1: someone < 20%)
+          this.emergencyHealing(),
+
+          // 5. Defensives (self + externals)
+          this.defensives(),
+
+          // 6. Major CDs (group-wide, OFF by default)
+          this.majorCooldowns(),
+
+          // 7. Lifebloom maintenance on tank
+          this.lifebloomMaintenance(),
+
+          // 8. Efflorescence maintenance
+          this.efflorescenceMaintenance(),
+
+          // 9. Cenarion Ward on tank
+          this.cenarionWardMaintenance(),
+
+          // 10. Healing rotation (Tiers 2-4)
+          this.healingRotation(),
+
+          // 11. DPS rotation (Tier 5: nobody needs healing)
+          this.dpsRotation(),
         )
       ),
-      
-      // Use Cat Form when desired out of combat
-      new bt.Decorator(
-        req => !me.inCombat && 
-               Settings.DruidRestoUseCatFormOOC && 
-               me.shapeshiftForm !== ShapeshiftForm.Cat && 
-               !me.isMounted && 
-               !this.needHealing() &&
-               !me.isMoving,
-        spell.cast("Cat Form")
-      ),
     );
+  }
 
-    
-  }
-  
-  needHealing() {
-    return heal.getPriorityTarget()?.predictedHealthPercent < 95;
-  }
-  
-  /******************************************
-   * Defensive Cooldowns
-   ******************************************/
-  
-  handleDefensiveCooldowns() {
+  // ===== OOC BUFFS =====
+  oocBuffs() {
     return new bt.Selector(
-      // Use Barkskin when taking heavy damage
-      new bt.Decorator(
-        req => Settings.DruidRestoUseBarkskin && 
-               me.inCombat && 
-               me.pctHealth < Settings.DruidRestoBarkskinThreshold,
-        spell.cast("Barkskin", on => me)
-      ),
-      
-      // Use Renewal if talented
-      new bt.Decorator(
-        req => this.talents.hasRenewal && 
-               Settings.DruidRestoUseRenewal && 
-               me.inCombat && 
-               me.pctHealth < Settings.DruidRestoRenewalThreshold,
-        spell.cast("Renewal", on => me)
-      )
+      // Mark of the Wild (spreading to group)
+      spell.cast(S.markOfTheWild, () => this.getMotwTarget(), () => {
+        return this.getMotwTarget() !== null;
+      }),
     );
   }
-  
-  /******************************************
-   * Emergency Healing
-   ******************************************/
-  
-  handleEmergencyHealing() {
+
+  // ===== DISPELS =====
+  dispels() {
+    return new bt.Selector(
+      spell.dispel(S.naturesCure, true, DispelPriority.High, false, WoWDispelType.Magic),
+      spell.dispel(S.naturesCure, true, DispelPriority.High, false, WoWDispelType.Curse),
+      spell.dispel(S.naturesCure, true, DispelPriority.High, false, WoWDispelType.Poison),
+      spell.dispel(S.naturesCure, true, DispelPriority.Medium, false, WoWDispelType.Magic),
+      spell.dispel(S.naturesCure, true, DispelPriority.Medium, false, WoWDispelType.Curse),
+      spell.dispel(S.naturesCure, true, DispelPriority.Medium, false, WoWDispelType.Poison),
+    );
+  }
+
+  // ===== MOVEMENT HEALING =====
+  movementHealing() {
     return new bt.Decorator(
-      req => heal.getPriorityTarget()?.predictedHealthPercent < Settings.DruidRestoPanicThreshold,
-      new bt.Sequence(
-        // Use Nature's Swiftness for instant cast
-        spell.cast("Nature's Swiftness", on => me),
-        
-        // Apply Ironbark on the critical target
-        spell.cast("Ironbark", on => heal.getPriorityTarget()),
-        
-        // Use critical healing
-        spell.cast("Regrowth", on => heal.getPriorityTarget()),
-        
-        // Use Swiftmend if available
-        spell.cast("Swiftmend", req => this.findSwiftmendTarget(true)),
-        
-        // Use adaptive swarm if talented
-        new bt.Decorator(
-          req => this.talents.hasAdaptiveSwarm && Settings.DruidRestoUseAdaptiveSwarm,
-          spell.cast("Adaptive Swarm", on => heal.getPriorityTarget())
-        )
-      )
+      () => me.isMoving(),
+      new bt.Selector(
+        // Emergency: Nature's Swiftness → instant Regrowth
+        spell.cast(S.naturesSwiftness, () => me, () => {
+          return this._cachedLowestHP < Settings.FWRdCriticalHP &&
+            !me.hasAura(A.naturesSwiftness);
+        }),
+        spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdCriticalHP), () => {
+          return this.hasNaturesSwiftness();
+        }),
+
+        // Swiftmend (instant, charge-based)
+        spell.cast(S.swiftmend, () => this.getSwiftmendTarget(Settings.FWRdUrgentHP), () => {
+          const target = this.getSwiftmendTarget(Settings.FWRdUrgentHP);
+          return target !== null && spell.getChargesFractional(S.swiftmend) > 0.5;
+        }),
+
+        // Rejuvenation (instant HoT — pandemic aware)
+        spell.cast(S.rejuvenation, () => this.getRejuvTarget(Settings.FWRdMaintenanceHP), () => {
+          return this.getRejuvTarget(Settings.FWRdMaintenanceHP) !== null &&
+            this.hasManaFor('rejuv');
+        }),
+
+        // Wild Growth (1.5s cast, but instant in Tree of Life)
+        spell.cast(S.wildGrowth, () => this.getWildGrowthTarget(Settings.FWRdUrgentHP), () => {
+          return this.inTreeOfLife() &&
+            this.getWildGrowthTarget(Settings.FWRdUrgentHP) !== null;
+        }),
+
+        // Lifebloom (instant)
+        spell.cast(S.lifebloom, () => this.getLifebloomTarget(), () => {
+          return this.getLifebloomTarget() !== null;
+        }),
+
+        // Cenarion Ward (instant)
+        spell.cast(S.cenarionWard, () => this.getCenarionWardTarget(), () => {
+          return this.getCenarionWardTarget() !== null;
+        }),
+
+        // ClearCasting Regrowth (instant with OoC proc)
+        spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdUrgentHP), () => {
+          return this.hasClearCasting() && this.getHealTarget(Settings.FWRdUrgentHP) !== null;
+        }),
+
+        // Ironbark (instant, off-GCD defensive)
+        spell.cast(S.ironbark, () => this.getIronbarkTarget(), () => {
+          return this.getIronbarkTarget() !== null;
+        }),
+
+        // Barkskin (instant, self)
+        spell.cast(S.barkskin, () => me, () => {
+          return Settings.FWRdUseBarkskin && me.effectiveHealthPercent < Settings.FWRdBarkskinHP;
+        }),
+
+        // DPS instants while moving
+        spell.cast(S.moonfire, () => this.getDpsTarget(), () => {
+          const target = this.getDpsTarget();
+          if (!target) return false;
+          if (spell.getTimeSinceLastCast(S.moonfire) < 3000) return false;
+          return this.getDebuffRemaining(target, S.moonfire) < 3000;
+        }),
+        spell.cast(S.sunfire, () => this.getDpsTarget(), () => {
+          const target = this.getDpsTarget();
+          if (!target) return false;
+          if (spell.getTimeSinceLastCast(S.sunfire) < 3000) return false;
+          return this.getDebuffRemaining(target, S.sunfire) < 3000;
+        }),
+
+        // Block cast-time spells while moving
+        new bt.Action(() => bt.Status.Success),
+      ),
+      new bt.Action(() => bt.Status.Failure)
     );
   }
 
-  /******************************************
-   * Dispels, Buffs, and Major Cooldowns
-   ******************************************/
-  
-  handleDispels() {
-    const priorityMap = {
-      "Low": DispelPriority.Low,
-      "Medium": DispelPriority.Medium,
-      "High": DispelPriority.High
-    };
-    
-    const priority = priorityMap[Settings.DruidRestoDispelPriority] || DispelPriority.Medium;
-    
+  // ===== EMERGENCY HEALING (Tier 1: < 20%) =====
+  emergencyHealing() {
     return new bt.Decorator(
-      req => Settings.DruidRestoUseNaturesCure,
-      spell.dispel("Nature's Cure", true, priority, true, 
-                WoWDispelType.Magic, WoWDispelType.Curse, WoWDispelType.Poison)
-    );
-  }
+      () => this._cachedBelow20 >= 1,
+      new bt.Selector(
+        // Nature's Swiftness → instant Regrowth (60% more healing)
+        spell.cast(S.naturesSwiftness, () => me, () => {
+          return !me.hasAura(A.naturesSwiftness);
+        }),
+        spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdEmergencyHP), () => {
+          return this.hasNaturesSwiftness();
+        }),
 
-  handleBuffs() {
-    return new bt.Selector(
-      // Apply Mark of the Wild if missing
-      spell.cast("Mark of the Wild", req => {
-        const target = this.findMotwTarget();
-        return target && !target.hasAura("Mark of the Wild");
-      }),
-      
-      // Manage Efflorescence placement
-      new bt.Decorator(
-        req => this.shouldPlaceEfflorescence(),
-        spell.cast("Efflorescence", on => this.getBestEfflorescenceLocation())
+        // Swiftmend (instant, big heal)
+        spell.cast(S.swiftmend, () => this.getSwiftmendTarget(Settings.FWRdEmergencyHP), () => {
+          return this.getSwiftmendTarget(Settings.FWRdEmergencyHP) !== null;
+        }),
+
+        // Ironbark on emergency target
+        spell.cast(S.ironbark, () => this.getHealTarget(Settings.FWRdEmergencyHP), () => {
+          if (!Settings.FWRdUseIronbark) return false;
+          const target = this.getHealTarget(Settings.FWRdEmergencyHP);
+          return target !== null && !target.hasAura(A.ironbark);
+        }),
+
+        // Rejuvenation (instant HoT to start ticking)
+        spell.cast(S.rejuvenation, () => this.getHealTarget(Settings.FWRdEmergencyHP), () => {
+          const target = this.getHealTarget(Settings.FWRdEmergencyHP);
+          if (!target) return false;
+          const rejuvAura = target.getAuraByMe(A.rejuvenation);
+          return !rejuvAura || rejuvAura.remaining < 3600;
+        }),
+
+        // ClearCasting Regrowth (instant, free)
+        spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdEmergencyHP), () => {
+          return this.hasClearCasting();
+        }),
+
+        // Hard-cast Regrowth (last resort)
+        spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdEmergencyHP)),
       )
     );
   }
 
-  handleMajorCooldowns() {
+  // ===== DEFENSIVES =====
+  defensives() {
     return new bt.Selector(
-      // Use Tree of Life for major healing
-      new bt.Decorator(
-        req => this.talents.hasTreeOfLife && 
-               Settings.DruidRestoUseTreeOfLife && 
-               this.isHighDamageSituation() && 
-               spell.canCast("Incarnation: Tree of Life") && 
-               this.countCriticalHealTargets() >= Settings.DruidRestoTreeOfLifeMinTargets,
-        spell.cast("Incarnation: Tree of Life")
-      ),
-      
-      // Use Flourish to extend HoTs
-      new bt.Decorator(
-        req => this.talents.hasFlourish && 
-               Settings.DruidRestoUseFlourish && 
-               this.shouldUseFlourish(),
-        spell.cast("Flourish")
-      ),
-      
-      // Use Convoke the Spirits
-      new bt.Decorator(
-        req => this.talents.hasConvoke && 
-               Settings.DruidRestoUseConvoke && 
-               this.isHighDamageSituation() && 
-               spell.canCast("Convoke the Spirits"),
-        spell.cast("Convoke the Spirits")
-      ),
-      
-      // Use Tranquility in extreme situations
-      new bt.Decorator(
-        req => this.countPriorityTargets(Settings.DruidRestoTransquilityPercent) >= 
-               Settings.DruidRestoTransquilityMinTargets,
-        spell.cast("Tranquility")
-      )
+      // Barkskin (self-defense)
+      spell.cast(S.barkskin, () => me, () => {
+        return Settings.FWRdUseBarkskin && me.inCombat() &&
+          me.effectiveHealthPercent < Settings.FWRdBarkskinHP;
+      }),
+      // Ironbark on low ally
+      spell.cast(S.ironbark, () => this.getIronbarkTarget(), () => {
+        return this.getIronbarkTarget() !== null;
+      }),
     );
   }
-  
-  isHighDamageSituation() {
-    // Count how many players are below 60% health
-    let criticalCount = this.countPriorityTargets(60);
-    
-    // Or if tank is taking heavy damage
-    const tankInDanger = heal.friends.Tanks.some(tank => tank.pctHealth < 40);
-    
-    return criticalCount >= 3 || tankInDanger;
-  }
-  
-  countCriticalHealTargets() {
-    return this.countPriorityTargets(50);
-  }
-  
-  shouldUseFlourish() {
-    // Count how many of our HoTs are active on group members
-    let hotCount = 0;
-    for (const unit of heal.friends.All) {
-      if (unit.hasAuraByMe("Rejuvenation") || 
-          unit.hasAuraByMe("Regrowth") || 
-          unit.hasAuraByMe("Wild Growth") ||
-          unit.hasAuraByMe("Lifebloom")) {
-        hotCount++;
-      }
-    }
-    
-    // Use Flourish if we have several HoTs active and people need healing
-    return hotCount >= Settings.DruidRestoFlourishMinHoTs && this.isHighDamageSituation();
-  }
-  
-  // Helper functions for target counting
-  countPriorityTargets(healthPercent) {
-    return heal.priorityList.filter(unit => 
-      unit.predictedHealthPercent < healthPercent &&
-      unit.distanceTo(me) <= 40
-    ).length;
-  }
-  
-  countTargetsInRange(centerUnit, range, healthPercentThreshold = 100) {
-    return heal.priorityList.filter(unit => 
-      unit.distanceTo(centerUnit) <= range &&
-      unit.predictedHealthPercent < healthPercentThreshold
-    ).length;
-  }
-  /******************************************
-   * Healing Rotations
-   ******************************************/
-  
-  // Standard healing rotation for all contexts
-  generalHealingRotation() {
-    this.handleGroveGuardian();
+
+  // ===== MAJOR COOLDOWNS (OFF by default) =====
+  majorCooldowns() {
     return new bt.Selector(
-      // Use Overgrowth if talented
-      new bt.Decorator(
-        req => this.talents.hasOvergrowth && this.findOvergrowthTarget(),
-        spell.cast("Overgrowth", on => this.findOvergrowthTarget())
-      ),
-      
-      // Use Swiftmend to consume a HoT for fast healing
-      spell.cast("Swiftmend", req => this.findSwiftmendTarget()),
-      
-      // Use Cenarion Ward on the tank
-      new bt.Decorator(
-        req => this.talents.hasCenarionWard,
-        spell.cast("Cenarion Ward", req => this.findCenarionWardTarget())
-      ),
-      
-      // Use Regrowth with Clearcasting proc
-      spell.cast("Regrowth", 
-        req => me.hasVisibleAura("Clearcasting") && 
-               heal.getPriorityTarget()?.predictedHealthPercent < 90, 
-        on => heal.getPriorityTarget()
-      ),
-      
-      // Use Adaptive Swarm if talented
-      new bt.Decorator(
-        req => this.talents.hasAdaptiveSwarm && Settings.DruidRestoUseAdaptiveSwarm,
-        spell.cast("Adaptive Swarm", req => this.findAdaptiveSwarmTarget())
-      ),
-      
-      // Use Wild Growth for AoE healing
-      spell.cast("Wild Growth", 
-        req => this.shouldUseWildGrowth(),
-        on => heal.getPriorityTarget()
-      ),
-      
-      // Manage Lifebloom
-      spell.cast("Lifebloom", req => this.findLifebloomTarget()),
-      
-      // Use Regrowth on low health targets
-      spell.cast("Regrowth", req => this.findRegrowthTarget()),
-      
-      // Apply Rejuvenation
-      spell.cast("Rejuvenation", req => this.findRejuvenationTarget())
-    );
-  }
-  
-  // Specialized rotation for raids
-  // powerOfNature: 394045, // Power of Nature buff
-  // masterShapeshifter: 393760, // Master Shapeshifter buff
-  // naturesVigil: 124974, // Nature's Vigil buff/ability
-  
-  /**
-   * Enhanced raid healing rotation focused on Tree of Life and Keeper of the Grove synergy
-   */
-  raidHealingRotation() {
-    
-    // Track number of active Grove Guardians for optimization
-    const groveGuardianStacks = this.getGroveGuardianCharges();
-    
-    // Check Reforestation stack count for timing
-    const reforestationStacks = this.getReforestationStacks();
-    
-    // Check if we're in a major cooldown window (Tree of Life or Reforestation proc)
-    const inCooldownWindow = me.hasAura(auras.incarnationTree) || me.hasAura(auras.reforestation);
-    
-    // Check if Flourish will be available soon for syncing
-    const flourishAvailableSoon = spell.getCooldown("Flourish").timeleft < 15;
-    return new bt.Selector(
-      // === MAJOR COOLDOWN WINDOWS ===
-      // this.debugFunction(),
-      
-      new bt.Decorator(
-        req => this.shouldSummonGroveGuardian(),
-        spell.cast("Grove Guardians"),
-      ),
-        
-      // Use Tree of Life with proper timing
-      new bt.Decorator(
-        req => this.talents.hasTreeOfLife && 
-              Settings.DruidRestoUseTreeOfLife && 
-              spell.canCast("Incarnation: Tree of Life") &&
-              // Only use if we have 3 Grove Guardian charges for synergy
-              (groveGuardianStacks.charges === 3 || 
-                // Or if it's a high damage situation and we can't wait
-                (this.isHighDamageSituation() && this.countCriticalHealTargets() >= Settings.DruidRestoTreeOfLifeMinTargets)),
-        spell.cast("Incarnation: Tree of Life")
-      ),
-      
-      // Use Nature's Vigil during cooldown windows with Flourish
-      new bt.Decorator(
-        req => spell.canCast("Nature's Vigil") && 
-               (me.hasAura(auras.flourish) || 
-                (inCooldownWindow && flourishAvailableSoon)),
-        spell.cast("Nature's Vigil")
-      ),
-      
-      // Use Innervate during ramp windows
-      new bt.Decorator(
-        req => spell.canCast("Innervate") && 
-               inCooldownWindow && 
-               me.pctPowerByType(PowerType.Mana) < 60,
-        spell.cast("Innervate", on => me)
-      ),
-      
-      // Use Flourish during major cooldown windows with good HoT coverage
-      new bt.Decorator(
-        req => this.talents.hasFlourish && 
-               Settings.DruidRestoUseFlourish &&
-               spell.canCast("Flourish") && 
-               inCooldownWindow && 
-               this.countActiveHoTs() >= Settings.DruidRestoFlourishMinHoTs,
-        spell.cast("Flourish")
-      ),
-      
-      // Trigger 3rd Reforestation stack when Flourish is ready
-      new bt.Decorator(
-        req => reforestationStacks === 2 && 
-               flourishAvailableSoon && 
-               groveGuardianStacks.charges === 3 && 
-               spell.getCooldown("Swiftmend").timeleft === 0,
-        spell.cast("Swiftmend", on => this.findSwiftmendTarget())
-      ),
-      
-      // === BASIC HEALING MAINTENANCE ===
-      
-      // Keep Efflorescence down in optimal location
-      new bt.Decorator(
-        req => {
-          this.shouldPlaceEfflorescence() ,
-          spell.cast("Efflorescence,", on => this.findBestRaidEfflorescenceLocation())
-          },
-        ),
-      
-      
-      // Manage Lifebloom on optimal target (usually tank)
-      spell.cast("Lifebloom", req => {
-        // Check if we've reached max Lifebloom targets
-        let lifebloomCount = 0;
-        const maxLifebloomTargets = this.talents.hasPhotosynthesis ? 3 : 1;
-        
-        for (const unit of heal.friends.All) {
-          if (unit.hasAuraByMe("Lifebloom")) {
-            lifebloomCount++;
-          }
-        }
-        
-        if (lifebloomCount >= maxLifebloomTargets) {
-          // Only look for targets that need a refresh (under 5 seconds)
-          const targetToRefresh = heal.priorityList.find(unit => {
-            const lifebloom = unit.getAuraByMe("Lifebloom");
-            return lifebloom && lifebloom.remainingTime <= 5000;
-          });
-          
-          return targetToRefresh;
-        }
-        
-        // Look for a target without Lifebloom
-        // Prioritize tanks first
-        const tank = heal.friends.Tanks.find(unit => 
-          !unit.hasAuraByMe("Lifebloom") &&
-          unit.distanceTo(me) <= 40 &&
-          me.inCombat
-        );
-        
-        if (tank) return tank;
-        
-        // Then other priority targets if we use Photosynthesis
-        if (this.talents.hasPhotosynthesis) {
-          const priorityTarget = heal.priorityList.find(unit => 
-            !unit.hasAuraByMe("Lifebloom") &&
-            unit.distanceTo(me) <= 40 &&
-            me.inCombat
-          );
-          
-          return priorityTarget;
-        }
-        this.debugFunction();
-        return false;
+      // Innervate (self — mana recovery)
+      spell.cast(S.innervate, () => me, () => {
+        if (!Settings.FWRdUseInnervate) return false;
+        return this.getManaPercent() < Settings.FWRdInnervateMana && me.inCombat();
       }),
-      
-      // Use Swiftmend + Wild Growth combo for Reforestation stacks
-      new bt.Decorator(
-        req => spell.canCast("Swiftmend") && 
-               spell.canCast("Wild Growth") && 
-               reforestationStacks < 3 && 
-               this.countPriorityTargets(Settings.DruidRestoWildGrowthPercent) >= 
-               Math.max(2, Settings.DruidRestoWildGrowthMinTargets - 1),
-        new bt.Sequence(
-          spell.cast("Swiftmend", req => this.findSwiftmendTarget()),
-          spell.cast("Wild Growth")
-        )
-      ),
-      
-      // Use Wild Growth more aggressively in raids
-      spell.cast("Wild Growth", 
-        req => this.countPriorityTargets(Settings.DruidRestoWildGrowthPercent) >= 
-               Math.max(2, Settings.DruidRestoWildGrowthMinTargets - 1)
-      ),
-      
-      // Apply Rejuvenation to prepare for incoming damage
-      // More aggressive in raid context to build Abundance stacks
-      spell.cast("Rejuvenation", req => {
-        // Target needs rejuv and doesn't have it
-        const target = heal.priorityList.find(unit => 
-          unit.predictedHealthPercent < Settings.DruidRestoRejuvenationPercent && 
-          !unit.hasAuraByMe("Rejuvenation") &&
-          unit.distanceTo(me) <= 40
-        );
-        
-        // Add additional logic to maintain some rejuvs for Abundance/procs
-        if (target) {
-          return target;
-        }
-        
-        // If we have Abundance talent, keep more rejuvs active
-        if (this.talents.hasAbundance && this.countRejuvenations() < 6) {
-          // Find any valid target without rejuv
-          return heal.friends.All.find(unit => 
-            !unit.hasAuraByMe("Rejuvenation") && 
-            unit.distanceTo(me) <= 40
-          );
-        }
-        
-        return false;
+
+      // Incarnation: Tree of Life
+      spell.cast(S.incarnation, () => me, () => {
+        if (!Settings.FWRdUseIncarn) return false;
+        if (!me.inCombat()) return false;
+        return this._cachedBelow65 >= 2;
       }),
-      
-      // Use Regrowth with Abundance during Tree of Life or Reforestation
-      new bt.Decorator(
-        req => this.talents.hasAbundance && 
-               (me.hasAura(auras.incarnationTree) || me.hasAura(auras.reforestation)),
-        spell.cast("Regrowth", req => {
-          // Find target needing healing that doesn't have Regrowth
-          const target = heal.priorityList.find(unit => 
-            unit.predictedHealthPercent < 85 && 
-            !unit.hasAuraByMe("Regrowth") &&
-            unit.distanceTo(me) <= 40
-          );
-          
-          return target;
-        })
-      ),
-      
-      // Use Nature's Swiftness for emergency healing
-      new bt.Decorator(
-        req => spell.canCast("Nature's Swiftness") &&
-               heal.getPriorityTarget()?.predictedHealthPercent < 45,
-        new bt.Sequence(
-          spell.cast("Nature's Swiftness"),
-          spell.cast("Regrowth", on => heal.getPriorityTarget())
-        )
-      ),
-      
-      // === UTILITY AND DEFENSIVE ===
-      
-      // Use Ironbark on endangered tanks or allies
-      spell.cast("Ironbark", req => {
-        // First check tanks
-        const endangeredTank = heal.friends.Tanks.find(unit => 
-          unit.predictedHealthPercent < Settings.DruidRestoIronbarkThreshold &&
-          unit.distanceTo(me) <= 40
-        );
-        
-        if (endangeredTank) return endangeredTank;
-        
-        // Then check any priority target
-        const endangeredAlly = heal.priorityList.find(unit => 
-          unit.predictedHealthPercent < Settings.DruidRestoIronbarkThreshold * 0.8 &&
-          unit.distanceTo(me) <= 40
-        );
-        
-        return endangeredAlly;
+
+      // Convoke the Spirits (strong burst healing in Resto form)
+      spell.cast(S.convoke, () => me, () => {
+        if (!Settings.FWRdUseConvoke) return false;
+        if (!me.inCombat()) return false;
+        return this._cachedBelow40 >= 2;
       }),
-      
-      // Cast Wrath during downtime for Master Shapeshifter mana regen
-      new bt.Decorator(
-        req => Settings.DruidRestoEnableDPS && 
-               !this.needHealing() && 
-               me.pctPowerByType(PowerType.Mana) < 80 && 
-               me.target,
-        spell.cast("Wrath")
-      ),
-      
-      // Maintain Moonfire for DPS optimization
-      new bt.Decorator(
-        req => Settings.DruidRestoEnableDPS && 
-               !this.needHealing() && 
-               me.target,
-        spell.cast("Moonfire", req => this.shouldRefreshMoonfire())
-      ),
-      
-      // Fallback to general healing rotation
-      this.generalHealingRotation()
-    );
-  }
-  
-  /**
-   * Helper method to get Reforestation stacks
-   */
-  getReforestationStacks() {
-    const reforestation = me.getAura("Reforestation");
-    if (reforestation) {
-      return reforestation.stacks || 0;
-    }
-    return 0;
-  }
-  
-  /**
-   * Count active HoTs on all raid members
-   */
-  countActiveHoTs() {
-    let hotCount = 0;
-    
-    for (const unit of heal.friends.All) {
-      if (unit.hasAuraByMe("Rejuvenation")) hotCount++;
-      if (unit.hasAuraByMe("Regrowth")) hotCount++;
-      if (unit.hasAuraByMe("Wild Growth")) hotCount++;
-      if (unit.hasAuraByMe("Lifebloom")) hotCount++;
-      if (unit.hasAuraByMe("Spring Blossoms") && this.talents.hasSpringBlossoms) hotCount++;
-      if (unit.hasAuraByMe("Cultivation") && this.talents.hasCultivation) hotCount++;
-    }
-    
-    return hotCount;
-  }
-  
-  /**
-   * Count active Rejuvenations
-   */
-  countRejuvenations() {
-    return heal.friends.All.filter(unit => 
-      unit.hasAuraByMe("Rejuvenation")
-    ).length;
-  }
-  
-  // Specialized rotation for Mythic+
-  mythicPlusRotation() {
-    return new bt.Selector(
-      // Use Adaptive Swarm more aggressively in M+
-      new bt.Decorator(
-        req => this.talents.hasAdaptiveSwarm && Settings.DruidRestoUseAdaptiveSwarm,
-        spell.cast("Adaptive Swarm", req => {
-          const tank = heal.friends.Tanks.find(unit => 
-            unit.predictedHealthPercent < 85 && !unit.hasAuraByMe("Adaptive Swarm")
-          );
-          return tank || this.findAdaptiveSwarmTarget();
-        })
-      ),
-      
-      // Prioritize Swiftmend for burst healing
-      spell.cast("Swiftmend", req => this.findSwiftmendTarget(false, true)),
-      
-      // Keep Lifebloom on tank at all times
-      spell.cast("Lifebloom", req => {
-        const tank = heal.friends.Tanks.find(unit => 
-          !unit.hasAuraByMe("Lifebloom") && unit.distanceTo(me) <= 40
-        );
-        return tank;
+
+      // Tranquility (raid-wide emergency)
+      spell.cast(S.tranquility, () => me, () => {
+        if (!Settings.FWRdUseTranq) return false;
+        if (!me.inCombat()) return false;
+        return this.getFriendsBelow(Settings.FWRdTranqHP) >= Settings.FWRdTranqCount;
       }),
-      
-      // Fall back to general healing rotation
-      this.generalHealingRotation()
-    );
-  }
-  
-  // Specialized rotation for tank healing
-  tankHealingRotation() {
-    return new bt.Selector(
-      // Focus Ironbark on main tank
-      spell.cast("Ironbark", req => {
-        const tank = heal.friends.Tanks.find(unit => 
-          unit.predictedHealthPercent < Settings.DruidRestoIronbarkThreshold && 
-          !unit.hasAura("Ironbark") && 
-          unit.distanceTo(me) <= 40
-        );
-        return tank;
-      }),
-      
-      // Keep Cenarion Ward on tank
-      new bt.Decorator(
-        req => this.talents.hasCenarionWard,
-        spell.cast("Cenarion Ward", on => {
-          const tank = heal.friends.Tanks.find(unit => 
-            !unit.hasAuraByMe("Cenarion Ward") && unit.distanceTo(me) <= 40
-          );
-          return tank;
-        })
-      ),
-      
-      // Lifebloom on tank
-      spell.cast("Lifebloom", req => {
-        const tank = heal.friends.Tanks.find(unit => 
-          !unit.hasAuraByMe("Lifebloom") && unit.distanceTo(me) <= 40
-        );
-        return tank;
-      }),
-      
-      // Rejuvenation on tank
-      spell.cast("Rejuvenation", req => {
-        const tank = heal.friends.Tanks.find(unit => 
-          !unit.hasAuraByMe("Rejuvenation") && unit.distanceTo(me) <= 40
-        );
-        return tank;
-      }),
-      
-      // Swiftmend for emergency tank healing
-      spell.cast("Swiftmend", req => {
-        const tank = heal.friends.Tanks.find(unit => 
-          unit.predictedHealthPercent < Settings.DruidRestoSwiftmendPercent && 
-          (unit.hasAuraByMe("Rejuvenation") || unit.hasAuraByMe("Regrowth") || unit.hasAuraByMe("Wild Growth")) &&
-          unit.distanceTo(me) <= 40
-        );
-        return tank;
-      }),
-      
-      // Fall back to general healing rotation
-      this.generalHealingRotation()
-    );
-  }
-  
-  // Specialized rotation for PvP healing
-  pvpHealingRotation() {
-    return new bt.Selector(
-      // Abolish Poison (if applicable in current version)
-      spell.cast("Abolish Poison", req => {
-        const poisonedTarget = heal.friends.All.find(unit => 
-          unit.hasAuraOfDispelType(WoWDispelType.Poison) && 
-          unit.distanceTo(me) <= 40
-        );
-        return poisonedTarget;
-      }),
-      
-      // Remove Corruption (if applicable in current version)
-      spell.cast("Remove Corruption", req => {
-        const cursedTarget = heal.friends.All.find(unit => 
-          unit.hasAuraOfDispelType(WoWDispelType.Curse) && 
-          unit.distanceTo(me) <= 40
-        );
-        return cursedTarget;
-      }),
-      
-      // Instant cast healing prioritized in PvP
-      spell.cast("Swiftmend", req => {
-        const target = heal.priorityList.find(unit => 
-          unit.predictedHealthPercent < Settings.DruidRestoSwiftmendPercent && 
-          (unit.hasAuraByMe("Rejuvenation") || unit.hasAuraByMe("Regrowth") || unit.hasAuraByMe("Wild Growth")) &&
-          unit.distanceTo(me) <= 40
-        );
-        return target;
-      }),
-      
-      // Barkskin proactively when taking damage in PvP
-      new bt.Decorator(
-        req => Settings.DruidRestoUseBarkskin && 
-               me.InCombat && 
-               me.pctHealth < 80,
-        spell.cast("Barkskin", on => me)
-      ),
-      
-      // Fall back to general healing rotation
-      this.generalHealingRotation()
     );
   }
 
-  /******************************************
-   * Target Finding Functions
-   ******************************************/
-  
-  findMotwTarget() {
-    const motwTarget = heal.friends.All.find(unit => !unit.hasVisibleAura("Mark of the Wild"));
-    return motwTarget || false;
-  }
-
-  findSwiftmendTarget(emergency = false, prioritizeTanks = false) {
-    const threshold = emergency ? 
-      Settings.DruidRestoPanicThreshold : 
-      Settings.DruidRestoSwiftmendPercent;
-    
-    // First look for tanks if prioritizing them
-    if (prioritizeTanks || Settings.DruidRestoPrioritizeTanks) {
-      for (const tank of heal.friends.Tanks) {
-        if (tank.predictedHealthPercent < threshold && 
-            (tank.hasAuraByMe("Rejuvenation") || 
-             tank.hasAuraByMe("Regrowth") || 
-             tank.hasAuraByMe("Wild Growth")) &&
-            tank.distanceTo(me) <= 40) {
-          return tank;
-        }
-      }
-    }
-    
-    // Then check all other units
-    for (const unit of heal.priorityList) {
-      if (unit.predictedHealthPercent < threshold && 
-          (unit.hasAuraByMe("Rejuvenation") || 
-           unit.hasAuraByMe("Regrowth") || 
-           unit.hasAuraByMe("Wild Growth")) &&
-          unit.distanceTo(me) <= 40) {
-        return unit;
-      }
-    }
-    
-    return false;
-  }
-
-  findRegrowthTarget() {
-    // Apply prioritization based on talents
-    const threshold = Settings.DruidRestoRegrowthPercent;
-    
-    // First look for tanks if prioritizing them
-    if (Settings.DruidRestoPrioritizeTanks) {
-      for (const tank of heal.friends.Tanks) {
-        if (tank.predictedHealthPercent < threshold && 
-            !tank.hasAuraByMe("Regrowth") &&
-            tank.distanceTo(me) <= 40) {
-          return tank;
-        }
-      }
-    }
-    
-    // Consider Abundance and stack priority if talented
-    if (this.talents.hasAbundance) {
-      const candidates = heal.priorityList.filter(unit => 
-        unit.predictedHealthPercent < threshold && 
-        !unit.hasAuraByMe("Regrowth") &&
-        unit.distanceTo(me) <= 40
-      );
-      
-      // With Abundance, prioritize targets with more Rejuv stacks
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => {
-          const aHasRejuv = a.hasAuraByMe("Rejuvenation") ? 1 : 0;
-          const bHasRejuv = b.hasAuraByMe("Rejuvenation") ? 1 : 0;
-          
-          // First sort by Rejuvenation
-          if (aHasRejuv !== bHasRejuv) {
-            return bHasRejuv - aHasRejuv;
-          }
-          
-          // Then by health
-          return a.predictedHealthPercent - b.predictedHealthPercent;
-        });
-        
-        return candidates[0];
-      }
-    }
-    
-    // Standard target finding
-    return this.findHealOverTimeTarget("Regrowth", 
-      unit => unit.predictedHealthPercent < threshold
-    );
-  }
-
-  findRejuvenationTarget() {
-    const threshold = Settings.DruidRestoRejuvenationPercent;
-    
-    // First look for tanks if prioritizing them
-    if (Settings.DruidRestoPrioritizeTanks) {
-      for (const tank of heal.friends.Tanks) {
-        if (tank.predictedHealthPercent < threshold && 
-            !tank.hasAuraByMe("Rejuvenation") &&
-            tank.distanceTo(me) <= 40) {
-          return tank;
-        }
-      }
-    }
-    
-    // Then check all other units
-    return this.findHealOverTimeTarget("Rejuvenation", 
-      unit => unit.predictedHealthPercent < threshold
-    );
-  }
-
-  findCenarionWardTarget() {
-    // Prioritize tanks first
-    if (heal.friends.Tanks.length > 0) {
-      const tank = heal.friends.Tanks[0];
-      if (tank.predictedHealthPercent < Settings.DruidRestoCenarionWardThreshold && 
-          !tank.hasAuraByMe("Cenarion Ward") &&
-          tank.distanceTo(me) <= 40) {
-        return tank;
-      }
-    }
-    
-    // Then any priority target
-    const target = heal.getPriorityTarget();
-    if (target && 
-        target.predictedHealthPercent < 80 && 
-        !target.hasAuraByMe("Cenarion Ward") &&
-        target.distanceTo(me) <= 40) {
-      return target;
-    }
-    
-    return false;
-  }
-
-  shouldUseWildGrowth() {
-    let damagedUnitsCount = 0;
-    const threshold = Settings.DruidRestoWildGrowthPercent;
-    
-    for (const unit of heal.priorityList) {
-      if (unit.predictedHealthPercent < threshold && 
-          unit.distanceTo(me) <= 30) {
-        damagedUnitsCount++;
-      }
-    }
-    
-    return damagedUnitsCount >= Settings.DruidRestoWildGrowthMinTargets;
-  }
-  
-  shouldPlaceEfflorescence() {
-    // Count how many injured allies would benefit from it
-    let potentialTargets = 0;
-    const bestLocation = this.getBestEfflorescenceLocation();
-    
-    for (const unit of heal.friends.All) {
-      if (unit.predictedHealthPercent < Settings.DruidRestoEfflorescencePercent && 
-          bestLocation && 
-          unit.distanceTo(bestLocation) < 10) {
-        potentialTargets++;
-      }
-    }
-    
-    return potentialTargets >= Settings.DruidRestoEfflorescenceMinTargets;
-  }
-  
-  getBestEfflorescenceLocation() {
-   const allUnits = [...heal.friends.All, ...combat.targets];
-       const tank = this.getTank();
-   
-       let bestPosition = null;
-       let maxUnitsInRange = 0;
-   
-       // Function to count units within range of a position
-       const countUnitsInRange = (position, units) => {
-         return units.filter(unit => unit.distanceTo(position) <= EFFLORESCENCE_RADIUS).length;
-       };
-   
-       // Check each unit's position as a potential center
-       allUnits.forEach(centerUnit => {
-         const position = centerUnit.position;
-         let unitsInRange;
-   
-         
-           const friendsInRange = countUnitsInRange(position, heal.friends.All);
-           
-             unitsInRange = 0; // Don't consider positions without the tank
-           
-         
-   
-         if (unitsInRange > maxUnitsInRange) {
-           maxUnitsInRange = unitsInRange;
-           bestPosition = position;
-         }
-       });
-   
-       return bestPosition || me;
-  }
-  
-  findBestRaidEfflorescenceLocation() {
-    // Find the unit that will affect the most injured allies
-    let bestUnit = null;
-    let maxCoveredTargets = 0;
-    
-    // For each possible unit, count how many would be in range
-    for (const centralUnit of heal.friends.All) {
-      if (centralUnit.distanceTo(me) > 40) continue;
-      
-      let coveredTargets = 0;
-      for (const unit of heal.friends.All) {
-        if (unit.predictedHealthPercent < Settings.DruidRestoEfflorescencePercent && 
-            unit.distanceTo(centralUnit) < 10) {
-          coveredTargets++;
-        }
-      }
-      
-      if (coveredTargets > maxCoveredTargets) {
-        maxCoveredTargets = coveredTargets;
-        bestUnit = centralUnit;
-      }
-    }
-    
-    return bestUnit || heal.getPriorityTarget() || me;
-  }
-
-  findLifebloomTarget() {
-    // Count how many Lifeblooms we have active
-    let lifebloomTargets = 0;
-    
-    // Get the maximum number of Lifebloom targets based on talents
-    const maxLifebloomTargets = this.talents.hasPhotosynthesis ? 3 : 1;
-    
-    // Count current active Lifebloom applications
-    for (const unit of heal.friends.All) {
-      if (unit.hasAuraByMe("Lifebloom")) {
-        lifebloomTargets++;
-      }
-    }
-    
-    // If we already have maximum number of Lifeblooms active, check if any need refreshing
-    if (lifebloomTargets >= maxLifebloomTargets) {
-      // Look for a Lifebloom that needs refreshing (below 5 seconds)
-      for (const unit of heal.priorityList) {
-        const lifebloom = unit.getAuraByMe("Lifebloom");
-        if (lifebloom && lifebloom.remainingTime <= 5000) {
-          return unit; // Return this unit to refresh their Lifebloom
-        }
-      }
-      
-      // All Lifeblooms are good, no need to cast
-      return false;
-    }
-    
-    // We don't have max Lifeblooms, so try to apply new ones
-    
-    // First priority: tanks without Lifebloom
-    for (const tank of heal.friends.Tanks) {
-      if (!tank.hasAuraByMe("Lifebloom") && 
-          tank.distanceTo(me) <= 40 && 
-          me.inCombat) { // Only apply to tanks in combat
-        return tank;
-      }
-    }
-    
-    // Second priority: other priority targets if we have Photosynthesis
-    if (this.talents.hasPhotosynthesis && lifebloomTargets < maxLifebloomTargets) {
-      for (const unit of heal.priorityList) {
-        if (!unit.hasAuraByMe("Lifebloom") && 
-            unit.predictedHealthPercent < 85 && 
-            unit.distanceTo(me) <= 40 && 
-            me.inCombat) { // Only apply in combat
-          return unit;
-        }
-      }
-    }
-    
-    // No valid targets found
-    return false;
-  }
-  
-  findAdaptiveSwarmTarget() {
-    // Healing adaptive swarm on low health targets
-    for (const unit of heal.priorityList) {
-      if (unit.predictedHealthPercent < 70 && 
-          !unit.hasAuraByMe("Adaptive Swarm") &&
-          unit.distanceTo(me) <= 40) {
-        return unit;
-      }
-    }
-    
-    // Damaging adaptive swarm on enemies if in offensive mode
-    if (Settings.DruidRestoEnableDPS && me.target && !me.target.hasAuraByMe("Adaptive Swarm")) {
-      return me.target;
-    }
-    
-    return false;
-  }
-  
-  getTank() {
-    return heal.friends.Tanks[0] || me; // Fallback to 'me' if no tank is found
-  }
-
-  getTanks() {
-    return heal.friends.Tanks.filter(tank => tank !== null);
-  }
-
-  findOvergrowthTarget() {
-    // Prioritize tanks that need multiple HoTs
-    for (const tank of heal.friends.Tanks) {
-      if (tank.predictedHealthPercent < 80 && 
-          (!tank.hasAuraByMe("Rejuvenation") || 
-           !tank.hasAuraByMe("Regrowth") || 
-           !tank.hasAuraByMe("Wild Growth")) &&
-          tank.distanceTo(me) <= 40) {
-        return tank;
-      }
-    }
-    
-    // Then any critical unit
-    for (const unit of heal.priorityList) {
-      if (unit.predictedHealthPercent < 50 && 
-          (!unit.hasAuraByMe("Rejuvenation") || 
-           !unit.hasAuraByMe("Regrowth") || 
-           !unit.hasAuraByMe("Wild Growth")) &&
-          unit.distanceTo(me) <= 40) {
-        return unit;
-      }
-    }
-    
-    return false;
-  }
-
-  findHealOverTimeTarget(spellName, predicate, sortFn = null) {
-    // Filter units that need the HoT and don't have it
-    const candidates = heal.priorityList.filter(unit => 
-      predicate(unit) && 
-      !unit.hasAuraByMe(spellName) &&
-      unit.distanceTo(me) <= 40
-    );
-    
-    // If we have a sort function, sort by it
-    if (sortFn && candidates.length > 1) {
-      candidates.sort(sortFn);
-    }
-    
-    return candidates.length > 0 ? candidates[0] : false;
-  }
-
-  /******************************************
-   * DPS Rotation
-   ******************************************/
-  
-  handleDamageDealing() {
-    if (!Settings.DruidRestoEnableDPS) {
-      return new bt.Action(() => bt.Status.Failure);
-    }
-    
-    // Check if healing is needed before doing damage
-    const needsHealing = heal.priorityList.some(unit => unit.predictedHealthPercent < 90);
-    if (needsHealing) return new bt.Action(() => bt.Status.Failure);
-    
-    return new bt.Selector(
-      common.waitForTarget(),
-      
-      // Apply Moonfire if missing or about to expire
-      spell.cast("Moonfire", req => this.shouldRefreshMoonfire()),
-      
-      // Apply Sunfire if missing or about to expire
-      new bt.Decorator(
-        req => Settings.DruidRestoUseSunfire,
-        spell.cast("Sunfire", req => this.shouldRefreshSunfire())
-      ),
-      
-      // Use Wrath as filler
-      spell.cast("Wrath", req => me.target && !this.needHealing())
-    );
-  }
-  
-  shouldRefreshMoonfire() {
-    if (!me.target) return false;
-    
-    const moonfire = me.target.getAuraByMe("Moonfire");
-    return !moonfire || 
-           moonfire.remainingTime < Settings.DruidRestoMoonfireRefreshThreshold;
-  }
-  
-  shouldRefreshSunfire() {
-    if (!me.target) return false;
-    
-    const sunfire = me.target.getAuraByMe("Sunfire");
-    return (!sunfire || 
-            sunfire.remainingTime < Settings.DruidRestoSunfireRefreshThreshold) && 
-           combat.targets.length > 1;
-  }
-
-  /******************************************
-   * Grove Guardian Management - Improved
-   ******************************************/
-  
-  // Add to auras object at the top of the file:
-  // keeperOfTheGrove: 395833, // Keeper of the Grove talent
-  
- // Replace the handleGroveGuardian function with this corrected version
-handleGroveGuardian() {
-  // Skip if the talent isn't selected or feature is disabled
-  if (!this.talents.hasGroveGuardian || !Settings.DruidRestoUseGroveGuardian) {
-    return new bt.Action(() => bt.Status.Failure);
-  }
-
-  // Create a proper behavior tree selector for Grove Guardian handling
-  return new bt.Selector(
-    // First check if we need to summon
-    new bt.Decorator(
-      req => this.shouldSummonGroveGuardian(),
-      // If we should summon, cast the spell
-      spell.cast("Grove Guardians", on => me)
-    ),
-    // Always return failure if we didn't summon so rotation continues
-    new bt.Action(() => bt.Status.Failure)
-  );
-}
-
-// Add this new method to determine if we should summon
-shouldSummonGroveGuardian() {
-  // Initialize tracking variables if needed
-  if (!this._variables.lastGroveGuardianTime) {
-    this._variables.lastGroveGuardianTime = 0;
-    this._variables.groveGuardiansUsed = 0;
-  }
-  
-  // Get current state information
-  const inRampWindow = me.hasAura(auras.incarnationTree) || me.hasAura(auras.reforestation);
-  const currentTime = Date.now() / 1000;
-  const guardianCooldown = 1.5; // Minimum time between summons to prevent spamming
-  
-  // Check if we already have 3 active guardians
-  if (this.countActiveGroveGuardians() >= 3) {
-    // console.log("Already have 3 active guardians");
-    return false;
-  }
-  
-  // Check time since last summon to prevent spamming
-  if ((currentTime - this._variables.lastGroveGuardianTime) <= guardianCooldown) {
-  //  console.log("Too soon since last summon attempt");
-    return false;
-  }
-  
-  // Check if we can cast the spell at all
-  if (!spell.cast("Grove Guardians")) {
-    // console.log("Cannot cast Grove Guardians");
-    return false;
-  }
-
-  // Check if we can cast the spell at all
-  if (!me.inCombat()) {
-    return false;
-  }
-  
-  // Get charge information more reliably
-  let charges = 0;
-  try {
-    charges = spell.getCharges("Grove Guardians");
-    // console.log(`Grove Guardian charges: ${charges}`);
-  } catch (error) {
-    // console.log(`Error getting charges: ${error.message}`);
-  }
-  
-  // Determine if we should summon based on context
- this.shouldSummon = false;
-  
-  // Case 1: During major cooldown windows, use aggressively
-  if (inRampWindow) {
-    // console.log("In ramp window - summoning");
-    return true;
-  } 
-  // Case 2: In healing-intensive situations
-  else if (this.isHighDamageSituation()) {
-    // console.log("High damage situation - summoning");
-    return true;
-  }
-  // Case 3: When we have high charges available (avoid overcapping)
-  else if (charges > 2) {
-    // console.log("High charges available - summoning");
-    return true;
-  }
-  // Case 4: In combat with at least 1 charge and someone needs healing
-  else if (me.inCombat && charges > 0 && this.needHealing()) {
-    // console.log("In combat with healing needed - summoning");
-    return true;
-  }
-  
-  // If we're going to summon, update tracking variables
-  if (this.shouldSummon) {
-    this._variables.lastGroveGuardianTime = currentTime;
-    this._variables.groveGuardiansUsed = (this._variables.groveGuardiansUsed || 0) + 1;
-    // console.log(`Grove Guardian summoning (${this._variables.groveGuardiansUsed})`);
-  } else {
-    // console.log("Not summoning Grove Guardian");
-  }
-  
-  return false;
-}
-
-// SIMPLIFIED PET COUNTING FUNCTION
-countActiveGroveGuardians() {
-  let count = 0;
-      
-      // Durchsuche alle Objekte im ObjectManager
-        objMgr.objects.forEach(obj => {
-            // Prüfe, ob das Objekt eine Einheit ist
-            if (obj instanceof wow.CGUnit) {
-                // Prüfe, ob die Einheit vom Spieler beschworen wurde und ein Wild Imp ist
-                if (obj.createdBy && 
-                    me.guid && 
-                    obj.createdBy.equals(me.guid) && 
-                    obj.name === 'Treant') {
-                    count++;
-                }
-            }
-        });
-          return count > 0 ? count : 0;
-  
-  
-}
-
-// Update getGroveGuardianCharges to be more reliable
-getGroveGuardianCharges() {
-  try {
-    // Try to get spell cooldown info
-    const cooldownInfo = spell.getCharges("Grove Guardians");
-    if (cooldownInfo) {
-      return {
-        charges: cooldownInfo || 0,
-        maxCharges: 3
-      };
-    }
-  } catch (error) {
-    console.log(`Error getting Grove Guardian charges: ${error.message}`);
-  }
-  
-  // Default fallback
-  return {
-    charges: spell.canCast("Grove Guardians") ? 1 : 0,
-    maxCharges: 3
-  };
-}
-  
-  
-  
-  /**
-   * Checks if a pet is a Grove Guardian
-   */
-  isGroveGuardianPet(pet) {
-    if (!pet) return false;
-    
-    // More robust checks for identifying Grove Guardian pets
-    return pet.name === "Treant" || 
-           pet.name.includes("Treant") ||
-           pet.id === 194958 || // Pet ID for Grove Guardian
-           (pet.auras && pet.auras.some(aura => 
-             aura.id === auras.groveGuardian || 
-             aura.id === auras.groveGuardianPet
-           ));
-  }
-
-  // Improved rejuvenation target finding with max target check
-  findRejuvenationTarget() {
-    const threshold = Settings.DruidRestoRejuvenationPercent;
-    
-    // Calculate max Rejuvenation targets based on settings
-    let maxRejuvenationTargets = Settings.DruidRestoMaxRejuvenationTargets || 8;
-    
-    // Scale with raid size if enabled
-    if (Settings.DruidRestoScaleRejuvWithRaidSize) {
-      const raidSize = heal.friends.All.length;
-      if (raidSize <= 5) {
-        maxRejuvenationTargets = Math.min(maxRejuvenationTargets, 3); // 5-player content
-      } else if (raidSize <= 10) {
-        maxRejuvenationTargets = Math.min(maxRejuvenationTargets, 5); // 10-player content
-      }
-      // For 20+ players, use the full setting value
-    }
-    
-    // Increase if we have Abundance talent and the setting is enabled
-    if (this.talents.hasAbundance && Settings.DruidRestoIncreasedRejuvWithAbundance) {
-      maxRejuvenationTargets += 2; // Add 2 more for Abundance benefit
-    }
-    
-    // Count current rejuvenations
-    const currentRejuvCount = this.countRejuvenations();
-    
-    // If we're already at or above the max, only refresh existing ones that are about to expire
-    if (currentRejuvCount >= maxRejuvenationTargets) {
-      // Look for rejuvenations about to expire
-      for (const unit of heal.priorityList) {
-        const rejuv = unit.getAuraByMe("Rejuvenation");
-        // Only refresh if less than 3 seconds remaining
-        if (rejuv && rejuv.remainingTime <= 3000 && unit.predictedHealthPercent < threshold) {
-          return unit;
-        }
-      }
-      
-      // If we need more rejuvs for Abundance stacks in Tree of Life
-      if (this.talents.hasAbundance && me.hasAura(auras.incarnationTree) && currentRejuvCount < 10) {
-        // Look for any targets without Rejuvenation during Tree of Life
-        const target = heal.priorityList.find(unit => 
-          !unit.hasAuraByMe("Rejuvenation") && 
-          unit.distanceTo(me) <= 40
-        );
-        return target;
-      }
-      
-      return false; // Already at max, and no urgent refreshes needed
-    }
-    
-    // First look for tanks if prioritizing them
-    if (Settings.DruidRestoPrioritizeTanks) {
-      for (const tank of heal.friends.Tanks) {
-        if (tank.predictedHealthPercent < threshold && 
-            !tank.hasAuraByMe("Rejuvenation") &&
-            tank.distanceTo(me) <= 40) {
-          return tank;
-        }
-      }
-    }
-    
-    // Then check all other units based on health threshold
-    const target = heal.priorityList.find(unit => 
-      unit.predictedHealthPercent < threshold && 
-      !unit.hasAuraByMe("Rejuvenation") &&
-      unit.distanceTo(me) <= 40
-    );
-    
-    // Finally, if we have Abundance and need to build stacks
-    if (!target && 
-        this.talents.hasAbundance && 
-        currentRejuvCount < maxRejuvenationTargets * 0.75 && // Only fill up to 75% of max
-        Settings.DruidRestoIncreasedRejuvWithAbundance) {
-      // Look for any eligible unit without Rejuvenation
-      return heal.friends.All.find(unit => 
-        !unit.hasAuraByMe("Rejuvenation") && 
-        unit.distanceTo(me) <= 40
-      );
-    }
-    
-    return target || false;
-  }
-
-  createDebugPanel() {
-    // Skip if UI system is not available
-    if (typeof ui === 'undefined' || !ui.createDebugPanel) {
-      return;
-    }
-    
-    try {
-      // Create panel if it doesn't exist
-      if (!this._variables.debugPanel) {
-        this._variables.debugPanel = ui.createDebugPanel("Resto Druid Debug", {
-          width: 300,
-          height: 200,
-          position: "topright"
-        });
-      }
-      
-      // Get current Grove Guardian state
-      const ggCharges = this.getGroveGuardianCharges();
-      const activeGG = this.countActiveGroveGuardians();
-      const inRampWindow = me.hasAura(auras.incarnationTree) || me.hasAura(auras.reforestation);
-      
-      // Calculate time since last summon
-      const currentTime = Date.now() / 1000;
-      const timeSinceLastSummon = this._variables.lastGroveGuardianTime ? 
-        Math.floor(currentTime - this._variables.lastGroveGuardianTime) : 
-        "N/A";
-      
-      // Get healing metrics
-      const rejuvCount = this.countRejuvenations();
-      const maxRejuvs = Settings.DruidRestoMaxRejuvenationTargets || 8;
-      
-      // Update panel content
-      this._variables.debugPanel.update({
-        title: "Resto Druid Debug",
-        content: [
-          { 
-            type: "progressBar", 
-            label: "Grove Guardian Charges", 
-            value: ggCharges.charges, 
-            max: 3,
-            color: ggCharges.charges === 3 ? "#00ff00" : "#ffcc00"
-          },
-          {
-            type: "text",
-            text: `Active Guardians: ${activeGG}/3`,
-            color: activeGG > 0 ? "#00ff99" : "#ffffff"
-          },
-          {
-            type: "text",
-            text: `Ramp Window: ${inRampWindow ? "ACTIVE!" : "Inactive"}`,
-            color: inRampWindow ? "#ff3399" : "#888888"
-          },
-          {
-            type: "text",
-            text: `Last Summon: ${timeSinceLastSummon} seconds ago`,
-            color: "#cccccc"
-          },
-          { 
-            type: "progressBar", 
-            label: "Rejuvenation", 
-            value: rejuvCount, 
-            max: maxRejuvs,
-            color: "#33ccff"
-          },
-          {
-            type: "separator"
-          },
-          {
-            type: "text",
-            text: "Cooldowns:",
-            color: "#ffffff"
-          },
-          {
-            type: "text",
-            text: `Tree: ${this.getCooldownText("Incarnation: Tree of Life")}`,
-            color: spell.canCast("Incarnation: Tree of Life") ? "#00ff00" : "#ff5555"
-          },
-          {
-            type: "text",
-            text: `Flourish: ${this.getCooldownText("Flourish")}`,
-            color: spell.canCast("Flourish") ? "#00ff00" : "#ff5555"
-          }
-        ]
-      });
-    } catch (error) {
-      console.log(`Debug panel error: ${error.message}`);
-    }
-  }
-  
-  /**
-   * Helper method to format cooldown text
-   */
-  getCooldownText(spellName) {
-    const cd = spell.getCooldown(spellName);
-    if (!cd) return "N/A";
-    
-    if (cd.timeleft === 0) {
-      return "READY";
-    } else {
-      const seconds = Math.ceil(cd.timeleft / 1000);
-      return `${seconds}s`;
-    }
-  }
-
-  /**
-   * Debug function that runs on every tick to track important metrics
-   * Place this in your behavior tree to ensure it runs every tick
-   */
-  debugFunction() {
-    // Create a debug node that always returns failure to continue the rotation
-    return new bt.Action(() => {
-      try {
-        const currentTime = Date.now() / 1000;
-        
-        // Always update the debug panel on every tick if it exists
-        // This ensures real-time Grove Guardian tracking
-        this.createDebugPanel();
-        
-        // Only log text messages every few seconds to avoid spam
-        if (!this._variables.lastDebugTime || (currentTime - this._variables.lastDebugTime) > 3) {
-          this._variables.lastDebugTime = currentTime;
-          
-          // Get Grove Guardian status
-          const groveGuardianCharges = this.getGroveGuardianCharges();
-          const activeGuardians = this.countActiveGroveGuardians();
-          
-          // Get healing metrics
-          const rejuvCount = this.countRejuvenations();
-          const hotCount = this.countActiveHoTs();
-          const inRampWindow = me.hasAura(auras.incarnationTree) || me.hasAura(auras.reforestation);
-          const priorityTargetHealth = heal.getPriorityTarget()?.predictedHealthPercent || 100;
-          
-          // Display targeting info for Grove Guardian debugging
-          const targetInfo = me.target ? 
-            `Target: ${me.target.name} (${me.target.id}) at ${me.distanceTo(me.target)}yd` : 
-            "No target";
-          
-          // Create debug message with enhanced Grove Guardian info
-          const debugMsg = [
-            `=== RESTO DRUID DEBUG (${new Date().toLocaleTimeString()}) ===`,
-            `Grove Guardian: ${groveGuardianCharges.charges}/${3} charges, ${this.shouldSummonGroveGuardian()}`,
-            
-          ].join("\n");
-          
-          // Log to console with color for visibility
-          console.log("%c" + debugMsg, "color: #00ff99; font-weight: bold;");
-          
-          // Optional: Show on-screen debugging if available in your addon framework
-          if (typeof ui !== 'undefined' && ui.debug) {
-            ui.debug(debugMsg);
-          }
-        }
-      } catch (error) {
-        console.log(`Debug function error: ${error.message}`);
-      }
-      
-      // Always return failure to continue the rotation
-      return bt.Status.Failure;
+  // ===== LIFEBLOOM MAINTENANCE =====
+  lifebloomMaintenance() {
+    return spell.cast(S.lifebloom, () => this.getLifebloomTarget(), () => {
+      return this.getLifebloomTarget() !== null;
     });
   }
 
+  // ===== EFFLORESCENCE MAINTENANCE =====
+  efflorescenceMaintenance() {
+    return spell.cast(S.efflorescence, () => me, () => {
+      if (!me.inCombat()) return false;
+      if (this.isEfflorescenceActive()) return false;
+      // Only place when people are grouped and need healing
+      return this._cachedBelow85 >= 2;
+    });
+  }
+
+  // ===== CENARION WARD MAINTENANCE =====
+  cenarionWardMaintenance() {
+    return spell.cast(S.cenarionWard, () => this.getCenarionWardTarget(), () => {
+      return this.getCenarionWardTarget() !== null;
+    });
+  }
+
+  // ===== HEALING ROTATION (Tiers 2-4) =====
+  healingRotation() {
+    return new bt.Selector(
+      // ===== Tier 2: CRITICAL (< 40%) =====
+
+      // Nature's Swiftness → Regrowth for critical target
+      spell.cast(S.naturesSwiftness, () => me, () => {
+        return this._cachedLowestHP < Settings.FWRdCriticalHP &&
+          !me.hasAura(A.naturesSwiftness);
+      }),
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdCriticalHP), () => {
+        return this.hasNaturesSwiftness() &&
+          this.getHealTarget(Settings.FWRdCriticalHP) !== null;
+      }),
+
+      // Swiftmend on critical target (instant, spawns Grove Guardian for KotG)
+      spell.cast(S.swiftmend, () => this.getSwiftmendTarget(Settings.FWRdCriticalHP), () => {
+        const target = this.getSwiftmendTarget(Settings.FWRdCriticalHP);
+        return target !== null && spell.getChargesFractional(S.swiftmend) > 0.5;
+      }),
+
+      // Rejuvenation on critical target (instant, gets healing ticking)
+      spell.cast(S.rejuvenation, () => this.getHealTarget(Settings.FWRdCriticalHP), () => {
+        const target = this.getHealTarget(Settings.FWRdCriticalHP);
+        if (!target) return false;
+        const rejuvAura = target.getAuraByMe(A.rejuvenation);
+        return !rejuvAura || rejuvAura.remaining < 3600;
+      }),
+
+      // Wild Growth when 2+ injured at critical
+      spell.cast(S.wildGrowth, () => this.getWildGrowthTarget(Settings.FWRdCriticalHP), () => {
+        const target = this.getWildGrowthTarget(Settings.FWRdCriticalHP);
+        return target !== null && this.hasManaFor('wildGrowth');
+      }),
+
+      // ClearCasting Regrowth (free, instant)
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdCriticalHP), () => {
+        return this.hasClearCasting() &&
+          this.getHealTarget(Settings.FWRdCriticalHP) !== null;
+      }),
+
+      // Soul of the Forest empowered Regrowth/Rejuv
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdCriticalHP), () => {
+        return this.hasSoulOfTheForest() &&
+          this.getHealTarget(Settings.FWRdCriticalHP) !== null;
+      }),
+
+      // Hard-cast Regrowth on critical target
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdCriticalHP), () => {
+        return this._cachedLowestHP < Settings.FWRdCriticalHP;
+      }),
+
+      // ===== Tier 3: URGENT (< 65%) =====
+
+      // Swiftmend (save charges at fractional > 1.4 for efficiency, but use at 0.5+ for urgent)
+      spell.cast(S.swiftmend, () => this.getSwiftmendTarget(Settings.FWRdUrgentHP), () => {
+        const target = this.getSwiftmendTarget(Settings.FWRdUrgentHP);
+        return target !== null && spell.getChargesFractional(S.swiftmend) > 1.4;
+      }),
+
+      // Rejuvenation spreading — pandemic-aware (build Mastery: Harmony stacks)
+      spell.cast(S.rejuvenation, () => this.getRejuvTarget(Settings.FWRdUrgentHP), () => {
+        return this.getRejuvTarget(Settings.FWRdUrgentHP) !== null &&
+          this.hasManaFor('rejuv');
+      }),
+
+      // Wild Growth when 2+ urgent
+      spell.cast(S.wildGrowth, () => this.getWildGrowthTarget(Settings.FWRdUrgentHP), () => {
+        const target = this.getWildGrowthTarget(Settings.FWRdUrgentHP);
+        return target !== null && this.hasManaFor('wildGrowth');
+      }),
+
+      // ClearCasting Regrowth (free)
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdUrgentHP), () => {
+        return this.hasClearCasting() && this.getHealTarget(Settings.FWRdUrgentHP) !== null;
+      }),
+
+      // SotF-empowered Rejuvenation (spreads to 2 extra with Power of the Archdruid)
+      spell.cast(S.rejuvenation, () => this.getRejuvTarget(Settings.FWRdUrgentHP), () => {
+        return this.hasSoulOfTheForest() &&
+          this.getRejuvTarget(Settings.FWRdUrgentHP) !== null;
+      }),
+
+      // Regrowth with Tidal-like conditions: SotF or Tree of Life (instant)
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdUrgentHP), () => {
+        if (!this.getHealTarget(Settings.FWRdUrgentHP)) return false;
+        return this.inTreeOfLife() || this.hasSoulOfTheForest();
+      }),
+
+      // Hard-cast Regrowth on urgent (only if mana OK and no better option)
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdUrgentHP), () => {
+        return this._cachedLowestHP < Settings.FWRdUrgentHP && this.getManaPercent() > 40;
+      }),
+
+      // ===== Tier 4: MAINTENANCE (< 85%) =====
+
+      // Rejuvenation spreading (maintain HoTs for Mastery)
+      spell.cast(S.rejuvenation, () => this.getRejuvTarget(Settings.FWRdMaintenanceHP), () => {
+        return this.getRejuvTarget(Settings.FWRdMaintenanceHP) !== null &&
+          this.getManaPercent() > 50 && this.hasManaFor('rejuv');
+      }),
+
+      // Wild Growth for group top-off
+      spell.cast(S.wildGrowth, () => this.getWildGrowthTarget(Settings.FWRdMaintenanceHP), () => {
+        const target = this.getWildGrowthTarget(Settings.FWRdMaintenanceHP);
+        return target !== null && this.getManaPercent() > 60 && this.hasManaFor('wildGrowth');
+      }),
+
+      // Swiftmend for SotF proc (if charges capping and someone needs healing)
+      spell.cast(S.swiftmend, () => this.getSwiftmendTarget(Settings.FWRdMaintenanceHP), () => {
+        const target = this.getSwiftmendTarget(Settings.FWRdMaintenanceHP);
+        return target !== null && spell.getChargesFractional(S.swiftmend) >= 2;
+      }),
+
+      // ClearCasting Regrowth (free, never waste)
+      spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdMaintenanceHP), () => {
+        return this.hasClearCasting() && this.getHealTarget(Settings.FWRdMaintenanceHP) !== null;
+      }),
+
+      // Tank-focused Regrowth (keeps Regrowth HoT up for Mastery)
+      spell.cast(S.regrowth, () => this.getTankTarget(Settings.FWRdMaintenanceHP), () => {
+        const tank = this.getTankTarget(Settings.FWRdMaintenanceHP);
+        if (!tank) return false;
+        const rgAura = tank.getAuraByMe(A.regrowth);
+        return (!rgAura || rgAura.remaining < 3000) && this.getManaPercent() > 60;
+      }),
+    );
+  }
+
+  // ===== DPS ROTATION (Tier 5: everyone > 85%) =====
+  dpsRotation() {
+    return new bt.Decorator(
+      () => this._cachedLowestHP >= Settings.FWRdDpsThreshold && me.inCombat() && Settings.FWRdDPS,
+      new bt.Selector(
+        // Keep up HoT maintenance even while DPSing
+        // Rejuvenation on anyone needing it (low priority)
+        spell.cast(S.rejuvenation, () => this.getRejuvTarget(90), () => {
+          const target = this.getRejuvTarget(90);
+          return target !== null && this.getManaPercent() > 70;
+        }),
+
+        // ClearCasting Regrowth (free, never waste even in DPS mode)
+        spell.cast(S.regrowth, () => this.getHealTarget(Settings.FWRdMaintenanceHP), () => {
+          return this.hasClearCasting() && this.getHealTarget(Settings.FWRdMaintenanceHP) !== null;
+        }),
+
+        // Catweave DPS (optional)
+        new bt.Decorator(
+          () => Settings.FWRdCatweave,
+          this.catweaveRotation(),
+          new bt.Action(() => bt.Status.Failure)
+        ),
+
+        // Caster DPS
+        // Moonfire maintenance
+        spell.cast(S.moonfire, () => this.getDpsTarget(), () => {
+          const target = this.getDpsTarget();
+          if (!target) return false;
+          if (spell.getTimeSinceLastCast(S.moonfire) < 3000) return false;
+          if (target.timeToDeath && target.timeToDeath() < MIN_DOT_TTD) return false;
+          return this.getDebuffRemaining(target, S.moonfire) < 3000;
+        }),
+
+        // Sunfire maintenance
+        spell.cast(S.sunfire, () => this.getDpsTarget(), () => {
+          const target = this.getDpsTarget();
+          if (!target) return false;
+          if (spell.getTimeSinceLastCast(S.sunfire) < 3000) return false;
+          if (target.timeToDeath && target.timeToDeath() < MIN_DOT_TTD) return false;
+          return this.getDebuffRemaining(target, S.sunfire) < 3000;
+        }),
+
+        // Wrath filler (also generates mana with Master Shapeshifter)
+        spell.cast(S.wrath, () => this.getDpsTarget()),
+      )
+    );
+  }
+
+  // ===== CATWEAVE ROTATION =====
+  catweaveRotation() {
+    return new bt.Selector(
+      // Enter Cat Form if not already
+      spell.cast(S.catForm, () => me, () => {
+        return !this.inCatForm() && this._cachedLowestHP >= Settings.FWRdDpsThreshold;
+      }),
+
+      // Only catweave if in Cat Form
+      new bt.Decorator(
+        () => this.inCatForm(),
+        new bt.Selector(
+          // Rake (DoT maintenance)
+          spell.cast(S.rake, () => this.getDpsTarget(), () => {
+            const target = this.getDpsTarget();
+            if (!target) return false;
+            if (target.timeToDeath && target.timeToDeath() < MIN_DOT_TTD) return false;
+            return this.getDebuffRemaining(target, S.rake) < 3000;
+          }),
+
+          // Rip (DoT maintenance, higher priority with combo points)
+          spell.cast(S.rip, () => this.getDpsTarget(), () => {
+            const target = this.getDpsTarget();
+            if (!target) return false;
+            if (target.timeToDeath && target.timeToDeath() < 8000) return false;
+            const cp = me.powerByType(PowerType.ComboPoints);
+            return cp >= 4 && this.getDebuffRemaining(target, S.rip) < 3000;
+          }),
+
+          // Ferocious Bite at 5 combo points (dump)
+          spell.cast(S.ferociousBite, () => this.getDpsTarget(), () => {
+            const cp = me.powerByType(PowerType.ComboPoints);
+            return cp >= 5 && this.getDpsTarget() !== null;
+          }),
+
+          // Shred (builder)
+          spell.cast(S.shred, () => this.getDpsTarget()),
+        ),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+    );
+  }
 }

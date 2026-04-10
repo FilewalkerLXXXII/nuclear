@@ -8,14 +8,83 @@ import { PowerType } from "@/Enums/PowerType";
 import { me } from '@/Core/ObjectManager';
 import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
-// STATUS : DONE
+/**
+ * Balance Druid Behavior - Midnight 12.0.1
+ * Sources: SimC APL (dreamgrove/sims/owl/balance.txt) + Dreamgrove Compendium
+ *          + Method Guide (all pages) + Wowhead Guide
+ *
+ * Auto-detects: Keeper of the Grove vs Elune's Chosen
+ * Dispatches to: kotgSingleTarget / ecSingleTarget / aoeRotation
+ *
+ * Key SimC variables replicated:
+ *   opener, eclipse_down, cd_window, cd_window_narrow, no_weaver_procs, ca_soon
+ *
+ * Eclipse entry: charge fractional > 1.5 (sustain) or charges = 2 (opener)
+ * CA trigger: prev_gcd FoN (KotG) or charges_fractional < 1.5 (EC)
+ * Convoke gating: AP < 40 during CA, off-burst if Convoke CD < CA CD
+ * Starsurge formula: AP > cost*2 - procCount (KotG), AP > 80 (EC)
+ */
 
-const auras = {
-	solareclipse : 48517,
-  lunareclipse : 48518,
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'SimC APL (Dreamgrove) + Compendium + Method + Wowhead — v2 optimized',
 };
 
+const S = {
+  wrath:              190984,
+  starfire:           194153,
+  starsurge:          78674,
+  starfall:           191034,
+  moonfire:           8921,
+  sunfire:            93402,
+  celestialAlignment: 194223,
+  incarnation:        102560,
+  convoke:            391528,
+  forceOfNature:      205636,
+  furyOfElune:        202770,
+  warriorOfElune:     202425,
+  newMoon:            274281,
+  halfMoon:           274282,
+  fullMoon:           274283,
+  wildMushroom:       88747,    // Confirmed Midnight 12.0.1 (3 charges, 30s recharge)
+  solarEclipse:       1233346,
+  lunarEclipse:       1233272,
+  solarBeam:          78675,
+  barkskin:           22812,
+  moonkinForm:        24858,
+  regrowth:           8936,
+  renewal:            108238,
+  naturesSwiftness:   132158,
+  markOfTheWild:      1126,
+  berserking:         26297,
+};
 
+const A = {
+  moonkinForm:        24858,
+  celestialAlignment: 194223,
+  incarnation:        102560,
+  naturesSwiftness:   132158,
+  solarEclipse:       48517,
+  lunarEclipse:       48518,
+  moonfireDebuff:     164812,
+  sunfireDebuff:      164815,
+  starlord:           279709,
+  starweaversWeft:    393944,   // Free Starsurge
+  starweaversWarp:    393942,   // Free Starfall
+  touchTheCosmos:     450360,   // Free spender from Wrath/Starfire (450356=talent, 394414=old tier set)
+  harmonyOfTheGrove:  428735,   // Buff applied by FoN treants (+4% spell dmg each)
+  treantsOfTheMoon:   428544,   // KotG passive
+  warriorOfElune:     202425,
+  ascendantStars:     1263382,  // Bolts from Eclipse entry (Ascendant Eclipses pt4)
+  ascendantFires:     1263363,  // Instant Wrath/Starfire from Eclipse entry
+  fungalGrowth:       81291,    // Wild Mushroom debuff on target
+};
+
+const MIN_DOT_TTD = 6000;
+const STARSURGE_COST = 30;      // Base AP cost
+const FON_DURATION = 10000;     // Force of Nature: 10s
 
 export class BalanceDruidBehavior extends Behavior {
   name = 'FW Balance Druid';
@@ -23,608 +92,1000 @@ export class BalanceDruidBehavior extends Behavior {
   specialization = Specialization.Druid.Balance;
   version = wow.GameVersion.Retail;
 
+  // Per-tick caches
+  _eclipseFrame = 0;
+  _cachedSolar = null;
+  _cachedLunar = null;
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _apFrame = 0;
+  _cachedAP = 0;
+
+  // State
+  _versionLogged = false;
+  _lastDebug = 0;
+  _opener = true;   // SimC variable.opener — clears on first CA/Inc usage
+
   static settings = [
     {
-      header: 'Cooldowns',
+      header: 'General',
       options: [
-        { type: 'checkbox', uid: 'DruidBalanceUseCooldown', text: 'Use Cooldowns', default: true },
+        { type: 'checkbox', uid: 'FWBalAutoCDs', text: 'Auto Cooldowns (ignore burst keybind)', default: false },
+        { type: 'checkbox', uid: 'FWBalUsePotion', text: 'Use Potion (Light\'s Potential)', default: false },
+        { type: 'slider', uid: 'FWBalAoECount', text: 'AoE Target Count', default: 2, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWBalDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives & Healing',
+      options: [
+        { type: 'checkbox', uid: 'FWBalBarkskin', text: 'Use Barkskin', default: true },
+        { type: 'slider', uid: 'FWBalBarkskinHP', text: 'Barkskin HP %', default: 50, min: 10, max: 90 },
+        { type: 'checkbox', uid: 'FWBalSelfHeal', text: 'Use Self-Healing', default: true },
+        { type: 'slider', uid: 'FWBalRenewalHP', text: 'Renewal HP %', default: 30, min: 10, max: 60 },
+        { type: 'slider', uid: 'FWBalRegrowthHP', text: 'NS+Regrowth HP %', default: 40, min: 10, max: 70 },
       ],
     },
   ];
 
+  // =============================================
+  // BUILD — Main behavior tree
+  // =============================================
   build() {
-    console.debug("Dreamstate: "+ me.hasAura("Dreamstate"));
     return new bt.Selector(
       common.waitForNotMounted(),
       common.waitForNotSitting(),
-      new bt.Action(() => (this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure)),
-      common.waitForTarget(),
-      common.waitForFacing(),
+
+      // OOC: Mark of the Wild
+      new bt.Decorator(
+        () => !me.inCombat(),
+        new bt.Selector(
+          spell.cast(S.markOfTheWild, () => this.getMotwTarget(), () => this.getMotwTarget() !== null),
+          new bt.Action(() => bt.Status.Success)
+        ),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Auto-target dead/invalid
+      new bt.Action(() => {
+        if (!me.target || !common.validTarget(me.target)) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
+        }
+        return bt.Status.Failure;
+      }),
+
+      // Null target bail
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      // Cancel cast-time spells when moving (Wrath, Starfire) so instant rotation can fire
+      new bt.Action(() => {
+        if (me.isMoving() && me.isCastingOrChanneling) {
+          const cast = me.currentCastOrChannel;
+          if (cast && (cast.spellId === S.wrath || cast.spellId === S.starfire)) {
+            me.stopCasting();
+            return bt.Status.Failure;
+          }
+        }
+        return bt.Status.Failure;
+      }),
       common.waitForCastOrChannel(),
 
+      // Moonkin Form
       new bt.Decorator(
-        req => !me.hasAura(24858),
-        spell.cast("Moonkin Form"),
+        () => !me.hasAura(A.moonkinForm),
+        spell.cast(S.moonkinForm),
         new bt.Action(() => bt.Status.Success)
       ),
-      
+
+      // Opener flag: clear on first CA/Inc usage
+      new bt.Action(() => {
+        if (this._opener && this.inCA()) this._opener = false;
+        return bt.Status.Failure;
+      }),
+
+      // Version + Debug
+      new bt.Action(() => {
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[Bal] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | Hero: ${this.isKeeperOfTheGrove() ? 'KotG' : 'EC'} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWBalDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          const sl = me.getAura(A.starlord);
+          console.info(`[Bal] Ecl:${this.inSolar() ? 'Sol' : this.inLunar() ? 'Lun' : 'NONE'}(${this.eclipseRemains()}ms) CF:${this.getEclipseChargesFrac().toFixed(2)} AP:${this.getAP()} SL:${sl ? sl.stacks + '/' + Math.round(sl.remaining) : '-'} CA:${this.inCA()} Stars:${this.hasStars()} Fires:${this.hasFires()} Open:${this._opener} E:${this.getEnemyCount()}`);
+        }
+        return bt.Status.Failure;
+      }),
+
       new bt.Decorator(
-      ret => !spell.isGlobalCooldown(),
-      new bt.Selector(
-        spell.interrupt('Solar Beam'),
-        this.preCombatCooldowns(),
-       
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          spell.interrupt(S.solarBeam),
+          this.defensives(),
 
-        new bt.Decorator(
-          req => this.enemiesAroundTarget(5) >= 2,
-          this.multiTarget(),
-            new bt.Action(() => bt.Status.Success)
-        ),
+          // Trinkets: SimC use_items — during CA+Harmony or fight ending
+          common.useTrinkets(() => this.getCurrentTarget(), () =>
+            this.useCDs() && (
+              this.inCA() && (this.hasHarmony() || !spell.isSpellKnown(S.forceOfNature)) ||
+              this.targetTTD() < this.getCACdRemains()
+            )
+          ),
 
-        new bt.Decorator(
-          req => this.enemiesAroundTarget(5) <= 1,
-          this.st(),
-            new bt.Action(() => bt.Status.Success)
-        ),
+          // Potion: SimC — KotG:Harmony, EC:CA, opener:prev Solar Eclipse, fight<30
+          new bt.Action(() => {
+            if (!this.useCDs()) return bt.Status.Failure;
+            if (!Settings.FWBalUsePotion) return bt.Status.Failure;
+            const item = common.getItemByName("Light's Potential");
+            if (!item || !item.cooldown.ready) return bt.Status.Failure;
+            if (this.hasHarmony() && !this.isElunesChosen()) { item.use(); return bt.Status.Success; }
+            if (this.inCA() && this.isElunesChosen()) { item.use(); return bt.Status.Success; }
+            if (this._opener && spell.getTimeSinceLastCast(S.solarEclipse) < 1500) { item.use(); return bt.Status.Success; }
+            if (this.targetTTD() <= 30000) { item.use(); return bt.Status.Success; }
+            return bt.Status.Failure;
+          }),
 
-        
-        spell.cast('Wrath', this.getCurrentTarget),
-      ),
-      ),
+          // Berserking: during CA + Harmony (or fight ending)
+          spell.cast(S.berserking, () => me, () =>
+            this.useCDs() && (
+              this.inCA() && (this.hasHarmony() || !spell.isSpellKnown(S.forceOfNature)) ||
+              this.targetTTD() < this.getCACdRemains()
+            )
+          ),
+
+          // Dispatch: EC ST → KotG ST → AoE
+          new bt.Decorator(
+            () => this.isElunesChosen() && this.getEnemyCount() < Settings.FWBalAoECount,
+            this.ecSingleTarget(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.getEnemyCount() < Settings.FWBalAoECount,
+            this.kotgSingleTarget(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          this.aoeRotation(),
+        )
+      )
     );
   }
 
-  st() {
+  // =============================================
+  // KEEPER OF THE GROVE — Single Target
+  // SimC: actions.kotg_st (19 lines)
+  // =============================================
+  kotgSingleTarget() {
     return new bt.Selector(
-      // actions.st=warrior_of_elune,if=talent.lunar_calling|!talent.lunar_calling&variable.eclipse_remains<=7
-      spell.cast('Warrior of Elune', () => 
-        this.hasTalent('Lunar Calling') || 
-        (!this.hasTalent('Lunar Calling') && Math.max(this.solarRemains(), this.lunarRemains()) <= 7000)
+      // --- Movement: full instant-cast rotation ---
+      new bt.Decorator(
+        () => me.isMoving(),
+        new bt.Selector(
+          // CDs (instant/off-GCD)
+          spell.cast(S.celestialAlignment, () => me, () =>
+            this.useCDs() && (this.prevGcdFoN() || this.targetTTD() < 20000)
+          ),
+          spell.cast(S.incarnation, () => me, () =>
+            this.useCDs() && (this.prevGcdFoN() || this.targetTTD() < 20000)
+          ),
+          spell.cast(S.forceOfNature, () => this.getCurrentTarget(), () => this.kotgFoNCond()),
+          spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+            (this.inCA() && this.getAP() < 40) ||
+            (!this.inCA() && this.getAP() < 40 && (spell.getCooldown(S.convoke)?.timeleft || 0) < this.getCACdRemains())
+          ),
+          // DoTs (refresh)
+          spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+          spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+          // Starfall: 2+ targets or Warp proc
+          spell.cast(S.starfall, () => this.getCurrentTarget(), () =>
+            me.hasAura(A.starweaversWarp) || this.getEnemyCount() >= 2
+          ),
+          spell.cast(S.starsurge, () => this.getCurrentTarget(), () => this.kotgSSCond()),
+          // Instants
+          spell.cast(S.starfire, () => this.getCurrentTarget(), () => me.hasAura(A.warriorOfElune)),
+          spell.cast(S.furyOfElune, () => this.getCurrentTarget(), () => this.kotgFoeCond()),
+          this.enterSolar(),
+          // Moonfire/Sunfire spam (always cast something while moving for DPS)
+          spell.cast(S.sunfire, () => this.getCurrentTarget()),
+          spell.cast(S.moonfire, () => this.getCurrentTarget()),
+          new bt.Action(() => bt.Status.Success)
+        ),
+        new bt.Action(() => bt.Status.Failure)
       ),
-      
-      // Starsurge logic based on astral power management
-      spell.cast('Starsurge', this.getCurrentTarget, () =>
-        this.astralPowerDeficit() < this.passiveAsp() + this.energizeAmount('Wrath') +
-        ((this.energizeAmount('Starfire') + this.passiveAsp()) * (this.solarRemains() < (this.getGCD() * 3) ? 1 : 0))
+
+      // === OPENER: DoTs first, then fast burst when player pre-cast 2x Wrath (AP >= 15) ===
+      // Apply DoTs BEFORE burst CDs during opener
+      new bt.Decorator(
+        () => this._opener && this.getAP() >= 15,
+        new bt.Selector(
+          spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+          spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+          // Fast burst: skip FoE/FoN prev_gcd requirement during opener
+          spell.cast(S.furyOfElune, () => this.getCurrentTarget()),
+          spell.cast(S.forceOfNature, () => this.getCurrentTarget()),
+          spell.cast(S.celestialAlignment, () => me, () => this.useCDs()),
+          spell.cast(S.incarnation, () => me, () => this.useCDs()),
+          spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+            this.inCA() && this.getAP() < 40
+          ),
+          new bt.Action(() => bt.Status.Failure) // Fall through to normal rotation
+        ),
+        new bt.Action(() => bt.Status.Failure)
       ),
-      
-      // Starlord talent maintenance
-      spell.cast('Starsurge', this.getCurrentTarget, () => 
-        this.hasTalent('Starlord') && me.getAuraStacks('Starlord') < 3
+
+      // === Dreamgrove Burst Sequence: FoE → FoN → CA/Inc → Convoke (sustain) ===
+
+      // 1. Fury of Elune: fires before FoN in burst prep
+      spell.cast(S.furyOfElune, () => this.getCurrentTarget(), () => this.kotgFoeCond()),
+
+      // 2. Force of Nature: fires before CA/Inc
+      spell.cast(S.forceOfNature, () => this.getCurrentTarget(), () => this.kotgFoNCond()),
+
+      // 3. CA/Inc: immediately after FoN
+      spell.cast(S.celestialAlignment, () => me, () =>
+        this.useCDs() && (this.prevGcdFoN() || this.targetTTD() < 20000)
       ),
-      
-      // Eclipse transition management - cast appropriate spell to avoid wasting eclipse time
-      spell.cast('Wrath', this.getCurrentTarget, () => 
-        this.inSolar() && this.solarRemains() < spell.getSpell('Wrath').castTime && !this.cdCondition()
+      spell.cast(S.incarnation, () => me, () =>
+        this.useCDs() && (this.prevGcdFoN() || this.targetTTD() < 20000)
       ),
-      
-      spell.cast('Starfire', this.getCurrentTarget, () => 
-        this.inLunar() && this.lunarRemains() < spell.getSpell('Starfire').castTime && !this.cdCondition()
+
+      // 4. Convoke: IMMEDIATELY after CA/Inc
+      spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+        (this.inCA() && this.getAP() < 40) ||
+        (!this.inCA() && this.getAP() < 40 && (spell.getCooldown(S.convoke)?.timeleft || 0) < this.getCACdRemains())
       ),
-      
-      // DOT maintenance with stricter conditions
-      spell.cast('Sunfire', this.getCurrentTarget, () => {
-        // Only refresh Sunfire if it's about to expire OR special conditions are met
-        const debuffRemaining = this.getDebuffRemainingTime('Sunfire');
-        
-        // About to expire - less than 3 seconds left
-        if (debuffRemaining < 3000) {
-          return true;
-        }
-        
-        // Refreshable (< 7 seconds) AND special talents/conditions
-        if (debuffRemaining < 7000) {
-          // Only refresh if we have Keeper of the Grove AND Force of Nature is ready
-          if (this.hasTalent('Keeper of the Grove') && spell.getCooldown('Force of Nature').ready) {
-            return true;
-          }
-          
-          // OR if we have Elune's Chosen AND we're about to use major cooldowns
-          if (this.hasTalent('Elunes Chosen') && this.cdCondition()) {
-            return true;
-          }
-          
-          // Otherwise, don't refresh yet
-          return false;
-        }
-        
-        // Default behavior - don't cast Sunfire
+
+      // 5. DoTs: Moonfire + Sunfire refresh
+      spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+      spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+
+      // 6. Solar Eclipse
+      this.enterSolar(),
+
+      // 8. Wrath pooling (non-Convoke, FoN coming — NOT during opener)
+      spell.cast(S.wrath, () => this.getCurrentTarget(), () =>
+        !this._opener && !spell.isSpellKnown(S.convoke) && !this.hasStars() &&
+        this.getAP() < 80 && this.noWeaverProcs() && this.getFoNCdRemains() < 15000
+      ),
+
+      // 9. Pre-burst Sunfire (line_cd=10)
+      spell.cast(S.sunfire, () => this.getCurrentTarget(), () => {
+        if (spell.getTimeSinceLastCast(S.sunfire) < 10000) return false;
+        if (this._opener) return !this.hasStars();
+        return this.getDebuffRemaining(S.sunfire) < 10000 &&
+          this.caSoon() && this.getFoNCdRemains() < 3000;
+      }),
+
+      // 10. Starfall: PRIMARY spender on 2+ targets | Warp proc | TtC on 2+
+      spell.cast(S.starfall, () => this.getCurrentTarget(), () => {
+        if (me.hasAura(A.starweaversWarp)) return true; // Warp proc always
+        if (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() >= 2) return true; // TtC on 2+
+        if (this.getEnemyCount() >= 2 && this.getAP() > 50) return true; // 2+ targets = Starfall > Starsurge
         return false;
       }),
-      
-      // spell.cast('Moonfire', this.getCurrentTarget, () => 
-      //   this.getDebuffRemainingTime('Moonfire') < 3000 && 
-      //   (!this.hasTalent('Treants of the Moon') || 
-      //    (spell.getCooldown('Force of Nature').timeleft > 3000 && !me.hasAura('Harmony of the Grove')))
-      // ),
-      
-      // Cooldown management
-      this.preCombatCooldowns(),
-      this.castCooldowns(),
-      
-      // Eclipse building - cast appropriate spell based on Dreamstate and target count
-      spell.cast('Wrath', this.getCurrentTarget, () => 
-        this.enterLunar() && (this.inNoEclipse() || this.solarRemains() < spell.getSpell('Wrath').castTime)
+
+      // 11. Starsurge: ST spender (only when Starfall didn't fire)
+      spell.cast(S.starsurge, () => this.getCurrentTarget(), () => this.kotgSSCond()),
+
+      // 12. Starfire: Ascendant Fires + Lunar Eclipse (instant)
+      spell.cast(S.starfire, () => this.getCurrentTarget(), () =>
+        this.hasFires() && this.inLunar()
       ),
-      
-      spell.cast('Starfire', this.getCurrentTarget, () => 
-        !this.enterLunar() && (this.inNoEclipse() || this.lunarRemains() < spell.getSpell('Starfire').castTime)
-      ),
-      
-      // Astral power management for cooldowns
-      spell.cast('Starsurge', this.getCurrentTarget, () => 
-        this.cdCondition() && 
-        this.astralPowerDeficit() > this.passiveAsp() + this.energizeAmount('Force of Nature')
-      ),
-      
-      // Key abilities
-      spell.cast('Force of Nature', this.getCurrentTarget),
-      spell.cast('Fury of Elune', this.getCurrentTarget, () => 
-        5 + this.passiveAsp() < this.astralPowerDeficit()
-      ),
-      
-      // Special proc management
-      spell.cast('Starfall', this.getCurrentTarget, () => 
-        me.hasAura('Starweaver\'s Warp')
-      ),
-      
-      // DOT refreshing
-      spell.cast('Sunfire', this.getCurrentTarget, () => 
-        this.getDebuffRemainingTime('Sunfire') < 7000
-      ),
-      
-      // spell.cast('Moonfire', this.getCurrentTarget, () => 
-      //   this.getDebuffRemainingTime('Moonfire') < 7000 && 
-      //   (!this.hasTalent('Treants of the Moon') || 
-      //    (spell.getCooldown('Force of Nature').timeleft > 3000 && !me.hasAura('Harmony of the Grove')))
-      // ),
-      
-      spell.cast('Stellar Flare', this.getCurrentTarget, () => 
-        this.getDebuffRemainingTime('Stellar Flare') < 7000
-      ),
-      
-      // Convoke management
-      spell.cast('Starsurge', this.getCurrentTarget, () => 
-        spell.getCooldown('Convoke the Spirits').timeleft < this.getGCD() * 2 && 
-        this.convokeCondition() && 
-        this.astralPowerDeficit() < 50
-      ),
-      
-      spell.cast('Convoke the Spirits', this.getCurrentTarget, () => 
-        this.convokeCondition()
-      ),
-      
-      // Moon cycle abilities
-      spell.cast('New Moon', this.getCurrentTarget, () => 
-        this.astralPowerDeficit() > this.passiveAsp() + this.energizeAmount('New Moon') || 
-        spell.getCooldown('Celestial Alignment').timeleft > 15000 &&
-        me.hasAura('New Moon')
-      ),
-      
-      spell.cast('Half Moon', this.getCurrentTarget, () => 
-        this.astralPowerDeficit() > this.passiveAsp() + this.energizeAmount('Half Moon') && 
-        (this.lunarRemains() > spell.getSpell('Half Moon').castTime || 
-         this.solarRemains() > spell.getSpell('Half Moon').castTime) || 
-        spell.getCooldown('Celestial Alignment').timeleft > 15000 &&
-        me.hasAura('Half Moon')
-      ),
-      
-      spell.cast('Full Moon', this.getCurrentTarget, () => 
-        this.astralPowerDeficit() > this.passiveAsp() + this.energizeAmount('Full Moon') && 
-        (this.lunarRemains() > spell.getSpell('Full Moon').castTime || 
-         this.solarRemains() > spell.getSpell('Full Moon').castTime) || 
-        spell.getCooldown('Celestial Alignment').timeleft > 15000 &&
-        me.hasAura('Full Moon')
-      ),
-      
-      // Special proc spell usage
-      spell.cast('Starsurge', this.getCurrentTarget, () => 
-        me.hasAura('Starweaver\'s Weft') || me.hasAura('Touch the Cosmos')
-      ),
-      
-      // Wild Mushroom
-      spell.cast('Wild Mushroom', this.getCurrentTarget, () => 
-        !this.prevGcd('Wild Mushroom') && this.dotRemains('Fungal Growth') < 2000
-      ),
-      
-      // Default fillers
-      spell.cast('Starfire', this.getCurrentTarget, () => 
-        this.hasTalent('Lunar Calling')
-      ),
-      
-      spell.cast('Wrath', this.getCurrentTarget)
+
+      // 13. Moon cycle (transforming spell — only current phase is castable)
+      this.castMoon(),
+
+      // 16. Wild Mushroom: no AP overcap, Fungal Growth not active
+      spell.cast(S.wildMushroom, () => this.getCurrentTarget(), () => {
+        if (this.apDeficit() < 10) return false;
+        const t = this.getCurrentTarget();
+        if (t && (t.hasAuraByMe(A.fungalGrowth) || t.getAuraByMe(A.fungalGrowth))) return false;
+        return this.inSolar() || (spell.getFullRechargeTime(S.wildMushroom) || 99999) < this.getCACdRemains();
+      }),
+
+      // 17. Wrath filler
+      spell.cast(S.wrath, () => this.getCurrentTarget())
     );
   }
 
-  multiTarget() {
+  // =============================================
+  // ELUNE'S CHOSEN — Single Target
+  // SimC: actions.ec_st (16 lines)
+  // =============================================
+  ecSingleTarget() {
     return new bt.Selector(
-      // actions.aoe=wrath,if=variable.enter_lunar&eclipse.in_eclipse&variable.eclipse_remains<cast_time
-      spell.cast('Wrath', this.getCurrentTarget, () => 
-        this.enterLunar() && 
-        this.inEclipse() && 
-        Math.max(this.solarRemains(), this.lunarRemains()) < spell.getSpell('Wrath').castTime
-      ),
-      
-      // actions.aoe+=/starfire,if=!variable.enter_lunar&eclipse.in_eclipse&variable.eclipse_remains<cast_time
-      spell.cast('Starfire', this.getCurrentTarget, () => 
-        !this.enterLunar() && 
-        this.inEclipse() && 
-        Math.max(this.solarRemains(), this.lunarRemains()) < spell.getSpell('Starfire').castTime
-      ),
-      
-      // actions.aoe+=/starfall,if=astral_power.deficit<=variable.passive_asp+6
-      spell.cast('Starfall', this.getCurrentTarget, () => 
-        this.astralPowerDeficit() <= this.passiveAsp() + 6 || 
-        me.hasAura("Touch the Cosmos")
+      // --- Movement: full instant-cast rotation ---
+      new bt.Decorator(
+        () => me.isMoving(),
+        new bt.Selector(
+          // CDs (instant/off-GCD) — FoE first, CA/Inc requires prev_gcd FoE
+          spell.cast(S.furyOfElune, () => this.getCurrentTarget()),
+          spell.cast(S.celestialAlignment, () => me, () => {
+            if (!this.useCDs()) return false;
+            if (this.targetTTD() < 20000) return true;
+            return this.prevGcdFoE() && this.eclipseDown();
+          }),
+          spell.cast(S.incarnation, () => me, () => {
+            if (!this.useCDs()) return false;
+            if (this.targetTTD() < 20000) return true;
+            return this.prevGcdFoE() && this.eclipseDown();
+          }),
+          spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+            (this.inCA() && this.getAP() < 40) ||
+            (spell.getCooldown(S.convoke)?.timeleft || 0) < this.getCACdRemains() ||
+            this.targetTTD() < 30000
+          ),
+          spell.cast(S.forceOfNature, () => this.getCurrentTarget()),
+          // DoTs
+          spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+          spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+          // Starfall: 2+ targets or procs
+          spell.cast(S.starfall, () => this.getCurrentTarget(), () =>
+            me.hasAura(A.starweaversWarp) ||
+            (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() >= 2) ||
+            this.getEnemyCount() >= 2
+          ),
+          spell.cast(S.starsurge, () => this.getCurrentTarget(), () => this.ecSSCond()),
+          // Eclipse entry (instant)
+          spell.cast(S.lunarEclipse, () => me, () => {
+            if (this.inEclipse()) return false;
+            return this.getCAFullRecharge() > 15000 || this._opener;
+          }),
+          // Moonfire/Sunfire spam (always cast something while moving)
+          spell.cast(S.sunfire, () => this.getCurrentTarget()),
+          spell.cast(S.moonfire, () => this.getCurrentTarget()),
+          new bt.Action(() => bt.Status.Success)
+        ),
+        new bt.Action(() => bt.Status.Failure)
       ),
 
-      // actions.aoe+=/starfall,if=astral_power.deficit<=variable.passive_asp+6
-      spell.cast('Starfall', this.getCurrentTarget, () => 
-        me.powerByType(PowerType.LunarPower) > 45
+      // === OPENER: DoTs first, then fast burst when player pre-cast 2x Wrath (AP >= 15) ===
+      new bt.Decorator(
+        () => this._opener && this.getAP() >= 15,
+        new bt.Selector(
+          spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+          spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+          spell.cast(S.furyOfElune, () => this.getCurrentTarget()),
+          spell.cast(S.celestialAlignment, () => me, () => this.useCDs()),
+          spell.cast(S.incarnation, () => me, () => this.useCDs()),
+          spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+            this.inCA() && this.getAP() < 40
+          ),
+          new bt.Action(() => bt.Status.Failure)
+        ),
+        new bt.Action(() => bt.Status.Failure)
       ),
-      
-      // Replace the Moonfire casting with this:
-new bt.Selector(
-  new bt.Action(() => {
-    const moonTarget = this.findMoonfireTarget();
-    if (moonTarget) {
-      const targetCount = this.enemiesAroundTarget(10);
-      // Don't refresh on too many targets
-      if (targetCount > 6) {
-        // Only apply to targets without Moonfire
-        const debuff = moonTarget.getAuraByMe("Moonfire");
-        if (debuff && debuff.remaining > 3000) {
-          return bt.Status.Failure;
+
+      // 1. Fury of Elune FIRST — CA/Inc requires prev_gcd FoE for EC
+      spell.cast(S.furyOfElune, () => this.getCurrentTarget()),
+
+      // 2. CA/Inc: prev_gcd FoE + eclipse_down (Dreamgrove EC rule)
+      spell.cast(S.celestialAlignment, () => me, () => {
+        if (!this.useCDs()) return false;
+        if (this.targetTTD() < 20000) return true;
+        return this.prevGcdFoE() && this.eclipseDown();
+      }),
+      spell.cast(S.incarnation, () => me, () => {
+        if (!this.useCDs()) return false;
+        if (this.targetTTD() < 20000) return true;
+        return this.prevGcdFoE() && this.eclipseDown();
+      }),
+
+      // 3. Moonfire
+      spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+
+      // 4. Sunfire
+      spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+
+      // 5. Convoke: CA+AP<40 | convoke_cd < ca_cd | fight<30
+      spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+        (this.inCA() && this.getAP() < 40) ||
+        (spell.getCooldown(S.convoke)?.timeleft || 0) < this.getCACdRemains() ||
+        this.targetTTD() < 30000
+      ),
+
+      // 6. Lunar Eclipse: CA full recharge > 15 | opener
+      spell.cast(S.lunarEclipse, () => me, () => {
+        if (this.inEclipse()) return false;
+        return this.getCAFullRecharge() > 15000 || this._opener;
+      }),
+
+      // 7. Starfall: PRIMARY spender on 2+ targets | Warp proc | TtC on 2+
+      spell.cast(S.starfall, () => this.getCurrentTarget(), () => {
+        if (me.hasAura(A.starweaversWarp)) return true;
+        if (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() >= 2) return true;
+        if (this.getEnemyCount() >= 2 && this.getAP() > 50) return true;
+        return false;
+      }),
+
+      // 8. Starsurge: ST spender (only when Starfall didn't fire)
+      spell.cast(S.starsurge, () => this.getCurrentTarget(), () => this.ecSSCond()),
+
+      // 9. Force of Nature (unconditional if talented — rare for EC)
+      spell.cast(S.forceOfNature, () => this.getCurrentTarget()),
+
+      // 10. Moon cycle (transforming spell — only current phase is castable)
+      this.castMoon(),
+
+      // 13. Wild Mushroom: no AP overcap, Fungal Growth not active
+      spell.cast(S.wildMushroom, () => this.getCurrentTarget(), () => {
+        if (this.apDeficit() < 10) return false;
+        const t = this.getCurrentTarget();
+        if (t && (t.hasAuraByMe(A.fungalGrowth) || t.getAuraByMe(A.fungalGrowth))) return false;
+        if (this.isElunesChosen()) return true; // EC: always use when available
+        return this.inSolar() || (spell.getFullRechargeTime(S.wildMushroom) || 99999) < this.getCACdRemains();
+      }),
+
+      // 14. Starfire filler (in Eclipse — EC always Lunar, Starfire is empowered)
+      spell.cast(S.starfire, () => this.getCurrentTarget(), () => !this.eclipseDown()),
+
+      // 15. Wrath (outside Eclipse — SimC: wrath,if=variable.eclipse_down)
+      spell.cast(S.wrath, () => this.getCurrentTarget(), () => this.eclipseDown())
+    );
+  }
+
+  // =============================================
+  // AOE — Both hero trees
+  // SimC: actions.aoe (20 lines)
+  // =============================================
+  aoeRotation() {
+    return new bt.Selector(
+      // --- Movement: full instant-cast AoE rotation ---
+      new bt.Decorator(
+        () => me.isMoving(),
+        new bt.Selector(
+          // CDs (instant/off-GCD)
+          spell.cast(S.celestialAlignment, () => me, () => {
+            if (!this.useCDs()) return false;
+            if (this.targetTTD() < 20000) return true;
+            if (!this.isElunesChosen()) return this.prevGcdFoN();
+            return this.prevGcdFoE() && this.eclipseDown();
+          }),
+          spell.cast(S.incarnation, () => me, () => {
+            if (!this.useCDs()) return false;
+            if (this.targetTTD() < 20000) return true;
+            if (!this.isElunesChosen()) return this.prevGcdFoN();
+            return this.prevGcdFoE() && this.eclipseDown();
+          }),
+          spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+            (this.inCA() && this.getAP() < 40) ||
+            (!this.inCA() && this.getAP() < 40 && (spell.getCooldown(S.convoke)?.timeleft || 0) < this.getCACdRemains())
+          ),
+          spell.cast(S.forceOfNature, () => this.getCurrentTarget(), () =>
+            !this._opener || !this.hasStars()
+          ),
+          spell.cast(S.furyOfElune, () => this.getCurrentTarget(), () => {
+            if (this.isElunesChosen()) return true;
+            if (this._opener) return !this.eclipseDown() && !this.hasStars();
+            return this.hasHarmony() || this.getFoNCdRemains() < 1500 ||
+              (spell.isSpellKnown(394121) && this.getFoNCdRemains() > 20000);
+          }),
+          // DoTs
+          spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+          spell.cast(S.moonfire, () => this.getCurrentTarget(), () => this.mfRefresh()),
+          // Spenders (match AoE logic)
+          spell.cast(S.starfall, () => this.getCurrentTarget(), () =>
+            me.hasAura(A.starweaversWarp) ||
+            (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() >= 3) ||
+            (this.getEnemyCount() >= 3 && this.getAP() > 80)
+          ),
+          spell.cast(S.starsurge, () => this.getCurrentTarget(), () =>
+            me.hasAura(A.starweaversWeft) ||
+            (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() <= 2) ||
+            (this.getEnemyCount() <= 2 && this.getAP() > 80) ||
+            this.hasStars()
+          ),
+          // Instants
+          spell.cast(S.starfire, () => this.getCurrentTarget(), () =>
+            me.hasAura(A.warriorOfElune) || this.hasFires()
+          ),
+          // Eclipse entry (instant)
+          this.enterSolar(),
+          spell.cast(S.lunarEclipse, () => me, () => {
+            if (this.inEclipse()) return false;
+            if (this.isElunesChosen()) return this._opener || this.getCAFullRecharge() > 15000;
+            if (this.getEnemyCount() <= 2) return false;
+            const cf = this.getEclipseChargesFrac();
+            if (this._opener && cf >= 2) return true;
+            if (!this._opener && cf > 1.5 && this.cdWindow()) return true;
+            return this.targetTTD() < 15000;
+          }),
+          // Moonfire/Sunfire spam (always cast something while moving)
+          spell.cast(S.sunfire, () => this.getCurrentTarget()),
+          spell.cast(S.moonfire, () => this.getCurrentTarget()),
+          new bt.Action(() => bt.Status.Success)
+        ),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+
+      // 1. CA/Inc: KotG=prev_gcd FoN, EC=prev_gcd FoE + eclipse_down
+      spell.cast(S.celestialAlignment, () => me, () => {
+        if (!this.useCDs()) return false;
+        if (this.targetTTD() < 20000) return true;
+        if (!this.isElunesChosen()) return this.prevGcdFoN();
+        return this.prevGcdFoE() && this.eclipseDown();
+      }),
+      spell.cast(S.incarnation, () => me, () => {
+        if (!this.useCDs()) return false;
+        if (this.targetTTD() < 20000) return true;
+        if (!this.isElunesChosen()) return this.prevGcdFoN();
+        return this.prevGcdFoE() && this.eclipseDown();
+      }),
+
+      // 2-3. DoTs (target_if: remains<2 | refreshable & eclipse_down)
+      // Moonfire spreading to targets without it
+      new bt.Action(() => {
+        if (spell.getTimeSinceLastCast(S.moonfire) < 2000) return bt.Status.Failure;
+        const target = this.findMoonfireTarget();
+        if (!target) return bt.Status.Failure;
+        if (target.timeToDeath && target.timeToDeath() < MIN_DOT_TTD) return bt.Status.Failure;
+        const result = spell.cast(S.moonfire, () => target).execute({});
+        return result === bt.Status.Success ? bt.Status.Success : bt.Status.Failure;
+      }),
+      spell.cast(S.sunfire, () => this.getCurrentTarget(), () => this.sfRefresh()),
+
+      // 4. Fury of Elune: EC=unconditional, KotG=complex gating
+      spell.cast(S.furyOfElune, () => this.getCurrentTarget(), () => {
+        if (this.isElunesChosen()) return true; // EC: unconditional in AoE per SimC
+        // KotG:
+        if (this._opener) return !this.eclipseDown() && !this.hasStars();
+        return this.hasHarmony() || this.getFoNCdRemains() < 1500 ||
+          (spell.isSpellKnown(394121) && this.getFoNCdRemains() > 20000); // Radiant Moonlight
+      }),
+
+      // 5. Solar Eclipse (KotG AoE: charges_fractional + cd_window)
+      spell.cast(S.solarEclipse, () => me, () => {
+        if (this.isElunesChosen()) return false;
+        if (this.inEclipse()) return false;
+        const cf = this.getEclipseChargesFrac();
+        if (this._opener && cf >= 2) return true;
+        if (!this._opener && cf > 1.5 && this.cdWindow()) return true;
+        if (spell.getCooldown(S.solarEclipse)?.ready && this.cdWindowNarrow()) return true;
+        if (this.targetTTD() < 15000) return true;
+        return false;
+      }),
+
+      // 6. Lunar Eclipse (EC always, or KotG 3+ targets)
+      spell.cast(S.lunarEclipse, () => me, () => {
+        if (this.inEclipse()) return false;
+        if (this.isElunesChosen()) {
+          return this._opener || this.getCAFullRecharge() > 15000;
         }
-      }
-      
-      // Additional checks for multi-target
-      if (!this.hasTalent('Treants of the Moon') || 
-          targetCount > 6 || 
-          (spell.getCooldown('Force of Nature').timeleft > 3000 && !me.hasAura('Harmony of the Grove'))) {
-        if (spell.cast("Moonfire", () => moonTarget)) {
-          return bt.Status.Failure;
+        // KotG: 3+ targets only
+        if (this.getEnemyCount() <= 2) return false;
+        const cf = this.getEclipseChargesFrac();
+        if (this._opener && cf >= 2) return true;
+        if (!this._opener && cf > 1.5 && this.cdWindow()) return true;
+        if (spell.getCooldown(S.lunarEclipse)?.ready && this.cdWindowNarrow()) return true;
+        if (this.targetTTD() < 15000) return true;
+        return false;
+      }),
+
+      // 7. Convoke: CA+AP<40 | off-burst+AP<40+Convoke CD < CA CD
+      spell.cast(S.convoke, () => this.getCurrentTarget(), () =>
+        (this.inCA() && this.getAP() < 40) ||
+        (!this.inCA() && this.getAP() < 40 && (spell.getCooldown(S.convoke)?.timeleft || 0) < this.getCACdRemains())
+      ),
+
+      // 8. Wrath pooling (non-Convoke, <3 targets, FoN coming)
+      spell.cast(S.wrath, () => this.getCurrentTarget(), () =>
+        !spell.isSpellKnown(S.convoke) && this.getEnemyCount() < 3 &&
+        !this.hasStars() &&
+        (this._opener ? this.getAP() < 50 :
+          this.getAP() < 80 && this.noWeaverProcs() && this.getFoNCdRemains() < 15000)
+      ),
+
+      // 9. Pre-burst Sunfire (line_cd=10)
+      spell.cast(S.sunfire, () => this.getCurrentTarget(), () => {
+        if (spell.getTimeSinceLastCast(S.sunfire) < 10000) return false;
+        if (this._opener) return !this.hasStars();
+        return this.getDebuffRemaining(S.sunfire) < 10000 &&
+          this.caSoon() && this.getFoNCdRemains() < 3000;
+      }),
+
+      // 10. Force of Nature
+      spell.cast(S.forceOfNature, () => this.getCurrentTarget(), () =>
+        !this._opener || !this.hasStars()
+      ),
+
+      // 10b. Wild Mushroom (EC AoE: step 7 per Dreamgrove — before Starfall)
+      new bt.Decorator(
+        () => this.isElunesChosen(),
+        spell.cast(S.wildMushroom, () => this.getCurrentTarget(), () => {
+          if (this.apDeficit() < 10) return false;
+          const t = this.getCurrentTarget();
+          if (t && (t.hasAuraByMe(A.fungalGrowth) || t.getAuraByMe(A.fungalGrowth))) return false;
+          return true;
+        }),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+
+      // 11. Starfall: Warp proc | TtC proc | 3+ targets overcap prevention
+      spell.cast(S.starfall, () => this.getCurrentTarget(), () =>
+        me.hasAura(A.starweaversWarp) ||
+        (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() >= 3) ||
+        (this.getEnemyCount() >= 3 && this.getAP() > 80)
+      ),
+
+      // 12. Starsurge: Weft proc | TtC on 2 targets | 2 targets overcap | Ascendant Stars
+      spell.cast(S.starsurge, () => this.getCurrentTarget(), () =>
+        me.hasAura(A.starweaversWeft) ||
+        (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() <= 2) ||
+        (this.getEnemyCount() <= 2 && this.getAP() > 80) ||
+        this.hasStars()
+      ),
+
+      // 13. Starfire: Ascendant Fires + Lunar
+      spell.cast(S.starfire, () => this.getCurrentTarget(), () =>
+        this.hasFires() && this.inLunar()
+      ),
+
+      // 14. Moon cycle (transforming spell — only current phase is castable)
+      this.castMoon(),
+
+      // 17. Wild Mushroom: no AP overcap, Fungal Growth not active
+      spell.cast(S.wildMushroom, () => this.getCurrentTarget(), () => {
+        if (this.apDeficit() < 10) return false;
+        const t = this.getCurrentTarget();
+        if (t && (t.hasAuraByMe(A.fungalGrowth) || t.getAuraByMe(A.fungalGrowth))) return false;
+        if (this.isElunesChosen()) return true;
+        return this.inSolar() || (spell.getFullRechargeTime(S.wildMushroom) || 99999) < this.getCACdRemains();
+      }),
+
+      // 18. Starfire (complex AoE filler by EC/target count/CA)
+      spell.cast(S.starfire, () => this.getCurrentTarget(), () => {
+        if (this.isElunesChosen()) return true;
+        if (this.eclipseDown() && this.getEnemyCount() > 6) return true;
+        if (this.inLunar()) {
+          const e = this.getEnemyCount();
+          return (e > 2 && this.inCA()) || (e <= 2 && !this.inCA());
         }
+        return false;
+      }),
+
+      // 19. Wrath fallback
+      spell.cast(S.wrath, () => this.getCurrentTarget())
+    );
+  }
+
+  // =============================================
+  // DEFENSIVES
+  // =============================================
+  defensives() {
+    return new bt.Selector(
+      spell.cast(S.barkskin, () => me, () =>
+        Settings.FWBalBarkskin && me.pctHealth <= Settings.FWBalBarkskinHP
+      ),
+      new bt.Decorator(
+        () => Settings.FWBalSelfHeal,
+        new bt.Selector(
+          spell.cast(S.renewal, () => me, () => me.pctHealth <= Settings.FWBalRenewalHP),
+          spell.cast(S.naturesSwiftness, () => me, () =>
+            me.pctHealth <= Settings.FWBalRegrowthHP && !me.hasAura(A.naturesSwiftness)
+          ),
+          spell.cast(S.regrowth, () => me, () => me.hasAura(A.naturesSwiftness)),
+          spell.cast(S.regrowth, () => me, () =>
+            me.pctHealth <= 25 && spell.getTimeSinceLastCast(S.regrowth) > 4000
+          ),
+          new bt.Action(() => bt.Status.Failure)
+        ),
+        new bt.Action(() => bt.Status.Failure)
+      ),
+      new bt.Action(() => bt.Status.Failure)
+    );
+  }
+
+  // =============================================
+  // ECLIPSE ENTRY
+  // =============================================
+  // KotG ST Solar Eclipse (charges_fractional + cd_window + Starlord expiry)
+  enterSolar() {
+    return spell.cast(S.solarEclipse, () => me, () => {
+      if (this.inEclipse()) return false;
+      if (this.isElunesChosen()) return false;
+      const cf = this.getEclipseChargesFrac();
+      if (this._opener && cf >= 2) return true;
+      if (!this._opener && cf > 1.5 && this.cdWindow()) return true;
+      if (spell.getCooldown(S.solarEclipse)?.ready && this.cdWindowNarrow()) return true;
+      // Dreamgrove: enter Solar when Starlord falls off (if talented)
+      const sl = me.getAura(A.starlord);
+      if (sl && sl.remaining < 2000 && cf >= 1) return true;
+      if (this.targetTTD() < 15000) return true;
+      return false;
+    });
+  }
+
+  // =============================================
+  // ECLIPSE DETECTION (cached per tick)
+  // =============================================
+  _refreshEclipseCache() {
+    if (this._eclipseFrame === wow.frameTime) return;
+    this._eclipseFrame = wow.frameTime;
+    this._cachedSolar = me.auras.find(a =>
+      a.spellId === 48517 || a.name.includes("Finsternis (Sonne") || a.name.includes("Eclipse (Solar")
+    ) || null;
+    this._cachedLunar = me.auras.find(a =>
+      a.spellId === 48518 || a.name.includes("Finsternis (Mond") || a.name.includes("Eclipse (Lunar")
+    ) || null;
+  }
+
+  inSolar() { this._refreshEclipseCache(); return this._cachedSolar !== null; }
+  inLunar() { this._refreshEclipseCache(); return this._cachedLunar !== null; }
+  inEclipse() { return this.inSolar() || this.inLunar(); }
+  eclipseDown() { return !this.inSolar() && !this.inLunar(); }
+  solarRemains() { this._refreshEclipseCache(); return this._cachedSolar ? this._cachedSolar.remaining : 0; }
+  lunarRemains() { this._refreshEclipseCache(); return this._cachedLunar ? this._cachedLunar.remaining : 0; }
+  eclipseRemains() { return Math.max(this.solarRemains(), this.lunarRemains()); }
+
+  // Eclipse charge fractional (SimC: cooldown.eclipse.charges_fractional)
+  getEclipseChargesFrac() {
+    if (this.isElunesChosen()) return spell.getChargesFractional(S.lunarEclipse) || 0;
+    return spell.getChargesFractional(S.solarEclipse) || 0;
+  }
+
+  // =============================================
+  // SIMC VARIABLE HELPERS
+  // =============================================
+
+  // variable.cd_window = cooldown.force_of_nature.remains>15 | cooldown.ca_inc.remains<44
+  cdWindow() {
+    return this.getFoNCdRemains() > 15000 || this.getCACdRemains() < 44000;
+  }
+
+  // variable.cd_window_narrow = cooldown.force_of_nature.remains>30 | (ca_inc.remains>10 & <20)
+  cdWindowNarrow() {
+    const ca = this.getCACdRemains();
+    return this.getFoNCdRemains() > 30000 || (ca > 10000 && ca < 20000);
+  }
+
+  // variable.no_weaver_procs = !touch_the_cosmos & !starweavers_warp
+  noWeaverProcs() {
+    return !me.hasAura(A.touchTheCosmos) && !me.hasAura(A.starweaversWarp);
+  }
+
+  // variable.ca_soon = cooldown.ca_inc.remains<3 | cooldown.ca_inc.charges_fractional>1
+  caSoon() {
+    const caCharges = spell.getChargesFractional(S.celestialAlignment) ||
+      spell.getChargesFractional(S.incarnation) || 0;
+    return this.getCACdRemains() < 3000 || caCharges > 1;
+  }
+
+  // Prev GCD checks (SimC: prev_gcd.1.X)
+  prevGcdFoN() { return spell.getTimeSinceLastCast(S.forceOfNature) < 1500; }
+  prevGcdFoE() { return spell.getTimeSinceLastCast(S.furyOfElune) < 1500; }
+
+  // Ascendant Stars/Fires
+  hasStars() { return me.hasAura(A.ascendantStars); }
+  hasFires() { return me.hasAura(A.ascendantFires); }
+  hasHarmony() { return me.hasAura(A.harmonyOfTheGrove); }
+
+  // =============================================
+  // SPENDER CONDITIONS
+  // =============================================
+
+  // KotG Starsurge: handles both Starweaver and Rattle the Stars builds
+  // Starweaver: AP > cost*2 - procCount | solar | TtC+Stars | Weft
+  // Rattle the Stars: AP overcap | solar | TtC | Ascendant Stars
+  kotgSSCond() {
+    const ap = this.getAP();
+    const hasWeaver = spell.isSpellKnown(393940); // Starweaver talent
+    if (hasWeaver) {
+      const procs = (me.hasAura(A.starweaversWeft) ? 1 : 0) +
+        (me.hasAura(A.touchTheCosmos) ? 1 : 0) +
+        (me.hasAura(A.starweaversWarp) ? 1 : 0);
+      return (ap > STARSURGE_COST * 2 - procs || this.inSolar()) ||
+        (me.hasAura(A.touchTheCosmos) && this.hasStars()) ||
+        me.hasAura(A.starweaversWeft);
+    }
+    // Rattle the Stars: reduced cost (27), spend in Solar or at overcap
+    if (this.inSolar()) return ap > 27;
+    if (me.hasAura(A.touchTheCosmos)) return true;
+    if (this.hasStars()) return true;
+    return ap > 80; // overcap prevention
+  }
+
+  // EC Starsurge: overcap AP | Ascendant Stars | Weft | TtC (ST only, AoE uses Starfall for TtC)
+  ecSSCond() {
+    return this.getAP() > 80 ||
+      this.hasStars() ||
+      me.hasAura(A.starweaversWeft) ||
+      me.hasAura(A.touchTheCosmos);
+  }
+
+  // EC Starfall: Warp proc | TtC proc (on 2+ targets, ST prefers Starsurge for TtC)
+  ecSFallCond() {
+    if (me.hasAura(A.starweaversWarp)) return true;
+    if (me.hasAura(A.touchTheCosmos) && this.getEnemyCount() >= 2) return true;
+    return false;
+  }
+
+  // KotG FoE: opener(eclipse+!stars) | sustain(harmony | FoN<gcd | Radiant+FoN>20)
+  kotgFoeCond() {
+    if (this._opener) return !this.eclipseDown() && !this.hasStars();
+    return this.hasHarmony() || this.getFoNCdRemains() < 1500 ||
+      (spell.isSpellKnown(394121) && this.getFoNCdRemains() > 20000);
+  }
+
+  // KotG FoN: opener(stars down + SF>16) | sustain(eclipse.remains>FoN dur | !eclipse+eclipse coming)
+  kotgFoNCond() {
+    if (this.targetTTD() < 15000) return true;
+    if (this._opener) {
+      return !this.hasStars() && this.getDebuffRemaining(S.sunfire) > 16000;
+    }
+    if (this.eclipseRemains() > FON_DURATION) return true;
+    if (!this.inEclipse()) {
+      const eclCD = spell.getCooldown(S.solarEclipse)?.timeleft || 99999;
+      if (eclCD < 1500) return true;
+      const caReady = this.getCACdRemains() < 1500;
+      if (caReady) {
+        if (!spell.isSpellKnown(S.convoke)) return true;
+        return (spell.getCooldown(S.convoke)?.timeleft || 99999) < 7500;
       }
     }
-    return bt.Status.Failure;
-  })
-),
-
-// Replace the Sunfire casting with this:
-// Simple Sunfire implementation for multiTarget method
-spell.cast('Sunfire', this.getCurrentTarget, () => {
-  const target = this.getCurrentTarget();
-  if (!target) return false;
-  
-  // Check if target has the Sunfire debuff
-  const debuff = target.getAuraByMe("Sunfire");
-  const debuffRemaining = debuff ? debuff.remaining : 0;
-  
-  // Get target count for threshold calculation
-  const targetCount = this.enemiesAroundTarget(10);
-  
-  // Calculate refresh threshold (simpler formula)
-  const refreshThreshold = targetCount > 4 ? 4000 : 6000;
-  
-  // Only cast if debuff is missing or about to expire
-  return !debuff || debuffRemaining < refreshThreshold;
-}),
-      
-      // Eclipse building spells
-      spell.cast('Wrath', this.getCurrentTarget, () => 
-        this.enterLunar() && 
-        (this.inNoEclipse() || Math.max(this.solarRemains(), this.lunarRemains()) < spell.getSpell('Wrath').castTime)
-      ),
-      
-      spell.cast('Starfire', this.getCurrentTarget, () => 
-        !this.enterLunar() && 
-        (this.inNoEclipse() || Math.max(this.solarRemains(), this.lunarRemains()) < spell.getSpell('Starfire').castTime)
-      ),
-      
-      // Stellar Flare with target count limit
-      spell.cast('Stellar Flare', this.getCurrentTarget, () => {
-        const targetCount = this.enemiesAroundTarget(10);
-        const debuffRemaining = this.getDebuffRemainingTime('Stellar Flare');
-        
-        // Calculate the target threshold based on talents
-        const targetThreshold = 11 - 
-                               (this.hasTalent('Umbral Intensity') ? 1 : 0) - 
-                               (this.hasTalent('Astral Smolder') ? 2 : 0) - 
-                               (this.hasTalent('Lunar Calling') ? 1 : 0);
-        
-        return debuffRemaining < 7000 && targetCount < targetThreshold;
-      }),
-      
-      // Force of Nature
-      spell.cast('Force of Nature', this.getCurrentTarget),
-      
-      // Fury of Elune during eclipse
-      spell.cast('Fury of Elune', this.getCurrentTarget, () => this.inEclipse()),
-      
-      // Cooldowns
-      this.preCombatCooldowns(),
-      this.castCooldowns(),
-      
-      // Warrior of Elune with proper timing
-      spell.cast('Warrior of Elune', () => 
-        (!this.hasTalent('Lunar Calling') && this.solarRemains() < 7000) || 
-        this.hasTalent('Lunar Calling')
-      ),
-      
-      // Starfall with procs
-      spell.cast('Starfall', this.getCurrentTarget, () => 
-        me.hasAura('Starweaver\'s Warp') || me.hasAura('Touch the Cosmos')
-      ),
-      
-      // Starsurge with proc
-      spell.cast('Starsurge', this.getCurrentTarget, () => me.hasAura('Starweaver\'s Weft')),
-      
-      // Starfall as main spender for AoE
-      spell.cast('Starfall', this.getCurrentTarget, () => 
-        me.powerByType(PowerType.LunarPower) >= 50 && this.enemiesAroundTarget(10) >= 3
-      ),
-      
-      // Convoke with conditions
-      spell.cast('Convoke the Spirits', this.getCurrentTarget, () => 
-        (!me.hasAura('Dreamstate') && !me.hasAura('Umbral Embrace') && 
-         (this.enemiesAroundTarget(10) < 7 || this.enemiesAroundTarget(10) === 1)) && 
-        ((me.hasAura('Celestial Alignment') || me.hasAura('Incarnation: Chosen of Elune') || 
-          spell.getCooldown('Celestial Alignment').timeleft > 40000) && 
-         (!this.hasTalent('Keeper of the Grove') || me.hasAura('Harmony of the Grove') || 
-          spell.getCooldown('Force of Nature').timeleft > 15000))
-      ),
-      
-      // Moon cycle
-      spell.cast('New Moon', this.getCurrentTarget),
-      spell.cast('Half Moon', this.getCurrentTarget),
-      spell.cast('Full Moon', this.getCurrentTarget),
-      
-      // Wild Mushroom
-      spell.cast('Wild Mushroom', this.getCurrentTarget, () => 
-        !this.prevGcd('Wild Mushroom') && !this.getCurrentTarget().hasAura('Fungal Growth')
-      ),
-      
-      // Force of Nature without Keeper of the Grove
-      spell.cast('Force of Nature', this.getCurrentTarget, () => !this.hasTalent('Keeper of the Grove')),
-      
-      // Starfire for AoE
-      spell.cast('Starfire', this.getCurrentTarget, () => {
-        const targetThreshold = 3 - (this.hasTalent('Umbral Intensity') || this.hasTalent('Soul of the Forest') ? 1 : 0);
-        return this.hasTalent('Lunar Calling') || 
-               (this.inLunar() && this.enemiesAroundTarget(10) > targetThreshold);
-      }),
-      
-      // Wrath as default filler
-      spell.cast('Wrath', this.getCurrentTarget)
-    );
+    return false;
   }
 
+  // =============================================
+  // DOT HELPERS — SimC: remains<2 | refreshable & eclipse_down
+  // =============================================
+  mfRefresh() {
+    if (spell.getTimeSinceLastCast(S.moonfire) < 3000) return false;
+    const t = this.getCurrentTarget();
+    if (t && t.timeToDeath && t.timeToDeath() < MIN_DOT_TTD) return false;
+    const rem = this.getDebuffRemaining(S.moonfire);
+    return rem < 2000 || (rem < 5400 && this.eclipseDown()); // 18s * 0.3 = 5.4s pandemic
+  }
 
-  preCombatCooldowns() {
+  sfRefresh() {
+    if (spell.getTimeSinceLastCast(S.sunfire) < 3000) return false;
+    const t = this.getCurrentTarget();
+    if (t && t.timeToDeath && t.timeToDeath() < MIN_DOT_TTD) return false;
+    const rem = this.getDebuffRemaining(S.sunfire);
+    return rem < 2000 || (rem < 5400 && this.eclipseDown());
+  }
+
+  // =============================================
+  // HERO TALENT DETECTION
+  // =============================================
+  isKeeperOfTheGrove() {
+    return me.hasAura(A.treantsOfTheMoon) || spell.isSpellKnown(S.forceOfNature) ||
+      spell.isSpellKnown(468743); // Whirling Stars = KotG exclusive
+  }
+  isElunesChosen() { return !this.isKeeperOfTheGrove(); }
+  inCA() { return me.hasAura(A.celestialAlignment) || me.hasAura(A.incarnation); }
+
+  // =============================================
+  // COOLDOWN HELPERS
+  // =============================================
+  getCACdRemains() {
+    const ca = spell.getCooldown(S.celestialAlignment);
+    const inc = spell.getCooldown(S.incarnation);
+    if (ca && ca.timeleft > 0) return ca.timeleft;
+    if (inc && inc.timeleft > 0) return inc.timeleft;
+    return 0;
+  }
+  getCAFullRecharge() {
+    return spell.getFullRechargeTime(S.celestialAlignment) ||
+      spell.getFullRechargeTime(S.incarnation) || 0;
+  }
+  getFoNCdRemains() { return spell.getCooldown(S.forceOfNature)?.timeleft || 0; }
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
+  }
+  useCDs() { return combat.burstToggle || Settings.FWBalAutoCDs; }
+
+  // =============================================
+  // RESOURCE (cached per tick)
+  // =============================================
+  getAP() {
+    if (this._apFrame === wow.frameTime) return this._cachedAP;
+    this._apFrame = wow.frameTime;
+    this._cachedAP = me.powerByType(PowerType.LunarPower);
+    return this._cachedAP;
+  }
+  apDeficit() { return 120 - this.getAP(); }
+  energize(id) {
+    const a = { [S.forceOfNature]: 20, [S.wrath]: 10, [S.starfire]: 10,
+      [S.newMoon]: 10, [S.halfMoon]: 20, [S.fullMoon]: 40 };
+    return a[id] || 0;
+  }
+
+  // Moon cycle: New→Half→Full is a single transforming spell. Only the current phase is castable.
+  castMoon() {
     return new bt.Selector(
-      spell.cast('Force of Nature', this.getCurrentTarget, () => this.useCooldowns()),
-      spell.cast('Berserking', on => me, () => this.useCooldowns()),
-      new bt.Action(() => bt.Status.Failure)
+      spell.cast(S.fullMoon, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(S.fullMoon) && this.apDeficit() > 40
+      ),
+      spell.cast(S.halfMoon, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(S.halfMoon) && this.apDeficit() > 20
+      ),
+      spell.cast(S.newMoon, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(S.newMoon) && this.apDeficit() > 10
+      ),
     );
   }
 
-  castCooldowns() {
-    // console.debug("CA " + me.hasAura(194223) + " Incarn:" + me.hasAura("Incarnation: Chosen of Elune"));
-    return new bt.Selector(
-      // Only cast Celestial Alignment if it's not already active
-      spell.cast('Celestial Alignment', () => 
-        this.useCooldowns() && 
-        !me.hasAura(194223) &&
-        !me.hasAura('Incarnation: Chosen of Elune')
-      ),
-      
-      // Only cast Incarnation if Celestial Alignment is not active
-      spell.cast('Incarnation: Chosen of Elune', () => 
-        this.useCooldowns() && 
-        !me.hasAura(194223) &&
-        !me.hasAura('Incarnation: Chosen of Elune')
-      ),
-      
-      // Only cast Convoke when in eclipse and when CA/Incarnation is active for maximum benefit
-      spell.cast('Convoke the Spirits', this.getCurrentTarget, () => 
-        this.useCooldowns() && 
-        (me.hasAura(194223) || me.hasAura('Incarnation: Chosen of Elune')) &&
-        this.inEclipse()
-      ),
-      new bt.Action(() => bt.Status.Failure)
-    );
+  // =============================================
+  // TARGET (cached per tick)
+  // =============================================
+  getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const target = me.target;
+    if (target !== null && common.validTarget(target) && me.distanceTo2D(target) <= 40 && me.isFacing(target)) {
+      this._cachedTarget = target;
+      return target;
+    }
+    if (me.inCombat()) {
+      // Prefer targets we're facing to avoid cast stuttering
+      const t = combat.targets.find(u => common.validTarget(u) && me.distanceTo2D(u) <= 40 && me.isFacing(u));
+      if (t) { wow.GameUI.setTarget(t); this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
   }
-  hasTalent(talentName) {
-    return me.hasAura(talentName);
+
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(10) + 1 : 0;
+    return this._cachedEnemyCount;
   }
 
   findMoonfireTarget() {
-    const moonFireTarget = combat.targets.find(unit => !unit.hasAuraByMe("Moonfire"));
-    return moonFireTarget ? moonFireTarget : false;
+    const ct = this.getCurrentTarget();
+    if (ct && !this.unitHasMyDebuff(ct, S.moonfire)) return ct;
+    const mfRem = this.getDebuffRemaining(S.moonfire);
+    if (ct && (mfRem < 2000 || (mfRem < 5400 && this.eclipseDown()))) return ct;
+    return combat.targets.find(u =>
+      common.validTarget(u) && me.distanceTo2D(u) <= 40 && !this.unitHasMyDebuff(u, S.moonfire)
+    ) || null;
   }
 
-  findSunfireTarget() {
-    const moonFireTarget = combat.targets.find(unit => !unit.hasAuraByMe("Sunfire"));
-    return moonFireTarget ? moonFireTarget : false;
+  unitHasMyDebuff(unit, id) {
+    if (!unit) return false;
+    const did = this.debuffId(id);
+    return !!(unit.getAuraByMe(did) || unit.getAuraByMe(id));
   }
 
-  inLunar() {
-    const inLunar = me.auras.find(aura => aura.name.includes("Eclipse (Lunar)") && aura.remaining > 1000) !== undefined;
-    // console.debug('IN Lunar ' + inLunar)
-    return me.auras.find(aura => aura.name.includes("Eclipse (Lunar)") && aura.remaining > 1000) !== undefined;
+  // =============================================
+  // MOTW
+  // =============================================
+  getMotwTarget() {
+    if (spell.getTimeSinceLastCast(S.markOfTheWild) < 5000) return null;
+    if (!this._hasMotw(me)) return me;
+    const friends = me.getFriends ? me.getFriends(40) : [];
+    return friends.find(u => u && !u.deadOrGhost && !this._hasMotw(u)) || null;
+  }
+  _hasMotw(unit) {
+    if (!unit) return false;
+    return unit.hasVisibleAura(S.markOfTheWild) || unit.hasAura(S.markOfTheWild) ||
+      unit.auras.find(a => a.spellId === S.markOfTheWild) !== undefined;
   }
 
-  inSolar() {
-    const inSolar = me.auras.find(aura => aura.name.includes("Eclipse (Solar)") && aura.remaining > 1000) !== undefined;
-    // console.debug('IN Solar ' + inSolar)
-    return me.auras.find(aura => aura.name.includes("Eclipse (Solar)") && aura.remaining > 1000) !== undefined;
+  // =============================================
+  // DEBUFF
+  // =============================================
+  getDebuffRemaining(spellId) {
+    const t = this.getCurrentTarget();
+    if (!t) return 0;
+    const did = this.debuffId(spellId);
+    let d = t.getAuraByMe(did);
+    if (!d && did !== spellId) d = t.getAuraByMe(spellId);
+    if (!d) d = t.auras.find(a =>
+      (a.spellId === did || a.spellId === spellId) && a.casterGuid?.equals(me.guid)
+    );
+    return d ? d.remaining : 0;
   }
-
-// Subroutinen für benötigte Bedingungen und Parameter
-enterLunar() {
-  // If we're already in an eclipse, return based on current eclipse
-  if (this.inSolar()) return true;  // In Solar, we should cast Wrath to benefit from it
-  if (this.inLunar()) return false; // In Lunar, we should cast Starfire to benefit from it
-  
-  // If we're not in any eclipse (have Dreamstate), we need to determine which one to enter:
-  // - For 3+ targets: Cast Wrath to enter LUNAR Eclipse (good for AoE)
-  // - For 1-2 targets: Cast Starfire to enter SOLAR Eclipse (good for ST)
-  const targetCount = this.enemiesAroundTarget(10);
-  
-  // Return true if we should cast Wrath (to enter Lunar Eclipse)
-  // Return false if we should cast Starfire (to enter Solar Eclipse)
-  return targetCount >= 3;
-}
-
-inEclipse() {
-  const lunareclipse = me.auras.find(aura => aura.name.includes("Eclipse (Lunar)") && aura.remaining > 1000) !== undefined;
-  const solareclipse = me.auras.find(aura => aura.name.includes("Eclipse (Solar)") && aura.remaining > 1000) !== undefined;
-  const eclipse = (solareclipse || lunareclipse) !== null ? true : false;
-  return eclipse;
-}
-
-inNoEclipse() {
-  // We're not in eclipse if we're not in Solar or Lunar AND we have Dreamstate stacks
-  const notInEclipse = !this.inSolar() && !this.inLunar();
-  const hasDreamstate = me.getAuraStacks('Dreamstate') > 0;
-  
-  return notInEclipse && hasDreamstate;
-}
-
-hasCooldownsReady() {
-  return (
-    spell.getCooldown('Celestial Alignment').ready ||
-    spell.getCooldown('Incarnation: Chosen of Elune').ready
-  );
-}
-
-eclipseRemains() {
-  const solartimer = this.getAuraById(auras.solareclipse);
-  const lunartimer = this.getAuraById(auras.lunareclipse);
-  return Math.max(lunartimer.remaining, solartimer.remaining);
-}
-
-solarRemains() {
-  const solartime = this.getAuraById(auras.solareclipse);
-  // console.debug('Solar ' + solartime.remaining)
-  return solartime.remaining;
-}
-
-lunarRemains() {
-  const lunartime = this.getAuraById(auras.lunareclipse);
-  // console.debug('Lunar ' +lunartime.remaining)
-  return lunartime.remaining;
-}
-
-getAuraById(spellId) {
-  return me.auras.find(aura => aura.spellId === spellId) || 0;
-}
-
-getBoatStacks() {
-  const aura = me.getAura('Balance of All Things');
-  return aura ? aura.stacks : 0;
-}
-
-castTime(spellName) {
-  console.debug("Get Casttime of: " + spellName);
-  return spell.getSpell(spellName).castTime;
-}
-
-cdCondition() {
-  return Settings.DruidBalanceUseCooldown;
-}
-
-astralPowerDeficit() {
-  return 120 - me.powerByType(PowerType.LunarPower);
-}
-
-passiveAsp() {
-  return 6; // Beispielwert, abhängig von Charakter-Stats
-}
-
-useCooldowns() {
-  return Settings.DruidBalanceUseCooldown;
-}
-
-energizeAmount(spellName) {
-  const spellEnergizeAmounts = { 'Force of Nature': 20, 'Wrath' : 10, 'Starfire' : 10 }; // Beispielwerte, anpassen nach Spell
-  return spellEnergizeAmounts[spellName] || 0;
-}
-
-convokeCondition() {
-  return this.cdCondition() && spell.getCooldown('Convoke the Spirits').ready;
-}
-
-prevGcd(spellName) {
-  return spell.getLastSuccessfulSpell() === spellName ? spellName : null;
-}
-
-dotRemains(debuffName) {
-    const target = this.getCurrentTarget();
-    const debuff = target.getAura(debuffName);
-    return debuff ? debuff.remaining : 0;
-}
-
-getGCD() {
-  return 1500;
-}
-  getCurrentTarget() {
-    const targetPredicate = unit => common.validTarget(unit) && me.isFacing(unit);
-    const target = me.target;
-    if (target !== null && targetPredicate(target)) {
-      return target;
-    }
-    return combat.targets.find(targetPredicate) || null;
+  debuffId(id) {
+    if (id === S.moonfire) return A.moonfireDebuff;
+    if (id === S.sunfire) return A.sunfireDebuff;
+    return id;
   }
-
-  getAuraRemainingTime(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.remaining : 0;
-  }
-
-  getDebuffRemainingTime(debuffName) {
-    const target = this.getCurrentTarget();
-    const debuff = target.getAura(debuffName);
-    return debuff ? debuff.remaining : 0;
-  }
-  enemiesAroundTarget(range) {
-    const target = this.getCurrentTarget();
-    return target ? target.getUnitsAroundCount(range) : 0;
-  }
-
-  // New target selection functions for DOT application
-findMoonfireTarget() {
-  // Check current target first
-  const currentTarget = this.getCurrentTarget();
-  if (currentTarget && !currentTarget.hasAuraByMe("Moonfire")) {
-    return currentTarget;
-  }
-  
-  // Find a target without Moonfire
-  const moonFireTarget = combat.targets.find(unit => 
-    common.validTarget(unit) && 
-    !unit.hasAuraByMe("Moonfire") && 
-    unit.distanceTo(me) <= 40
-  );
-  
-  return moonFireTarget || null;
-}
-
-findSunfireTarget() {
-  // Check current target first
-  const currentTarget = this.getCurrentTarget();
-  if (currentTarget && !currentTarget.hasAuraByMe("Sunfire")) {
-    return currentTarget;
-  }
-  
-  // Find a target without Sunfire
-  const sunfireTarget = combat.targets.find(unit => 
-    common.validTarget(unit) && 
-    !unit.hasAuraByMe("Sunfire") && 
-    unit.distanceTo(me) <= 40
-  );
-  
-  return sunfireTarget || null;
-}
 }

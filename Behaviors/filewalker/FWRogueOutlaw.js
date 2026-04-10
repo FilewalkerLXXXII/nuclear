@@ -1,753 +1,531 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
-import Common from '@/Core/Common';
-import Spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import Settings from "@/Core/Settings";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
 /**
- * Behavior implementation for Outlaw Rogue
- * Based on SIMC profile TWW2_Rogue_Outlaw
+ * Outlaw Rogue Behavior - Midnight 12.0.1
+ * Line-by-line match to SimC APL (midnight branch):
+ *   actions (default), actions.cds, actions.build, actions.finish
+ *
+ * Auto-detects: Fatebound (452536) vs Trickster (441146)
+ * Resource: Energy (PowerType 3) + Combo Points (PowerType 4)
+ * All melee instant + Pistol Shot (ranged) -- no movement block needed
+ *
+ * Key mechanics:
+ *   - Roll the Bones stage management (reroll at stage 1, KIR at stage 2+)
+ *   - Adrenaline Rush burst + Improved AR sync
+ *   - Hidden Opportunity talent: Ambush > Pistol Shot > SS
+ *   - Fan the Hammer: Opportunity stack/expiry management
+ *   - Fatebound: finish at cp_max-2 when BtE not ready, Preparation CD reset
+ *   - Trickster: Coup de Grace with Disorienting Strikes
+ *   - Blade Flurry AoE toggle + Deft Maneuvers CP gen
+ *   - Supercharger + Zero In: hold BtE for upcoming AR
+ *   - Blade Rush: 4pc set bonus tracking + energy management
+ *   - Bloodlust-aware potion timing
  */
+
+const S = {
+  // Builders
+  sinisterStrike:     193315,
+  ambush:             8676,
+  pistolShot:         185763,
+  // Finishers
+  dispatch:           2098,
+  betweenTheEyes:     315341,
+  killingSpree:       51690,
+  coupDeGrace:        441776,
+  // Buffs / CDs
+  bladeFlurry:        13877,
+  rollTheBones:       315508,
+  sliceAndDice:       315496,
+  adrenalineRush:     13750,
+  keepItRolling:      381989,
+  bladeRush:          271877,
+  preparation:        1277933,
+  coldBlood:          382245,
+  thistleTea:         381623,
+  vanish:             1856,
+  stealth:            1784,
+  // Utility
+  kick:               1766,
+  shadowstep:         36554,
+  berserking:         26297,
+};
+
+const A = {
+  // Self buffs
+  adrenalineRush:     13750,
+  bladeFlurry:        13877,
+  sliceAndDice:       315496,
+  rollTheBones:       315508,
+  coldBlood:          382245,
+  vanishBuff:         11327,
+  subterfuge:         115192,
+  stealth:            1784,
+  // RtB individual buffs
+  broadside:          193356,
+  ruthlessPrecision:  193357,
+  grandMelee:         193358,
+  trueBearing:        193359,
+  buriedTreasure:     199600,
+  skullCrossbones:    199603,
+  // Procs
+  opportunity:        195627,
+  audacity:           386270,
+  loadedDice:         256171,
+  greenskinsWickers:  394131,
+  // BtE debuff on target
+  betweenTheEyes:     315341,
+  // Trickster
+  escalatingBlade:    441786,
+  flawlessForm:       441326,
+  fazed:              441224,
+  disorienting:       441274,   // Disorienting Strikes buff
+  // Fatebound
+  fateCoinsHeads:     452923,
+  fateCoinsTails:     452917,
+  // Set bonus
+  whirlOfBlades:      1275176,  // 4pc set buff: +5% dmg 8s from Blade Rush
+  // Bloodlust
+  bloodlust:          2825,
+  heroism:            32182,
+  timewarp:           80353,
+  // Hero detection
+  fateboundKnown:     452536,
+  tricksterKnown:     441146,
+};
+
+// Talent IDs
+const T = {
+  hiddenOpportunity:  383281,
+  improvedAmbush:     381620,
+  fanTheHammer:       381846,
+  quickDraw:          196938,
+  audacity:           381845,
+  deftManeuvers:      381878,
+  improvedAR:         395422,
+  supercharger:       470347,
+  zeroIn:             1265736,
+  dealFate:           452536,   // Fatebound talent
+  preparation:        1277933,
+};
+
 export class OutlawRogueBehavior extends Behavior {
-  // Define context, specialization, name, and version
+  name = 'FW Outlaw Rogue';
   context = BehaviorContext.Any;
-  specialization = Specialization.Rogue.Combat;
-  name = "FW Outlaw Rogue";
-  version = 1;
-  
-  // Define talent build options - automatically determined based on hero talents
-  static TALENT_BUILDS = {
-    DEATHSTALKER: 'deathstalker',  // From Hero Talents: Deathstalker's Mark
-    FATEBOUND: 'fatebound',        // From Hero Talents: Hand of Fate
-    TRICKSTER: 'trickster',        // From Hero Talents: Unseen Blade
-  };
-  
-  /**
-   * Settings for the behavior
-   * These will appear in the UI settings panel
-   */
+  specialization = Specialization.Rogue.Combat; // "Combat" = Outlaw in enum
+  version = wow.GameVersion.Retail;
+
+  // Per-tick caches
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _energyFrame = 0;
+  _cachedEnergy = 0;
+  _cpFrame = 0;
+  _cachedCP = 0;
+  _rtbFrame = 0;
+  _cachedRtbCount = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _versionLogged = false;
+  _lastDebug = 0;
+
   static settings = [
     {
-      header: "Outlaw Rogue Configuration",
+      header: 'General',
       options: [
-        {
-          uid: "DoubleCoups",
-          text: "Double Coup de Grace (Bug)",
-          type: "checkbox",
-          default: false,
-          description: "Enable to chain cast Coup de Grace (if bug is active)"
-        },
-        {
-          uid: "AOEThreshold",
-          text: "AOE Threshold",
-          type: "slider",
-          min: 2,
-          max: 5,
-          default: 3,
-          description: "Number of enemies for Blade Flurry"
-        },
-        {
-          uid: "LethalPoison",
-          text: "Lethal Poison",
-          type: "dropdown",
-          default: "instant",
-          options: [
-            { text: "Instant", value: "instant" },
-            { text: "Wound", value: "wound" },
-            { text: "Deadly", value: "deadly" }
-          ]
-        },
-        {
-          uid: "NonLethalPoison",
-          text: "Non-Lethal Poison",
-          type: "dropdown",
-          default: "none",
-          options: [
-            { text: "None", value: "none" },
-            { text: "Crippling", value: "crippling" },
-            { text: "Numbing", value: "numbing" }
-          ]
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWOutUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'slider', uid: 'FWOutAoECount', text: 'Blade Flurry targets', default: 2, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWOutDebug', text: 'Debug Logging', default: false },
+      ],
+    },
   ];
 
-  /**
-   * Builds the behavior tree for Outlaw Rogue
-   * @returns {bt.Composite} The root node of the behavior tree
-   */
+  // =============================================
+  // HERO TALENT DETECTION
+  // =============================================
+  isFatebound() { return spell.isSpellKnown(A.fateboundKnown); }
+  isTrickster() { return !this.isFatebound(); }
+
+  // =============================================
+  // CACHED RESOURCE ACCESSORS
+  // =============================================
+  getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
+    const t = me.target;
+    if (t && common.validTarget(t) && me.distanceTo(t) <= 8 && me.isFacing(t)) {
+      this._cachedTarget = t;
+      return t;
+    }
+    if (me.inCombat()) {
+      const ct = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (ct && common.validTarget(ct) && me.distanceTo(ct) <= 8 && me.isFacing(ct)) {
+        this._cachedTarget = ct;
+        return ct;
+      }
+    }
+    this._cachedTarget = null;
+    return null;
+  }
+
+  getEnergy() {
+    if (this._energyFrame === wow.frameTime) return this._cachedEnergy;
+    this._energyFrame = wow.frameTime;
+    this._cachedEnergy = me.powerByType(PowerType.Energy);
+    return this._cachedEnergy;
+  }
+
+  getEnergyMax() { return me.maxPowerByType ? me.maxPowerByType(PowerType.Energy) : 100; }
+  getEnergyDeficit() { return this.getEnergyMax() - this.getEnergy(); }
+
+  getCP() {
+    if (this._cpFrame === wow.frameTime) return this._cachedCP;
+    this._cpFrame = wow.frameTime;
+    this._cachedCP = me.powerByType(PowerType.ComboPoints);
+    return this._cachedCP;
+  }
+
+  getCPMax() { return me.maxPowerByType ? me.maxPowerByType(PowerType.ComboPoints) : 7; }
+  getCPDeficit() { return this.getCPMax() - this.getCP(); }
+
+  getEnemyCount() {
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(8) + 1 : 1;
+    return this._cachedEnemyCount;
+  }
+
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
+  }
+
+  // Count active RtB buffs (cached per tick)
+  getRtbBuffCount() {
+    if (this._rtbFrame === wow.frameTime) return this._cachedRtbCount;
+    this._rtbFrame = wow.frameTime;
+    let count = 0;
+    if (me.hasAura(A.broadside)) count++;
+    if (me.hasAura(A.ruthlessPrecision)) count++;
+    if (me.hasAura(A.grandMelee)) count++;
+    if (me.hasAura(A.trueBearing)) count++;
+    if (me.hasAura(A.buriedTreasure)) count++;
+    if (me.hasAura(A.skullCrossbones)) count++;
+    this._cachedRtbCount = count;
+    return count;
+  }
+
+  // =============================================
+  // SIMC VARIABLES
+  // =============================================
+  // variable.ambush_condition = (talent.hidden_opportunity|combo_points.deficit>=2+talent.improved_ambush)&energy>=50
+  ambushCondition() {
+    const ho = spell.isSpellKnown(T.hiddenOpportunity);
+    const impAmb = spell.isSpellKnown(T.improvedAmbush) ? 1 : 0;
+    return (ho || this.getCPDeficit() >= 2 + impAmb) && this.getEnergy() >= 50;
+  }
+
+  // variable.finish_condition = combo_points>=cp_max_spend-1-(hero_tree.fatebound&!cooldown.between_the_eyes.ready)
+  finishCondition() {
+    const bteReady = spell.getCooldown(S.betweenTheEyes)?.ready || false;
+    const fbAdj = (this.isFatebound() && !bteReady) ? 1 : 0;
+    return this.getCP() >= this.getCPMax() - 1 - fbAdj;
+  }
+
+  // variable.blade_flurry_sync = spell_targets<2&raid_event.adds.in>20|buff.blade_flurry.up
+  bladeFlurrySync() {
+    return this.getEnemyCount() < 2 || me.hasAura(A.bladeFlurry);
+  }
+
+  inAR() { return me.hasAura(A.adrenalineRush); }
+  hasOpportunity() { return me.hasAura(A.opportunity); }
+  hasAudacity() { return me.hasAura(A.audacity); }
+
+  inStealth() {
+    return me.hasAura(A.stealth) || me.hasAura(A.vanishBuff) || me.hasAura(A.subterfuge);
+  }
+
+  getOpportunityStacks() {
+    const a = me.getAura(A.opportunity);
+    return a ? a.stacks : 0;
+  }
+
+  getOpportunityRemaining() {
+    const a = me.getAura(A.opportunity);
+    return a ? a.remaining : 0;
+  }
+
+  getOpportunityMaxStacks() {
+    const a = me.getAura(A.opportunity);
+    return a ? (a.maxStacks || 6) : 6;
+  }
+
+  getEscalatingBladeStacks() {
+    const a = me.getAura(A.escalatingBlade);
+    return a ? a.stacks : 0;
+  }
+
+  // Bloodlust check
+  hasBloodlust() {
+    return me.hasAura(A.bloodlust) || me.hasAura(A.heroism) || me.hasAura(A.timewarp);
+  }
+
+  // BtE buff check (debuff on target)
+  hasBtEDebuff() {
+    const t = this.getCurrentTarget();
+    return t && t.getAuraByMe(A.betweenTheEyes) !== undefined;
+  }
+
+  // =============================================
+  // BUILD -- Main behavior tree
+  // =============================================
   build() {
     return new bt.Selector(
-      Common.waitForCastOrChannel(),
-      Common.waitForNotMounted(),
-      this.applyPoisons(),
-      this.opener(),
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+      // Auto-target
       new bt.Action(() => {
-        // This action ensures we have a valid target
-        if (this.getCurrentTarget() === null) {
-          return bt.Status.Success;
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
         }
         return bt.Status.Failure;
       }),
-      // Main selector for choosing rotation
-      new bt.Selector(
-        // High priority stealth actions
-        new bt.Decorator(
-          () => me.hasAura("Stealth") || me.hasAura("Vanish") || me.hasAura("Subterfuge"),
-          this.stealthActions(),
-          new bt.Action(() => bt.Status.Success)
-        ),
-        // If finish condition is met, use finishers
-        new bt.Decorator(
-          () => this.finishCondition(),
-          this.finishers(),
-          new bt.Action(() => bt.Status.Success)
-        ),
-        // Cooldowns
-        this.useCooldowns(),
-        // Builders
-        this.builders()
-      )
-    );
-  }
+      // Null target bail
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      common.waitForCastOrChannel(),
 
-  /**
-   * Apply poisons to weapons
-   */
-  applyPoisons() {
-    const lethalPoison = Settings.LethalPoison || "instant";
-    const nonLethalPoison = Settings.NonLethalPoison || "none";
-    
-    return new bt.Selector(
-      Spell.cast("Apply Poison", () => {
-        const lethalActive = me.hasAura(this.getLethalPoisonAuraName());
-        const nonLethalActive = nonLethalPoison === "none" || me.hasAura(this.getNonLethalPoisonAuraName());
-        
-        return !lethalActive || !nonLethalActive;
-      })
-    );
-  }
-
-  /**
-   * Get the aura name for the currently selected lethal poison
-   */
-  getLethalPoisonAuraName() {
-    const poisonType = Settings.LethalPoison || "instant";
-    switch(poisonType) {
-      case "instant": return "Instant Poison";
-      case "wound": return "Wound Poison";
-      case "deadly": return "Deadly Poison";
-      default: return "Instant Poison";
-    }
-  }
-
-  /**
-   * Get the aura name for the currently selected non-lethal poison
-   */
-  getNonLethalPoisonAuraName() {
-    const poisonType = Settings.NonLethalPoison || "none";
-    switch(poisonType) {
-      case "crippling": return "Crippling Poison";
-      case "numbing": return "Numbing Poison";
-      default: return "";
-    }
-  }
-
-  /**
-   * Pre-combat opener sequence
-   */
-  opener() {
-    return new bt.Selector(
-      Spell.cast("Stealth", () => !me.inCombat && !me.hasAura("Stealth")),
-      Spell.cast("Adrenaline Rush", () => !me.inCombat && me.hasAura("Stealth") && Spell.isSpellKnown("Improved Adrenaline Rush")),
-      Spell.cast("Roll the Bones", () => !me.inCombat && me.hasAura("Stealth") && !this.hasAnyRtBBuff())
-    );
-  }
-
-  /**
-   * Detect which hero talent build is active based on key hero talents
-   * @returns {string} The detected talent build
-   */
-  detectHeroBuild() {
-    // Check for top-tier hero talents as listed in HeroTalents.txt
-    if (me.hasAura("Deathstalker's Mark")) {
-      return OutlawRogueBehavior.TALENT_BUILDS.DEATHSTALKER;
-    } else if (me.hasAura("Hand of Fate")) {
-      return OutlawRogueBehavior.TALENT_BUILDS.FATEBOUND;
-    } else if (me.hasAura("Unseen Blade")) {
-      return OutlawRogueBehavior.TALENT_BUILDS.TRICKSTER;
-    }
-    
-    // Default to Deathstalker if no hero talent detected
-    return OutlawRogueBehavior.TALENT_BUILDS.DEATHSTALKER;
-  }
-  
-  /**
-   * Check if the Deathstalker build is active
-   */
-  isDeathstalkerBuild() {
-    return this.detectHeroBuild() === OutlawRogueBehavior.TALENT_BUILDS.DEATHSTALKER;
-  }
-  
-  /**
-   * Check if the Fatebound build is active
-   */
-  isFateboundBuild() {
-    return this.detectHeroBuild() === OutlawRogueBehavior.TALENT_BUILDS.FATEBOUND;
-  }
-  
-  /**
-   * Check if the Trickster build is active
-   */
-  isTricksterBuild() {
-    return this.detectHeroBuild() === OutlawRogueBehavior.TALENT_BUILDS.TRICKSTER;
-  }
-  
-  /**
-   * Determine if we should use Ambush based on SIMC condition
-   * (talent.hidden_opportunity|combo_points.deficit>=2+talent.improved_ambush+buff.broadside.up)&energy>=50
-   */
-  ambushCondition() {
-    const comboPointsDeficit = 7 - me.powerByType(PowerType.ComboPoints);
-    const minDeficit = 2 + 
-                      (Spell.isSpellKnown("Improved Ambush") ? 1 : 0) + 
-                      (me.hasAura("Broadside") ? 1 : 0);
-                      
-    const hasEnoughEnergy = me.powerByType(PowerType.Energy) >= 50;
-    
-    return (Spell.isSpellKnown("Hidden Opportunity") || comboPointsDeficit >= minDeficit) && hasEnoughEnergy;
-  }
-
-  /**
-   * Actions to perform while in stealth
-   */
-  stealthActions() {
-    return new bt.Selector(
-      // High priority Cold Blood if finishing
-      Spell.cast("Cold Blood", () => this.finishCondition()),
-      
-      // Pool resources for BtE with Crackshot
+      // Version + Debug logging
       new bt.Action(() => {
-        if (this.finishCondition() && 
-            Spell.isSpellKnown("Crackshot") && 
-            (!me.hasAura("Shadowmeld") || me.hasAura("Stealth") || me.hasAura("Vanish")) && 
-            me.powerByType(PowerType.Energy) < 35) {
-          // We need more energy for BtE, so success here to stop and pool
-          return bt.Status.Success;
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[Outlaw] Midnight 12.0.1 | Hero: ${this.isFatebound() ? 'Fatebound' : 'Trickster'}`);
+        }
+        if (Settings.FWOutDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[Outlaw] E:${Math.round(this.getEnergy())} CP:${this.getCP()}/${this.getCPMax()} RtB:${this.getRtbBuffCount()} AR:${this.inAR()} Opp:${this.getOpportunityStacks()} Aud:${this.hasAudacity()} FC:${this.finishCondition()} WoB:${me.hasAura(A.whirlOfBlades)}`);
         }
         return bt.Status.Failure;
       }),
-      
-      // High priority Between the Eyes for Crackshot
-      Spell.cast("Between the Eyes", () => {
-        return this.finishCondition() && 
-               Spell.isSpellKnown("Crackshot") && 
-               (!me.hasAura("Shadowmeld") || me.hasAura("Stealth") || me.hasAura("Vanish"));
-      }),
-      
-      // Finisher Dispatch
-      Spell.cast("Dispatch", () => this.finishCondition()),
-      
-      // Fan the Hammer + Crackshot builds Pistol Shot with opportunity
-      Spell.cast("Pistol Shot", () => {
-        return Spell.isSpellKnown("Crackshot") && 
-               Spell.isSpellKnown("Fan the Hammer") && 
-               Spell.getAuraStacks("Opportunity") >= 6 && 
-               ((me.hasAura("Broadside") && me.powerByType(PowerType.ComboPoints) <= 1) || 
-                me.hasAura("Greenskins Wickers"));
-      }),
-      
-      // Hidden Opportunity Ambush
-      Spell.cast("Ambush", () => Spell.isSpellKnown("Hidden Opportunity"))
+
+      new bt.Decorator(
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          // SimC: actions+=/kick
+          spell.interrupt(S.kick),
+
+          // SimC: actions+=/call_action_list,name=cds
+          this.cooldowns(),
+
+          // SimC: actions+=/run_action_list,name=finish,if=variable.finish_condition
+          new bt.Decorator(
+            () => this.finishCondition(),
+            this.finishers(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+
+          // SimC: actions+=/call_action_list,name=build
+          this.builders(),
+        )
+      ),
     );
   }
 
-  /**
-   * Finisher abilities
-   */
+  // =============================================
+  // CDS -- SimC: actions.cds (~14 lines)
+  // =============================================
+  cooldowns() {
+    return new bt.Selector(
+      // SimC: adrenaline_rush,if=!buff.adrenaline_rush.up&(!variable.finish_condition|!talent.improved_adrenaline_rush)
+      spell.cast(S.adrenalineRush, () => me, () => {
+        if (!Settings.FWOutUseCDs) return false;
+        if (this.inAR()) return false;
+        if (this.finishCondition() && spell.isSpellKnown(T.improvedAR)) return false;
+        return this.targetTTD() > 10000;
+      }),
+
+      // SimC: blade_flurry,if=spell_targets>=2&buff.blade_flurry.remains<gcd
+      spell.cast(S.bladeFlurry, () => me, () => {
+        if (this.getEnemyCount() < 2) return false;
+        const bf = me.getAura(A.bladeFlurry);
+        return !bf || bf.remaining < 1500;
+      }),
+
+      // SimC: preparation,if=cooldown.adrenaline_rush.remains>30&!cooldown.between_the_eyes.ready&
+      //   (!cooldown.killing_spree.ready|!hero_tree.trickster)|fight_remains<30
+      spell.cast(S.preparation, () => me, () => {
+        if (!spell.isSpellKnown(T.preparation)) return false;
+        const arCD = spell.getCooldown(S.adrenalineRush)?.timeleft || 0;
+        const bteReady = spell.getCooldown(S.betweenTheEyes)?.ready || false;
+        const ksReady = spell.getCooldown(S.killingSpree)?.ready || false;
+        if (this.targetTTD() < 30000) return true;
+        return arCD > 30000 && !bteReady && (!ksReady || !this.isTrickster());
+      }),
+
+      // SimC: keep_it_rolling,if=rtb_buffs=2&buff.roll_the_bones.remains<cooldown.adrenaline_rush.remains&
+      //   !buff.loaded_dice.up&(cooldown.preparation.remains|!talent.preparation)|rtb_buffs>=3
+      spell.cast(S.keepItRolling, () => me, () => {
+        if (!spell.isSpellKnown(S.keepItRolling)) return false;
+        const rtb = this.getRtbBuffCount();
+        if (rtb >= 3) return true;
+        if (rtb === 2) {
+          const rtbBuff = me.getAura(A.rollTheBones);
+          const rtbRemains = rtbBuff ? rtbBuff.remaining : 0;
+          const arCD = spell.getCooldown(S.adrenalineRush)?.timeleft || 0;
+          const hasLoadedDice = me.hasAura(A.loadedDice);
+          const prepCD = spell.getCooldown(S.preparation)?.timeleft || 0;
+          const hasPrepTalent = spell.isSpellKnown(T.preparation);
+          return rtbRemains < arCD && !hasLoadedDice && (prepCD > 0 || !hasPrepTalent);
+        }
+        return false;
+      }),
+
+      // SimC: roll_the_bones,if=!buff.roll_the_bones.up|rtb_buffs=1
+      spell.cast(S.rollTheBones, () => me, () => {
+        if (this.getCP() < 1) return false;
+        const rtb = this.getRtbBuffCount();
+        return rtb === 0 || rtb <= 1;
+      }),
+
+      // SimC: blade_rush,if=set_bonus.mid1_4pc&!buff.whirl_of_blades.up|spell_targets=1&energy.base_time_to_max>2|spell_targets>=2
+      spell.cast(S.bladeRush, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        // 4pc check: if whirl_of_blades buff is not up, use Blade Rush
+        if (!me.hasAura(A.whirlOfBlades)) return true;
+        // ST: use when energy won't cap in 2s (energy deficit > ~regen*2)
+        if (this.getEnemyCount() === 1) return this.getEnergyDeficit() > 30;
+        // AoE: always use
+        return this.getEnemyCount() >= 2;
+      }),
+
+      // SimC: vanish,if=!variable.finish_condition&talent.hidden_opportunity&!buff.audacity.up&!buff.opportunity.up
+      spell.cast(S.vanish, () => me, () => {
+        if (!Settings.FWOutUseCDs) return false;
+        if (this.finishCondition()) return false;
+        if (!spell.isSpellKnown(T.hiddenOpportunity)) return false;
+        return !this.hasAudacity() && !this.hasOpportunity();
+      }),
+
+      // SimC: potion,if=buff.bloodlust.react|fight_remains<30|buff.adrenaline_rush.up
+      // (potion handled externally)
+
+      // SimC: berserking (unconditional in SimC APL)
+      spell.cast(S.berserking, () => me),
+    );
+  }
+
+  // =============================================
+  // FINISHERS -- SimC: actions.finish (6 lines)
+  // =============================================
   finishers() {
     return new bt.Selector(
-      Spell.cast("Coup de Grace"),
-      Spell.cast("Between the Eyes", () => {
-        return (me.hasAura("Ruthless Precision") || 
-                !me.hasAura("Between the Eyes") || 
-                me.getAura("Between the Eyes")?.remaining < 4000 || 
-                !Spell.isSpellKnown("Mean Streak")) && 
-               (!me.hasAura("Greenskins Wickers") || !Spell.isSpellKnown("Greenskins Wickers"));
+      // SimC: dispatch,if=!buff.slice_and_dice.up
+      spell.cast(S.dispatch, () => this.getCurrentTarget(), () => {
+        return !me.hasAura(A.sliceAndDice);
       }),
-      Spell.cast("Cold Blood"),
-      Spell.cast("Dispatch")
+
+      // SimC: between_the_eyes,if=cooldown.adrenaline_rush.remains>30|buff.adrenaline_rush.up|!talent.supercharger|!talent.zero_in
+      spell.cast(S.betweenTheEyes, () => this.getCurrentTarget(), () => {
+        if (!this.getCurrentTarget()) return false;
+        const arCD = spell.getCooldown(S.adrenalineRush)?.timeleft || 0;
+        if (arCD > 30000) return true;
+        if (this.inAR()) return true;
+        if (!spell.isSpellKnown(T.supercharger)) return true;
+        if (!spell.isSpellKnown(T.zeroIn)) return true;
+        return false;
+      }),
+
+      // SimC: pool_resource,for_next=1 + killing_spree (unconditional after pool)
+      spell.cast(S.killingSpree, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
+      }),
+
+      // SimC: coup_de_grace (unconditional)
+      spell.cast(S.coupDeGrace, () => this.getCurrentTarget(), () => {
+        return this.getCurrentTarget() !== null;
+      }),
+
+      // SimC: dispatch (fallback finisher, unconditional)
+      spell.cast(S.dispatch, () => this.getCurrentTarget()),
     );
   }
 
-  /**
-   * Builder abilities
-   */
+  // =============================================
+  // BUILDERS -- SimC: actions.build (10 lines)
+  // =============================================
   builders() {
     return new bt.Selector(
-      // Hidden Opportunity Ambush with Audacity
-      Spell.cast("Ambush", () => Spell.isSpellKnown("Hidden Opportunity") && me.hasAura("Audacity")),
-      
-      // Fan the Hammer + Audacity + Hidden Opportunity combo
-      Spell.cast("Pistol Shot", () => {
-        return Spell.isSpellKnown("Fan the Hammer") && 
-               Spell.isSpellKnown("Audacity") && 
-               Spell.isSpellKnown("Hidden Opportunity") && 
-               me.hasAura("Opportunity") && 
-               !me.hasAura("Audacity");
+      // SimC: ambush,if=talent.hidden_opportunity&buff.audacity.up
+      spell.cast(S.ambush, () => this.getCurrentTarget(), () => {
+        return spell.isSpellKnown(T.hiddenOpportunity) && this.hasAudacity();
       }),
-      
-      // Consume Opportunity with Fan the Hammer at max stacks or expiring soon
-      Spell.cast("Pistol Shot", () => {
-        return Spell.isSpellKnown("Fan the Hammer") && 
-               me.hasAura("Opportunity") && 
-               (Spell.getAuraStacks("Opportunity") >= (Spell.isSpellKnown("Quick Draw") ? 9 : 6) || 
-                me.getAura("Opportunity").remaining < 2000);
-      }),
-      
-      // Fan the Hammer Opportunity without overcapping combo points
-      Spell.cast("Pistol Shot", () => {
-        const comboPointsGenerated = 1 + 
-                                    (Spell.isSpellKnown("Quick Draw") ? 1 : 0) * 
-                                    (me.hasAura("Broadside") ? 1 : 0) * 
-                                    (Spell.isSpellKnown("Fan the Hammer") ? (Spell.isSpellKnown("Improved Fan the Hammer") ? 2 : 1) : 0);
-        
-        const comboPointDeficit = 6 - me.powerByType(PowerType.ComboPoints);
-        
-        return Spell.isSpellKnown("Fan the Hammer") && 
-               (me.hasAura("Opportunity") || !me.targetUnit.hasAura("Pistol Shot")) && 
-               (comboPointDeficit >= comboPointsGenerated || me.powerByType(PowerType.ComboPoints) <= (Spell.isSpellKnown("Ruthlessness") ? 1 : 0));
-      }),
-      
-    //   // Non-Fan the Hammer Opportunity usage
-    //   Spell.cast("Pistol Shot", () => {
-    //     return !Spell.isSpellKnown("Fan the Hammer") && (!me.targetUnit.hasAura(185763) ||
-    //            me.hasAura("Opportunity")) && 
-    //            (me.powerByType(PowerType.Energy) < (me.maxPowerByType(PowerType.Energy) - me.powerByType(PowerType.Energy) * 1.5) || 
-    //             (7 - me.powerByType(PowerType.ComboPoints)) <= 1 + (me.hasAura("Broadside") ? 1 : 0) || 
-    //             Spell.isSpellKnown("Quick Draw") || 
-    //             (Spell.isSpellKnown("Audacity") && !me.hasAura("Audacity")));
-    //   }),
-      
-      // Pool for Ambush with Hidden Opportunity
-      new bt.Action(() => {
-        if (Spell.isSpellKnown("Hidden Opportunity") && !this.ambushCondition()) {
-          return bt.Status.Success;
-        }
-        return bt.Status.Failure;
-      }),
-      
-      // Hidden Opportunity Ambush
-      Spell.cast("Ambush", () => Spell.isSpellKnown("Hidden Opportunity")),
-      
-      // Default builder
-      Spell.cast("Sinister Strike")
-    );
-  }
 
-  /**
-   * Logic for using cooldowns
-   */
-  useCooldowns() {
-    return new bt.Selector(
-      // Adrenaline Rush - maintain or use with Improved ADR at low CPs
-      Spell.cast("Adrenaline Rush", () => {
-        return !me.hasAura("Adrenaline Rush") && 
-              (!this.finishCondition() || !Spell.isSpellKnown("Improved Adrenaline Rush")) || 
-              (Spell.isSpellKnown("Improved Adrenaline Rush") && me.powerByType(PowerType.ComboPoints) <= 2);
+      // SimC: blade_flurry,if=talent.deft_maneuvers&spell_targets>=4
+      spell.cast(S.bladeFlurry, () => me, () => {
+        return spell.isSpellKnown(T.deftManeuvers) && this.getEnemyCount() >= 4;
       }),
-      
-      // Enable chain cast Coup de Grace if the bug option is enabled
-      Spell.cast("Coup de Grace", () => {
-        return Settings.DoubleCoups && Spell.getTimeSinceLastCast("Coup de Grace") < 1000 && 
-               Spell.getCooldown("Coup de Grace").ready;
-      }),
-      
-      // Maintain Blade Flurry on 2+ targets
-      Spell.cast("Blade Flurry", () => {
-        const targets = this.getEnemyCount();
-        return targets >= 2 && (!me.hasAura("Blade Flurry") || me.getAura("Blade Flurry").remaining < 1000);
-      }),
-      
-      // Deft Maneuvers logic for Blade Flurry
-      Spell.cast("Blade Flurry", () => {
-        const targets = this.getEnemyCount();
-        const comboPointDeficit = 6 - me.powerByType(PowerType.ComboPoints);
-        
-        return Spell.isSpellKnown("Deft Maneuvers") && 
-               !this.finishCondition() && 
-               (targets >= 3 && comboPointDeficit >= targets + (me.hasAura("Broadside") ? 1 : 0) || 
-                targets >= 5);
-      }),
-      
-      // Keep it Rolling logic - with a natural 5 buff roll
-      Spell.cast("Keep it Rolling", () => {
-        const normalBuffCount = this.getRtBNormalBuffCount();
-        const totalBuffs = this.getRtBBuffCount();
-        const maxRemaining = this.getMaxRtBBuffRemaining();
-        
-        return normalBuffCount >= 5 && totalBuffs == 6 && maxRemaining <= 30000;
-      }),
-      
-      // Keep it Rolling - at 4+ buffs without a natural 5
-      Spell.cast("Keep it Rolling", () => {
-        const normalBuffCount = this.getRtBNormalBuffCount();
-        const totalBuffs = this.getRtBBuffCount();
-        
-        return totalBuffs >= 4 && normalBuffCount <= 2;
-      }),
-      
-      // Keep it Rolling - at 3 specific buffs
-      Spell.cast("Keep it Rolling", () => {
-        const normalBuffCount = this.getRtBNormalBuffCount();
-        const totalBuffs = this.getRtBBuffCount();
-        
-        return totalBuffs >= 3 && normalBuffCount <= 2 && 
-               me.hasAura("Broadside") && me.hasAura("Ruthless Precision") && me.hasAura("True Bearing");
-      }),
-      
-      // Roll the Bones - no buffs
-      Spell.cast("Roll the Bones", () => this.getRtBBuffCount() === 0),
-      
-      // Roll the Bones - TWW2 set logic
-      Spell.cast("Roll the Bones", () => {
-        const willLoseCount = this.getRtBBuffsWillLose();
-        const maxRemaining = this.getMaxRtBBuffRemaining();
-        const buffsAbovePandemic = this.getBuffsAbovePandemic();
-        
-        return me.hasAura("TWW2_4pc") && 
-               willLoseCount <= 1 && 
-               (buffsAbovePandemic < 5 || maxRemaining < 42000);
-      }),
-      
-      // Roll the Bones - TWW2 set with few buffs or Supercharger
-      Spell.cast("Roll the Bones", () => {
-        const buffCount = this.getRtBBuffCount();
-        const maxRemaining = this.getMaxRtBBuffRemaining();
-        const willLoseCount = this.getRtBBuffsWillLose();
-        
-        return me.hasAura("TWW2_4pc") && 
-               (buffCount <= 2 || 
-               (Spell.isSpellKnown("Supercharger") && 
-                (maxRemaining < 11000 || !Spell.isSpellKnown("Keep it Rolling")) && 
-                willLoseCount < 5));
-      }),
-      
-      // Roll the Bones - non-TWW2 logic
-      Spell.cast("Roll the Bones", () => {
-        const buffCount = this.getRtBBuffCount();
-        const willLoseCount = this.getRtBBuffsWillLose();
-        
-        // Without TWW2 set or Sleight of Hand
-        return !me.hasAura("TWW2_4pc") && 
-               (willLoseCount <= (me.hasAura("Loaded Dice") ? 1 : 0) || 
-                (Spell.isSpellKnown("Supercharger") && me.hasAura("Loaded Dice") && buffCount <= 2) || 
-                (Spell.isSpellKnown("Hidden Opportunity") && me.hasAura("Loaded Dice") && 
-                 buffCount <= 2 && !me.hasAura("Broadside") && !me.hasAura("Ruthless Precision") && 
-                 !me.hasAura("True Bearing")));
-      }),
-      
-      // Ghostly Strike
-      Spell.cast("Ghostly Strike", () => me.powerByType(PowerType.ComboPoints) < 6),
-      
-      // Killing Spree outside of stealth
-      Spell.cast("Killing Spree", () => this.finishCondition() && !me.hasAura("Stealth") && !me.hasAura("Vanish")),
-      
-      // Vanish usage based on appropriate talent builds
-      this.vanishUsage(),
-      
-      // Blade Rush with low energy outside of stealth
-      Spell.cast("Blade Rush", () => {
-        return me.powerByType(PowerType.Energy) < (me.maxPowerByType(PowerType.Energy) - 4 * me.powerByType(PowerType.Energy) / me.maxPowerByType(PowerType.Energy)) && 
-               !me.hasAura("Stealth") && !me.hasAura("Vanish");
-      })
-    );
-  }
 
-  /**
-   * Vanish usage logic
-   */
-  vanishUsage() {
-    return new bt.Selector(
-      // Main meta build vanish logic (Underhanded Upper Hand + Crackshot + Subterfuge)
-      Spell.cast("Vanish", () => {
-        if (!Spell.isSpellKnown("Underhanded Upper Hand") || 
-            !Spell.isSpellKnown("Crackshot") || 
-            !Spell.isSpellKnown("Subterfuge")) {
-          return false;
-        }
-        
-        // With Adrenaline Rush
-        if (me.hasAura("Adrenaline Rush") && 
-            (me.getAura("Escalating Blade")?.stacks < 4 || !me.hasAura("Escalating Blade")) && 
-            this.finishCondition()) {
-          // Without Killing Spree
-          if (!Spell.isSpellKnown("Killing Spree")) {
-            // BtE on cooldown and Ruthless Precision active
-            if (!Spell.getCooldown("Between the Eyes").ready && 
-                me.hasAura("Ruthless Precision") && 
-                me.getAura("Ruthless Precision").remaining > 4000) {
-              const keepItRollingOnCD = Spell.getTimeSinceLastCast("Keep it Rolling") > 150000;
-              const hasNormalRtB = this.getRtBNormalBuffCount() > 0;
-              
-              // KIR logic
-              if ((keepItRollingOnCD && hasNormalRtB) || !Spell.isSpellKnown("Keep it Rolling")) {
-                return true;
-              }
-            }
-          } 
-          // With Killing Spree
-          else if (Spell.getCooldown("Killing Spree").timeleft > 15000) {
-            return true;
-          }
-          
-          // Prevent AR downtime
-          if (me.getAura("Adrenaline Rush").remaining < 3000 && Spell.getCooldown("Adrenaline Rush").timeleft > 10000) {
-            return true;
-          }
-          
-          // With Supercharger
-          if (!Spell.isSpellKnown("Killing Spree") && me.hasAura("Supercharge 1")) {
-            return true;
-          }
-        }
-        
-        // About to cap on charges
-        if (Spell.getCooldown("Vanish").duration - Spell.getCooldown("Vanish").timeleft < 15000) {
-          return true;
-        }
-        
+      // SimC: coup_de_grace,if=buff.disorienting_strikes.up
+      spell.cast(S.coupDeGrace, () => this.getCurrentTarget(), () => {
+        return me.hasAura(A.disorienting);
+      }),
+
+      // SimC: pistol_shot,if=talent.audacity&talent.hidden_opportunity&buff.opportunity.up&!buff.audacity.up
+      spell.cast(S.pistolShot, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.audacity)) return false;
+        if (!spell.isSpellKnown(T.hiddenOpportunity)) return false;
+        return this.hasOpportunity() && !this.hasAudacity();
+      }),
+
+      // SimC: pistol_shot,if=talent.fan_the_hammer&buff.opportunity.up&(buff.opportunity.stack>=buff.opportunity.max_stack|buff.opportunity.remains<2)
+      spell.cast(S.pistolShot, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.fanTheHammer)) return false;
+        if (!this.hasOpportunity()) return false;
+        return this.getOpportunityStacks() >= this.getOpportunityMaxStacks() ||
+          this.getOpportunityRemaining() < 2000;
+      }),
+
+      // SimC: pistol_shot,if=talent.fan_the_hammer&buff.opportunity.up&(combo_points.deficit>=(1+talent.quick_draw+(talent.quick_draw*talent.fan_the_hammer.rank))&(combo_points>1|rtb_buffs<2|!talent.deal_fate))
+      spell.cast(S.pistolShot, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.fanTheHammer)) return false;
+        if (!this.hasOpportunity()) return false;
+        const qd = spell.isSpellKnown(T.quickDraw) ? 1 : 0;
+        const fthRank = spell.isSpellKnown(T.fanTheHammer) ? 1 : 0;
+        const cpThreshold = 1 + qd + (qd * fthRank);
+        if (this.getCPDeficit() < cpThreshold) return false;
+        const hasDealFate = spell.isSpellKnown(T.dealFate);
+        return this.getCP() > 1 || this.getRtbBuffCount() < 2 || !hasDealFate;
+      }),
+
+      // SimC: pistol_shot,if=!talent.fan_the_hammer&buff.opportunity.up&(energy.base_deficit>energy.regen*1.5|combo_points.deficit<=1|talent.quick_draw|talent.audacity&!buff.audacity.up)
+      spell.cast(S.pistolShot, () => this.getCurrentTarget(), () => {
+        if (spell.isSpellKnown(T.fanTheHammer)) return false;
+        if (!this.hasOpportunity()) return false;
+        if (this.getEnergyDeficit() > 25) return true; // energy.base_deficit>energy.regen*1.5 approx
+        if (this.getCPDeficit() <= 1) return true;
+        if (spell.isSpellKnown(T.quickDraw)) return true;
+        if (spell.isSpellKnown(T.audacity) && !this.hasAudacity()) return true;
         return false;
       }),
-      
-      // Off-meta Vanish logic for builds missing key talents
-      Spell.cast("Vanish", () => {
-        // Has Underhanded Upper Hand and Subterfuge but no Crackshot
-        if (Spell.isSpellKnown("Underhanded Upper Hand") && 
-            Spell.isSpellKnown("Subterfuge") && 
-            !Spell.isSpellKnown("Crackshot")) {
-          if (me.hasAura("Adrenaline Rush")) {
-            const hasAmbushCondition = (Spell.isSpellKnown("Hidden Opportunity") && this.ambushCondition()) || 
-                                      !Spell.isSpellKnown("Hidden Opportunity");
-            
-            if (hasAmbushCondition) {
-              if ((!Spell.getCooldown("Between the Eyes").ready && me.hasAura("Ruthless Precision")) || 
-                  !me.hasAura("Ruthless Precision") || 
-                  me.getAura("Adrenaline Rush").remaining < 3000) {
-                return true;
-              }
-            }
-          }
-        }
-        
-        // Has Crackshot but no Underhanded Upper Hand
-        if (Spell.isSpellKnown("Crackshot") && !Spell.isSpellKnown("Underhanded Upper Hand")) {
-          return this.finishCondition();
-        }
-        
-        // Hidden Opportunity build without other key talents
-        if (Spell.isSpellKnown("Hidden Opportunity") && 
-            !Spell.isSpellKnown("Underhanded Upper Hand") && 
-            !Spell.isSpellKnown("Crackshot")) {
-          if (!me.hasAura("Audacity") && 
-              Spell.getAuraStacks("Opportunity") < (Spell.isSpellKnown("Quick Draw") ? 9 : 6) && 
-              this.ambushCondition()) {
-            return true;
-          }
-        }
-        
-        // Other builds
-        if (!Spell.isSpellKnown("Hidden Opportunity") && 
-            !Spell.isSpellKnown("Underhanded Upper Hand") && 
-            !Spell.isSpellKnown("Crackshot")) {
-          // Fateful Ending build
-          if (Spell.isSpellKnown("Fateful Ending")) {
-            if ((!me.hasAura("Fatebound Lucky Coin") && 
-                (me.getAuraStacks("Fatebound Coin Tails") >= 5 || me.getAuraStacks("Fatebound Coin Heads") >= 5)) || 
-                (me.hasAura("Fatebound Lucky Coin") && !Spell.getCooldown("Between the Eyes").ready)) {
-              return true;
-            }
-          }
-          
-          // Take Em By Surprise build
-          if (Spell.isSpellKnown("Take Em By Surprise") && !me.hasAura("Take Em By Surprise")) {
-            return true;
-          }
-        }
-        
-        // Fight is ending soon
-        if (combat.getAverageTimeToDeath() < 8) {
-          return true;
-        }
-        
-        return false;
-      })
+
+      // SimC: pool_resource,for_next=1 + ambush,if=talent.hidden_opportunity
+      spell.cast(S.ambush, () => this.getCurrentTarget(), () => {
+        return spell.isSpellKnown(T.hiddenOpportunity) && this.getEnergy() >= 50;
+      }),
+
+      // SimC: sinister_strike (fallback builder, unconditional)
+      spell.cast(S.sinisterStrike, () => this.getCurrentTarget()),
     );
-  }
-
-  /**
-   * Check if the finish condition is met based on SIMC logic
-   * combo_points>=cp_max_spend-1-(stealthed.all&talent.crackshot|(talent.hand_of_fate|talent.flawless_form)&talent.hidden_opportunity&(buff.audacity.up|buff.opportunity.up))
-   * @returns {boolean} True if we should use finishers
-   */
-  finishCondition() {
-    const maxComboPoints = me.maxPowerByType(PowerType.ComboPoints); // Assuming the max is always 6, adjust if needed
-    
-    // Base deduction: 1 point
-    let deduction = 1;
-    
-    // Additional deduction for certain conditions
-    if ((me.hasAura("Stealth") || me.hasAura("Vanish") || me.hasAura("Subterfuge")) && 
-        Spell.isSpellKnown("Crackshot")) {
-      // Stealth + Crackshot = additional 1 point deduction
-      deduction += 1;
-    } else if ((Spell.isSpellKnown("Hand of Fate") || Spell.isSpellKnown("Flawless Form")) && 
-               Spell.isSpellKnown("Hidden Opportunity") && 
-               (me.hasAura("Audacity") || me.hasAura("Opportunity"))) {
-      // Hidden Opportunity builds with buffs = additional 1 point deduction
-      deduction += 1;
-    }
-    
-    // Check if current combo points are sufficient to finish
-    return me.powerByType(PowerType.ComboPoints) >= maxComboPoints - deduction;
-  }
-
-  /**
-   * Get the current target, preferring the player's target if valid
-   * @returns {CGUnit} The current target or null if none
-   */
-  getCurrentTarget() {
-    const target = me.targetUnit;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
-      return target;
-    }
-    return combat.bestTarget;
-  }
-
-  /**
-   * Get the number of enemies in range
-   * @returns {number} The number of valid enemies
-   */
-  getEnemyCount() {
-    const aoeThreshold = Settings.AOEThreshold || 3;
-    return combat.targets.filter(unit => unit.distanceTo(me) <= 10).length;
-  }
-
-  /**
-   * Get the count of Roll the Bones buffs
-   * @returns {number} The number of active RtB buffs
-   */
-  getRtBBuffCount() {
-    let count = 0;
-    if (me.hasAura("Broadside")) count++;
-    if (me.hasAura("Buried Treasure")) count++;
-    if (me.hasAura("Grand Melee")) count++;
-    if (me.hasAura("Ruthless Precision")) count++;
-    if (me.hasAura("Skull and Crossbones")) count++;
-    if (me.hasAura("True Bearing")) count++;
-    return count;
-  }
-
-  /**
-   * Get the count of normal Roll the Bones buffs (not from Count the Odds)
-   * @returns {number} The number of normal RtB buffs
-   */
-  getRtBNormalBuffCount() {
-    // This is a simplification, as we don't have a way to distinguish 
-    // between normal buffs and those from Count the Odds
-    // In a real implementation, you'd need to track this
-    return this.getRtBBuffCount();
-  }
-
-  /**
-   * Get the number of buffs that will be lost when recasting Roll the Bones
-   * This is a simplification, as the actual implementation would be complex
-   * @returns {number} The number of buffs that will be lost
-   */
-  getRtBBuffsWillLose() {
-    // For simplicity, assume all current buffs will be lost
-    return this.getRtBBuffCount();
-  }
-
-  /**
-   * Get the maximum remaining time on any Roll the Bones buff
-   * @returns {number} The maximum remaining time in milliseconds
-   */
-  getMaxRtBBuffRemaining() {
-    let maxRemaining = 0;
-    
-    const checkAura = (auraName) => {
-      const aura = me.getAura(auraName);
-      if (aura && aura.remaining > maxRemaining) {
-        maxRemaining = aura.remaining;
-      }
-    };
-    
-    checkAura("Broadside");
-    checkAura("Buried Treasure");
-    checkAura("Grand Melee");
-    checkAura("Ruthless Precision");
-    checkAura("Skull and Crossbones");
-    checkAura("True Bearing");
-    
-    return maxRemaining;
-  }
-
-  /**
-   * Get the count of buffs that are above the pandemic range (>39s)
-   * @returns {number} The number of buffs above pandemic range
-   */
-  getBuffsAbovePandemic() {
-    let count = 0;
-    
-    const checkAura = (auraName) => {
-      const aura = me.getAura(auraName);
-      if (aura && aura.remaining > 39000) {
-        count++;
-      }
-    };
-    
-    checkAura("Broadside");
-    checkAura("Buried Treasure");
-    checkAura("Grand Melee");
-    checkAura("Ruthless Precision");
-    checkAura("Skull and Crossbones");
-    checkAura("True Bearing");
-    
-    return count;
-  }
-
-  /**
-   * Check if any Roll the Bones buff is active
-   * @returns {boolean} True if any RtB buff is active
-   */
-  hasAnyRtBBuff() {
-    return me.hasAura("Broadside") || 
-           me.hasAura("Buried Treasure") || 
-           me.hasAura("Grand Melee") || 
-           me.hasAura("Ruthless Precision") || 
-           me.hasAura("Skull and Crossbones") || 
-           me.hasAura("True Bearing");
-  }
-
-  debugPistolShotState() {
-    // Only log occasionally to prevent spam
-    const now = Date.now();
-    if (!this.lastDebugTime || now - this.lastDebugTime > 5000) {
-      console.info(`--- Outlaw Debug State ---`);
-      console.info(`Combo Points: ${me.powerByType(PowerType.ComboPoints)}/6`);
-      console.info(`Energy: ${me.powerByType(PowerType.Energy)}/${me.maxPowerByType(PowerType.Energy)}`);
-      console.info(`Opportunity: ${me.hasAura("Opportunity") ? `${me.getAura("Opportunity").stacks} stacks, ${Math.floor(me.getAura("Opportunity").remaining / 1000)}s remaining` : "Not active"}`);
-      console.info(`Audacity: ${me.hasAura("Audacity") ? `${Math.floor(me.getAura("Audacity").remaining / 1000)}s remaining` : "Not active"}`);
-      console.info(`Fan the Hammer: ${Spell.isSpellKnown("Fan the Hammer") ? "Known" : "Not known"}`);
-      console.info(`Quick Draw: ${Spell.isSpellKnown("Quick Draw") ? "Known" : "Not known"}`);
-      console.info(`Finish Condition: ${this.finishCondition() ? "True" : "False"}`);
-      this.lastDebugTime = now;
-    }
-    return bt.Status.Failure; // Always fail so rotation continues
   }
 }

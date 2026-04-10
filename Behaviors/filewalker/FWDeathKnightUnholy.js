@@ -1,585 +1,555 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
-import Common from '@/Core/Common';
-import Spell from "@/Core/Spell";
-import { me } from "@/Core/ObjectManager";
+import common from '@/Core/Common';
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
-import Settings from "@/Core/Settings";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
 
-const auras = {
-    // Core Hero Power
-    vampiric_strike: 433901, // San'layn
-    riders_champion: 444005, // Rider of the Apocalypse
-  
-    // General Death Knight
-    abomination_limb: 383269,
-    antimagic_barrier: 205727,
-    antimagic_zone: 51052,
-    asphyxiate: 221562,
-    assimilation: 374383,
-    blinding_sleet: 207167,
-    blood_draw: 374598,
-    blood_scent: 374030,
-    brittle: 374504,
-    cleaving_strikes: 316916,
-    coldthirst: 378848,
-    control_undead: 111673,
-    death_pact: 48743,
-    death_strike: 49998,
-    deaths_echo: 356367,
-    deaths_reach: 276079,
-    enfeeble: 392566,
-    gloom_ward: 391571,
-    grip_of_the_dead: 273952,
-    ice_prison: 454786,
-    icebound_fortitude: 48792,
-    icy_talons: 194878,
-    improved_death_strike: 374277,
-    insidious_chill: 391566,
-    march_of_darkness: 391546,
-    mind_freeze: 47528,
-    null_magic: 454842,
-    osmosis: 454835,
-    permafrost: 207200,
-    proliferating_chill: 373930,
-    raise_dead: 46585,
-    rune_mastery: 374574,
-    runic_attenuation: 207104,
-    runic_protection: 454788,
-    sacrificial_pact: 327574,
-    soul_reaper: 343294,
-    subduing_grasp: 454822,
-    suppression: 374049,
-    unholy_bond: 374261,
-    unholy_endurance: 389682,
-    unholy_ground: 374265,
-    unyielding_will: 457574,
-    vestigial_shell: 454851,
-    veteran_of_the_third_war: 48263,
-    will_of_the_necropolis: 206967,
-    wraith_walk: 212552,
-  
-    // Unholy
-    all_will_serve: 194916,
-    apocalypse: 275699,
-    army_of_the_dead: 42650,
-    bursting_sores: 207264,
-    clawing_shadows: 207311,
-    coil_of_devastation: 390270,
-    commander_of_the_dead: 390259,
-    dark_transformation: 63560,
-    death_rot: 377537,
-    decomposition: 455398,
-    defile: 152280,
-    doomed_bidding: 455386,
-    ebon_fever: 207269,
-    eternal_agony: 390268,
-    festering_scythe: 455397,
-    festering_strike: 85948,
-    festermight: 377590,
-    foul_infections: 455396,
-    ghoulish_frenzy: 377587,
-    harbinger_of_doom: 276023,
-    improved_death_coil: 377580,
-    improved_festering_strike: 316867,
-    infected_claws: 207272,
-    magus_of_the_dead: 390196,
-    menacing_magus: 455135,
-    morbidity: 377592,
-    pestilence: 277234,
-    plaguebringer: 390175,
-    raise_abomination: 455395,
-    raise_dead_2: 46584,
-    reaping: 377514,
-    rotten_touch: 390275,
-    runic_mastery: 390166,
-    ruptured_viscera: 390236,
-    scourge_strike: 55090,
-    sudden_doom: 49530,
-    summon_gargoyle: 49206,
-    superstrain: 390283,
-    unholy_assault: 207289,
-    unholy_aura: 377440,
-    unholy_blight: 460448,
-    unholy_pact: 319230,
-    vile_contagion: 390279,
-  
-    // Rider of the Apocalypse
-    a_feast_of_souls: 444072,
-    apocalypse_now: 444040,
-    death_charge: 444010,
-    fury_of_the_horsemen: 444069,
-    horsemens_aid: 444074,
-    hungering_thirst: 444037,
-    mawsworn_menace: 444099,
-    mograines_might: 444047,
-    nazgrims_conquest: 444052,
-    on_a_paler_horse: 444008,
-    pact_of_the_apocalypse: 444083,
-    trollbanes_icy_fury: 444097,
-    whitemanes_famine: 444033,
-  
-    // San'layn
-    bloodsoaked_ground: 434033,
-    bloody_fortitude: 434136,
-    frenzied_bloodthirst: 434075,
-    gift_of_the_sanlayn: 434152,
-    incite_terror: 434151,
-    infliction_of_sorrow: 434143,
-    newly_turned: 433934,
-    pact_of_the_sanlayn: 434261,
-    sanguine_scent: 434263,
-    the_blood_is_life: 434260,
-    vampiric_aura: 434100,
-    vampiric_speed: 434028,
-    visceral_strength: 434157,
-    
-    // Missing auras added
-    death_and_decay: 43265,
-    unholy_strength: 53365,
-    runic_corruption: 51460,
-    essence_of_the_blood_queen: 347607 // Approximate ID, adjust if needed
-  };
+/**
+ * Unholy Death Knight Behavior - Midnight 12.0.1
+ * Sources: SimC Midnight APL (deathknight_unholy.simc) + Method (all pages) + Wowhead
+ *
+ * Auto-detects: Rider of the Apocalypse vs San'layn
+ * No hero-specific rotation lists — Midnight APL uses shared lists with talent checks
+ *
+ * SimC action lists matched line-by-line:
+ *   variables (5): spending_rp, st_planning, adds_remain, cds_active, epidemic_prio
+ *   racials (8): berserking/blood_fury during cds_active
+ *   cooldowns (7): outbreak, army, DT, soul_reaper, putrefy (complex)
+ *   single_target (6): Festering Scythe maint, spending RP, FS build, SS consume, Putrefy, DC filler
+ *   aoe (9): DnD, Festering Scythe, Epidemic/DC spending, FS build, SS consume, Putrefy, Epi/DC filler
+ *
+ * Core Midnight mechanic: Lesser Ghoul stacking
+ *   Festering Strike → generates Lesser Ghoul stacks (buff.lesser_ghoul_ready)
+ *   Scourge Strike → consumes stacks to summon Lesser Ghouls
+ *   Resource: Runes + Runic Power. All melee instant — no movement block needed.
+ *
+ * Hotfixes March 17-18: -20% base, +8% partial revert, DC +30%, SS/VS +25%, FS +35%
+ */
 
-export class DeathKnightUnholyBehavior extends Behavior {
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'SimC Midnight APL + Method + Wowhead',
+};
+
+const S = {
+  festeringStrike:    85948,
+  scourgeStrike:      55090,
+  deathCoil:          47541,
+  epidemic:           207317,
+  outbreak:           77575,
+  darkTransformation: 1233448,  // Midnight cast ID (confirmed)
+  armyOfTheDead:      42650,
+  soulReaper:         343294,
+  putrefy:            1247378,
+  deathAndDecay:      43265,
+  raiseDead:          46584,
+  // Defensives
+  antiMagicShell:     48707,
+  iceboundFortitude:  48792,
+  deathStrike:        49998,
+  // Interrupt
+  mindFreeze:         47528,
+  // Racials
+  berserking:         26297,
+};
+
+// Talent IDs for spell.isSpellKnown() checks
+const T = {
+  festeringScythe:    458128,  // Spell/talent ID (confirmed)
+  pestilence:         1271974,
+  inflictionOfSorrow: 434143,
+  blightburst:        1254552,
+  summonGargoyle:     1242147,
+  soulReaper:         343294,
+  desecrate:          1234559,  // DnD talent variant (confirmed)
+  reaping:            377514,
+  armyOfTheDead:      42650,
+  commanderOfTheDead: 390259,
+};
+
+const A = {
+  // Core procs
+  suddenDoom:         49530,
+  lesserGhoulReady:   1254252,  // Stacks: FS generates, SS consumes
+  festeringScythe:    458123,   // Player buff: proc from Festering Strike (confirmed)
+  festeringScytheDeb: 458123,  // Same as buff — no separate debuff ID known
+  // Diseases
+  virulentPlague:     191587,
+  dreadPlague:        1240996,
+  // Buffs
+  darkTransformation: 1233448,  // DT active buff (confirmed)
+  darkTransformationAlt: 1233448, // Same as primary (63560 doesn't exist in Midnight)
+  forbiddenKnowledge: 1242158,  // 30s after Army
+  pestilenceBuff:     1271975,  // Pestilence upgrade active (confirmed)
+  reapingBuff:        377514,   // Reaping active during DT — TODO: verify
+  // San'layn
+  giftOfSanlayn:      434152,
+  essenceBloodQueen:  433925,
+  vampiricStrikeProc: 433899,
+  // Hero detection
+  ridersChampion:     444005,
+  vampiricStrike:     433901,
+};
+
+export class UnholyDeathknightBehavior extends Behavior {
+  name = 'FW Unholy Death Knight';
   context = BehaviorContext.Any;
   specialization = Specialization.DeathKnight.Unholy;
-  name = "FW Death Knight Unholy";
-  version = 1;
+  version = wow.GameVersion.Retail;
 
-  // Class variables to store APL variables
-  variableApocTiming = 0;
-  variablePopWounds = false;
-  variablePoolingRunicPower = false;
+  // Per-tick caches
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _rpFrame = 0;
+  _cachedRP = 0;
+  _runeFrame = 0;
+  _cachedRunes = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
 
-  
+  _versionLogged = false;
+  _lastDebug = 0;
 
   static settings = [
     {
-      header: "Unholy DK Settings",
+      header: 'General',
       options: [
-        {
-          uid: "AoEThreshold",
-          text: "AoE Target Threshold",
-          type: "slider",
-          min: 2,
-          max: 6,
-          default: 3
-        },
-        {
-          uid: "UseArmyOfTheDead",
-          text: "Use Army of the Dead",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "UseAbomination",
-          text: "Use Raise Abomination",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "UseGargoyle",
-          text: "Use Summon Gargoyle",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "UseApocalypse",
-          text: "Use Apocalypse",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "SaveCooldownsForBurst",
-          text: "Save Cooldowns for Burst",
-          type: "checkbox",
-          default: false
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWUdkUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'slider', uid: 'FWUdkAoECount', text: 'AoE Target Count', default: 4, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWUdkDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWUdkAMS', text: 'Use AMS for RP', default: true },
+        { type: 'checkbox', uid: 'FWUdkIBF', text: 'Use IBF', default: true },
+        { type: 'slider', uid: 'FWUdkIBFHP', text: 'IBF HP %', default: 35, min: 10, max: 50 },
+        { type: 'checkbox', uid: 'FWUdkDS', text: 'Use Death Strike', default: true },
+        { type: 'slider', uid: 'FWUdkDSHP', text: 'Death Strike HP %', default: 40, min: 15, max: 60 },
+      ],
+    },
   ];
 
+  // =============================================
+  // BUILD — Main behavior tree
+  // =============================================
   build() {
     return new bt.Selector(
-      Common.waitForCastOrChannel(),
-      Common.waitForNotMounted(),
-    //   Spell.cast("Raise Dead", () => !me.hasPet() && Spell.isSpellKnown("Raise Dead")),
-      Spell.interrupt("Mind Freeze", false),
+      common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // OOC: Raise Dead (permanent ghoul)
+      spell.cast(S.raiseDead, () => me, () => !me.inCombat() && (!me.pet || me.pet.deadOrGhost)),
+
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Auto-target
       new bt.Action(() => {
-        if (this.getCurrentTarget() === null) {
-          return bt.Status.Success;
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
         }
         return bt.Status.Failure;
       }),
-      this.determineActionList()
-    );
-  }
 
-  determineActionList() {
-    return new bt.Selector(
-      // Set up variables
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
+      common.waitForCastOrChannel(),
+
+      // Version + Debug
       new bt.Action(() => {
-        this.variableApocTiming = (Spell.getCooldown("Apocalypse").timeleft < 5 && this.getDebuffStacks("Festering Wound") < 1 && Spell.getCooldown("Unholy Assault").timeleft > 5) ? 3 : 0;
-        this.variablePopWounds = (Spell.getCooldown("Apocalypse").timeleft > this.variableApocTiming || !this.hasTalent("Apocalypse")) && 
-          ((this.getDebuffStacks("Festering Wound") >= 1 && Spell.getCooldown("Unholy Assault").timeleft < 20 && this.hasTalent("Unholy Assault") && this.getEnemyCount() === 1) || 
-          (this.getCurrentTarget().hasAuraByMe("Rotten Touch") && this.getDebuffStacks("Festering Wound") >= 1) || 
-          (this.getDebuffStacks("Festering Wound") >= (4 - (this.hasTalent("Raise Abomination") && me.pet && me.pet.active ? 1 : 0)))) || 
-          (this.getTargetTimeRemaining() < 5 && this.getDebuffStacks("Festering Wound") >= 1);
-        this.variablePoolingRunicPower = this.hasTalent("Vile Contagion") && Spell.getCooldown("Vile Contagion").timeleft < 5 && me.powerByType(PowerType.RunicPower) < 30;
-        
-        return bt.Status.Failure; // Continue to next selector
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          const hero = this.isRider() ? 'Rider' : "San'layn";
+          console.info(`[UnholyDK] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | ${hero} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWUdkDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[UnholyDK] RP:${Math.round(this.getRP())} Runes:${this.getRunes()} LG:${this.getLGStacks()} DT:${this.inDT()} FK:${this.hasFK()} SD:${this.hasSD()} CDsAct:${this.cdsActive()} E:${this.getEnemyCount()}`);
+        }
+        return bt.Status.Failure;
       }),
-      // Call action list based on enemy count and talent
+
       new bt.Decorator(
-        () => this.getEnemyCount() >= Settings.AoEThreshold && this.hasTalent("Vampiric Strike"),
-        this.aoeBurstSanAction(),
-        new bt.Action(() => bt.Status.Success)
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          spell.interrupt(S.mindFreeze),
+          this.defensives(),
+
+          // SimC: racials — Berserking during cds_active
+          spell.cast(S.berserking, () => me, () => this.cdsActive()),
+
+          // SimC: cooldowns
+          this.cooldowns(),
+
+          // SimC dispatch: AoE >= 4, else ST
+          new bt.Decorator(
+            () => this.getEnemyCount() >= Settings.FWUdkAoECount,
+            this.aoeRotation(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          this.stRotation(),
+        )
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() >= Settings.AoEThreshold && !this.hasTalent("Vampiric Strike"),
-        this.aoeBurstAction(),
-        new bt.Action(() => bt.Status.Success)
+    );
+  }
+
+  // =============================================
+  // COOLDOWNS (SimC actions.cooldowns, 7 lines)
+  // =============================================
+  cooldowns() {
+    return new bt.Selector(
+      // 1. Outbreak: VP ticks_remain < 3 & complex conditions
+      // SimC: outbreak,if=dot.virulent_plague.ticks_remain<3&!buff.pestilence.up&fight_remains>5&(!talent.blightburst|talent.blightburst&cooldown.putrefy.remains_expected>7)|buff.pestilence.up&dot.virulent_plague.ticking&(!talent.infliction_of_sorrow&cooldown.dark_transformation.remains<3|talent.infliction_of_sorrow&!buff.gift_of_the_sanlayn.up|fight_remains>7|...)
+      spell.cast(S.outbreak, () => this.getCurrentTarget(), () => {
+        const t = this.getCurrentTarget();
+        if (!t || this.targetTTD() < 5000) return false;
+        const vp = t.getAuraByMe(A.virulentPlague);
+        const vpLow = !vp || vp.remaining < 5000; // ~3 ticks remaining
+        const hasPest = me.hasAura(A.pestilenceBuff);
+        if (!hasPest) {
+          // No Pestilence: refresh when VP low & (!blightburst | putrefy CD > 7)
+          if (!vpLow) return false;
+          if (spell.isSpellKnown(T.blightburst)) {
+            return (spell.getCooldown(S.putrefy)?.timeleft || 0) > 7000;
+          }
+          return true;
+        }
+        // Pestilence up & VP ticking: complex refresh conditions
+        if (!vp) return false;
+        if (spell.isSpellKnown(T.inflictionOfSorrow)) {
+          // IoS: refresh when NOT in Gift of the San'layn
+          return !this.inGift();
+        }
+        // Non-IoS: refresh before DT (CD < 3s) or fight > 7s
+        const dtCD = spell.getCooldown(S.darkTransformation)?.timeleft || 99999;
+        return dtCD < 3000 || this.targetTTD() > 7000;
+      }),
+
+      // 2. Army of the Dead: (st_planning|adds_remain) & (Gargoyle+RP>=30 | FestScythe debuff | !FestScythe)
+      // SimC: army_of_the_dead,if=(variable.st_planning|variable.adds_remain)&(talent.summon_gargoyle&runic_power>=30|debuff.festering_scythe_debuff.up|!talent.festering_scythe)
+      spell.cast(S.armyOfTheDead, () => me, () => {
+        if (!Settings.FWUdkUseCDs || !this.sendingCDs()) return false;
+        if (spell.isSpellKnown(T.summonGargoyle) && this.getRP() < 30) return false;
+        if ((spell.isSpellKnown(T.festeringScythe) || spell.isSpellKnown(A.festeringScythe))) {
+          return this.targetHasFSDebuff();
+        }
+        return true;
+      }),
+
+      // 3. Dark Transformation: (st_planning|adds_remain) & (army active | army CD > 30 | !army)
+      // SimC: dark_transformation,if=(variable.st_planning|variable.adds_remain)&pet.lesser_ghoul_army.active|cooldown.army_of_the_dead.remains>30|!talent.army_of_the_dead
+      spell.cast(S.darkTransformation, () => me, () => {
+        if (!Settings.FWUdkUseCDs) return false;
+        // Army active approximation
+        const armyRecent = spell.getTimeSinceLastCast(S.armyOfTheDead) < 15000;
+        if (this.sendingCDs() && armyRecent) return true;
+        const armyCD = spell.getCooldown(S.armyOfTheDead)?.timeleft || 99999;
+        return armyCD > 30000 || !spell.isSpellKnown(T.armyOfTheDead);
+      }),
+
+      // 4. Soul Reaper: !pestilence | (pestilence & IoS & (DT.remains<5 | reaping<=gcd)) | target<35%
+      // SimC: soul_reaper,if=!talent.pestilence|talent.pestilence&talent.infliction_of_sorrow&(buff.dark_transformation.remains<5|buff.reaping.remains<=gcd.max)|target.health.pct<=35
+      spell.cast(S.soulReaper, () => this.getCurrentTarget(), () => {
+        if (!spell.isSpellKnown(T.soulReaper)) return false;
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        if (t.effectiveHealthPercent <= 35) return true;
+        if (!spell.isSpellKnown(T.pestilence)) return true;
+        if (spell.isSpellKnown(T.inflictionOfSorrow)) {
+          const dtAura = this.getDTAura();
+          if (dtAura && dtAura.remaining < 5000) return true;
+          const reaping = me.getAura(A.reapingBuff);
+          if (reaping && reaping.remaining <= 1500) return true;
+        }
+        return false;
+      }),
+
+      // 5. Putrefy: complex conditions
+      // SimC: putrefy,if=(variable.st_planning|variable.adds_remain)&(cooldown.dark_transformation.remains>15&runic_power<90&(talent.soul_reaper&target.health.pct>35&!action.soul_reaper.ready|!talent.soul_reaper&(talent.commander_of_the_dead&!cooldown.dark_transformation.ready|!talent.commander_of_the_dead))|charges=max_charges&(cooldown.dark_transformation.remains>gcd.max|!talent.reaping)|buff.reaping.up&talent.infliction_of_sorrow&talent.pestilence&buff.dark_transformation.remains>10&(charges=max_charges|!dot.virulent_plague.ticking&talent.blightburst))
+      spell.cast(S.putrefy, () => this.getCurrentTarget(), () => {
+        if (!Settings.FWUdkUseCDs || !this.sendingCDs()) return false;
+        const dtCD = spell.getCooldown(S.darkTransformation)?.timeleft || 0;
+        const putCharges = spell.getCharges(S.putrefy) || 0;
+        const putMaxCharges = 2;
+        const t = this.getCurrentTarget();
+
+        // Branch 1: dt.cd > 15 & RP < 90 & (soul_reaper checks | commander checks)
+        if (dtCD > 15000 && this.getRP() < 90) {
+          if (spell.isSpellKnown(T.soulReaper)) {
+            if (t && t.effectiveHealthPercent > 35 && !(spell.getCooldown(S.soulReaper)?.ready)) return true;
+          } else {
+            if (spell.isSpellKnown(T.commanderOfTheDead)) {
+              if (!(spell.getCooldown(S.darkTransformation)?.ready)) return true;
+            } else {
+              return true;
+            }
+          }
+        }
+
+        // Branch 2: charges = max & (dt.cd > gcd | !reaping)
+        if (putCharges >= putMaxCharges) {
+          if (dtCD > 1500 || !spell.isSpellKnown(T.reaping)) return true;
+        }
+
+        // Branch 3: reaping.up & IoS & pestilence & DT.remains > 10 & (max_charges | !vp & blightburst)
+        const reaping = me.getAura(A.reapingBuff);
+        if (reaping && spell.isSpellKnown(T.inflictionOfSorrow) && spell.isSpellKnown(T.pestilence)) {
+          const dtAura = this.getDTAura();
+          if (dtAura && dtAura.remaining > 10000) {
+            if (putCharges >= putMaxCharges) return true;
+            if (spell.isSpellKnown(T.blightburst)) {
+              const vp = t?.getAuraByMe(A.virulentPlague);
+              if (!vp) return true;
+            }
+          }
+        }
+
+        return false;
+      }),
+    );
+  }
+
+  // =============================================
+  // SINGLE TARGET (SimC actions.single_target, 6 lines)
+  // =============================================
+  stRotation() {
+    return new bt.Selector(
+      // 1. Festering Scythe: buff up → cast transformed spell (458128), else Festering Strike
+      spell.cast(T.festeringScythe, () => this.getCurrentTarget(), () => me.hasAura(A.festeringScythe)),
+      spell.cast(S.festeringStrike, () => this.getCurrentTarget(), () => me.hasAura(A.festeringScythe)),
+
+      // 2. Death Coil: spending_rp
+      // SimC: death_coil,if=variable.spending_rp
+      // Note: Sudden Doom makes DC free, so no RP check when SD is up
+      spell.cast(S.deathCoil, () => this.getCurrentTarget(), () =>
+        this.spendingRP() && (this.hasSD() || this.getRP() >= 30)
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() === 2 && this.hasTalent("Vampiric Strike"),
-        this.cleaveActionSan(),
-        new bt.Action(() => bt.Status.Success)
+
+      // 3. Festering Strike: lesser_ghoul_ready.stack = 0
+      // SimC: festering_strike,if=buff.lesser_ghoul_ready.stack=0
+      spell.cast(S.festeringStrike, () => this.getCurrentTarget(), () =>
+        this.getLGStacks() === 0
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() === 2 && !this.hasTalent("Vampiric Strike"),
-        this.cleaveAction(),
-        new bt.Action(() => bt.Status.Success)
+
+      // 4. Scourge Strike: lesser_ghoul_ready.stack >= 1
+      // SimC: scourge_strike,if=buff.lesser_ghoul_ready.stack>=1
+      spell.cast(S.scourgeStrike, () => this.getCurrentTarget(), () =>
+        this.getLGStacks() >= 1
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() === 1 && this.hasTalent("Gift of the San'layn") && !Spell.getCooldown("Dark Transformation").ready && !me.hasAura(auras.gift_of_the_sanlayn) && me.getAuraRemainingTime("Essence of the Blood Queen") < Spell.getCooldown("Dark Transformation").timeleft + 3,
-        this.sanFishingAction(),
-        new bt.Action(() => bt.Status.Success)
+
+      // 5. Putrefy: !soul_reaper & DT CD > 12
+      // SimC: putrefy,if=!talent.soul_reaper&cooldown.dark_transformation.remains>12
+      spell.cast(S.putrefy, () => this.getCurrentTarget(), () =>
+        !spell.isSpellKnown(T.soulReaper) &&
+        (spell.getCooldown(S.darkTransformation)?.timeleft || 0) > 12000
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() === 1 && this.hasTalent("Vampiric Strike"),
-        this.singleTargetSanAction(),
-        new bt.Action(() => bt.Status.Success)
+
+      // 6. Death Coil (absolute filler)
+      // SimC: death_coil (no condition = unconditional)
+      // SD makes it free; otherwise need RP
+      spell.cast(S.deathCoil, () => this.getCurrentTarget(), () =>
+        this.hasSD() || this.getRP() >= 30
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() === 1 && !this.hasTalent("Vampiric Strike"),
-        this.singleTargetAction(),
-        new bt.Action(() => bt.Status.Success)
-      )
     );
   }
 
-  useTrinkets() {
+  // =============================================
+  // AOE (SimC actions.aoe, 9 lines, 4+ targets)
+  // =============================================
+  aoeRotation() {
     return new bt.Selector(
-      Common.useEquippedItemByName("Treacherous Transmitter", () => ((this.getEnemyCount() > 1 || this.getEnemyCount() === 1) && Spell.getCooldown("Dark Transformation").timeleft < 10)),
-      Common.useEquippedItemByName("Fyralath, the Dreamrender", () => this.getCurrentTarget().hasAura("Mark of Fyralath") && (this.getEnemyCount() < 5 || this.getEnemyCount() > 21 || this.getTargetTimeRemaining() < 4))
+      // 1. Death and Decay: !ticking & talent.desecrate
+      // SimC: death_and_decay,if=!death_and_decay.ticking&talent.desecrate
+      spell.cast(S.deathAndDecay, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.desecrate) && spell.getTimeSinceLastCast(S.deathAndDecay) > 10000
+      ),
+
+      // 2. Festering Strike: Festering Scythe maintenance (same as ST)
+      // SimC: festering_strike,if=talent.festering_scythe&(buff.festering_scythe.up&(buff.festering_scythe.remains<=3|debuff.festering_scythe_debuff.remains<3)|!buff.festering_scythe.up&debuff.festering_scythe_debuff.remains<3)
+      spell.cast(S.festeringStrike, () => this.getCurrentTarget(), () => {
+        if (!(spell.isSpellKnown(T.festeringScythe) || spell.isSpellKnown(A.festeringScythe))) return false;
+        const fsBuff = me.getAura(A.festeringScythe);
+        const t = this.getCurrentTarget();
+        if (!t) return false;
+        const fsDebuff = t.getAuraByMe(A.festeringScytheDeb);
+        if (fsBuff) {
+          return fsBuff.remaining <= 3000 || (fsDebuff ? fsDebuff.remaining < 3000 : true);
+        }
+        return !fsDebuff || fsDebuff.remaining < 3000;
+      }),
+
+      // 3. Epidemic: spending_rp & epidemic_prio
+      // SimC: epidemic,if=variable.spending_rp&variable.epidemic_prio
+      spell.cast(S.epidemic, () => this.getCurrentTarget(), () =>
+        this.spendingRP() && this.epidemicPrio() && (this.hasSD() || this.getRP() >= 30)
+      ),
+
+      // 4. Death Coil: spending_rp & !epidemic_prio
+      // SimC: death_coil,if=variable.spending_rp&!variable.epidemic_prio
+      spell.cast(S.deathCoil, () => this.getCurrentTarget(), () =>
+        this.spendingRP() && !this.epidemicPrio() && (this.hasSD() || this.getRP() >= 30)
+      ),
+
+      // 5. Festering Strike: lesser_ghoul_ready.stack = 0
+      spell.cast(S.festeringStrike, () => this.getCurrentTarget(), () =>
+        this.getLGStacks() === 0
+      ),
+
+      // 6. Scourge Strike: lesser_ghoul_ready.stack >= 1
+      spell.cast(S.scourgeStrike, () => this.getCurrentTarget(), () =>
+        this.getLGStacks() >= 1
+      ),
+
+      // 7. Putrefy (on CD in AoE — SimC: putrefy, no condition)
+      spell.cast(S.putrefy, () => this.getCurrentTarget()),
+
+      // 8. Epidemic: epidemic_prio (filler)
+      // SimC: epidemic,if=variable.epidemic_prio
+      spell.cast(S.epidemic, () => this.getCurrentTarget(), () =>
+        this.epidemicPrio() && (this.hasSD() || this.getRP() >= 30)
+      ),
+
+      // 9. Death Coil: !epidemic_prio (filler)
+      // SimC: death_coil,if=!variable.epidemic_prio
+      spell.cast(S.deathCoil, () => this.getCurrentTarget(), () =>
+        !this.epidemicPrio() && (this.hasSD() || this.getRP() >= 30)
+      ),
     );
   }
 
-  useRacials() {
+  // =============================================
+  // DEFENSIVES
+  // =============================================
+  defensives() {
     return new bt.Selector(
-      Spell.cast("Blood Fury", () => this.shouldUseOffensiveCDs()),
-      Spell.cast("Berserking", () => this.shouldUseOffensiveCDs()),
-      Spell.cast("Arcane Torrent", () => me.powerByType(PowerType.RunicPower) < 20 && me.getReadyRunes() < 2),
-      Spell.cast("Lights Judgment", () => me.hasAura(auras.unholy_strength) && (!this.hasTalent("Festermight") || me.hasAura(auras.festermight))),
-      Spell.cast("Ancestral Call", () => this.shouldUseOffensiveCDs()),
-      Spell.cast("Fireblood", () => this.shouldUseOffensiveCDs()),
-      Spell.cast("Bag of Tricks", () => this.getEnemyCount() === 1 && (me.hasAura(auras.unholy_strength)))
+      spell.cast(S.antiMagicShell, () => me, () =>
+        Settings.FWUdkAMS && (125 - this.getRP()) > 40 && this.getRunes() < 2
+      ),
+      spell.cast(S.deathStrike, () => this.getCurrentTarget(), () =>
+        Settings.FWUdkDS && me.effectiveHealthPercent < Settings.FWUdkDSHP && this.getRP() >= 35
+      ),
+      spell.cast(S.iceboundFortitude, () => me, () =>
+        Settings.FWUdkIBF && me.effectiveHealthPercent < Settings.FWUdkIBFHP
+      ),
+      new bt.Action(() => bt.Status.Failure)
     );
   }
 
-  // Shared cooldowns
-  sharedCooldowns() {
-    return new bt.Selector(
-      Spell.cast("Army of the Dead", () => Settings.UseArmyOfTheDead && ((this.hasTalent("Commander of the Dead") && Spell.getCooldown("Dark Transformation").timeleft < 5) || (!this.hasTalent("Commander of the Dead") && this.getEnemyCount() >= 1) || this.getTargetTimeRemaining() < 35)),
-      Spell.cast("Raise Abomination", () => Settings.UseAbomination && this.hasTalent("Raise Abomination")),
-      Spell.cast("Summon Gargoyle", () => Settings.UseGargoyle && this.hasTalent("Summon Gargoyle") && ((me.hasAura(auras.commander_of_the_dead) || (!this.hasTalent("Commander of the Dead") && this.getEnemyCount() >= 1)) || this.getTargetTimeRemaining() < 25)),
-      Spell.cast("Anti-Magic Shell", () => me.powerByType(PowerType.RunicPower) < 30 && me.getReadyRunes() < 2)
-    );
-  }
-  
-  // Non-San'layn Cooldowns
-  cdsSingleTarget() {
-    return new bt.Selector(
-      Spell.cast("Dark Transformation", () => this.getEnemyCount() === 1 && (Spell.getCooldown("Apocalypse").timeleft < 8 || !this.hasTalent("Apocalypse") || this.getEnemyCount() >= 1) || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Unholy Assault", () => this.getEnemyCount() === 1 && (Spell.getCooldown("Apocalypse").timeleft < 1.5 || !this.hasTalent("Apocalypse") || this.getEnemyCount() >= 2 && me.hasAura(auras.dark_transformation)) || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Apocalypse", () => Settings.UseApocalypse && this.getEnemyCount() === 1 || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Outbreak", () => this.getTargetTimeRemaining() > this.getDebuffRemainingTime("Virulent Plague") && this.getDebuffTicksRemaining("Virulent Plague") < 5 && (this.getDebuffRemainingTime("Virulent Plague") === 0 || this.hasTalent("Superstrain") && (this.getDebuffRemainingTime("Frost Fever") === 0 || this.getDebuffRemainingTime("Blood Plague") === 0)) && (!this.hasTalent("Unholy Blight") || this.hasTalent("Plaguebringer")) && (!this.hasTalent("Raise Abomination") || this.hasTalent("Raise Abomination") && Spell.getCooldown("Raise Abomination").timeleft > this.getDebuffTicksRemaining("Virulent Plague") * 3)),
-      Spell.cast("Abomination Limb", () => this.getEnemyCount() === 1 && !me.hasAura(auras.sudden_doom) && (me.hasAura(auras.festermight) && me.getAuraStacks("Festermight") > 8 || !this.hasTalent("Festermight")) && (me.hasPet() && me.pet.timeRemaining < 5 || !this.hasTalent("Apocalypse")) && this.getDebuffStacks("Festering Wound") <= 2 || this.getTargetTimeRemaining() < 12)
-    );
+  // =============================================
+  // SIMC VARIABLE HELPERS
+  // =============================================
+  isRider() { return spell.isSpellKnown(A.ridersChampion); }
+  isSanlayn() { return !this.isRider(); }
+
+  // variable.spending_rp = rune<2 | (forbidden_knowledge.up & rune<4) | sudden_doom.react
+  // SimC: variable,name=spending_rp,value=rune<2|buff.forbidden_knowledge.up&rune<4|buff.sudden_doom.react
+  spendingRP() {
+    if (this.getRunes() < 2) return true;
+    if (this.hasFK() && this.getRunes() < 4) return true;
+    if (this.hasSD()) return true;
+    return false;
   }
 
-  // San'layn Cooldowns
-  cdsSingleTargetSan() {
-    return new bt.Selector(
-      Spell.cast("Dark Transformation", () => this.getEnemyCount() >= 1 && this.getEnemyCount() === 1 && (this.hasTalent("Apocalypse") && me.hasPet() || !this.hasTalent("Apocalypse")) || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Unholy Assault", () => this.getEnemyCount() === 1 && (me.hasAura(auras.dark_transformation) && this.getAuraRemainingTime("Dark Transformation") < 12) || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Apocalypse", () => Settings.UseApocalypse && this.getEnemyCount() === 1 || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Outbreak", () => this.getTargetTimeRemaining() > this.getDebuffRemainingTime("Virulent Plague") && this.getDebuffTicksRemaining("Virulent Plague") < 5 && (this.getDebuffRemainingTime("Virulent Plague") === 0 || this.hasTalent("Morbidity") && me.hasAura(auras.infliction_of_sorrow) && this.hasTalent("Superstrain") && this.getDebuffRemainingTime("Frost Fever") === 0 && this.getDebuffRemainingTime("Blood Plague") === 0) && (!this.hasTalent("Unholy Blight") || this.hasTalent("Unholy Blight") && Spell.getCooldown("Dark Transformation").timeleft > 0) && (!this.hasTalent("Raise Abomination") || this.hasTalent("Raise Abomination") && Spell.getCooldown("Raise Abomination").timeleft > 0)),
-      Spell.cast("Abomination Limb", () => this.getEnemyCount() >= 1 && this.getEnemyCount() === 1 && !me.hasAura(auras.gift_of_the_sanlayn) && !me.hasAura(auras.sudden_doom) && me.hasAura(auras.festermight) && this.getDebuffStacks("Festering Wound") <= 2 || !me.hasAura(auras.gift_of_the_sanlayn) && this.getTargetTimeRemaining() < 12)
-    );
+  // variable.cds_active = lesser_ghoul_army.active | forbidden_knowledge.up | DT.up & DT.remains>5
+  // SimC: variable,name=cds_active,value=pet.lesser_ghoul_army.active|buff.forbidden_knowledge.up|buff.dark_transformation.up&buff.dark_transformation.remains>5
+  cdsActive() {
+    if (spell.getTimeSinceLastCast(S.armyOfTheDead) < 15000) return true; // army active approx
+    if (this.hasFK()) return true;
+    const dt = this.getDTAura();
+    return dt && dt.remaining > 5000;
   }
 
-  // AoE Burst (San'layn)
-  aoeBurstSanAction() {
-    return new bt.Selector(
-      this.useTrinkets(),
-      this.useRacials(),
-      this.sharedCooldowns(),
-      // AoE Cooldowns
-      Spell.cast("Dark Transformation", () => this.getEnemyCount() > 1 && (me.hasAura(auras.death_and_decay) || this.getEnemyCount() <= 3)),
-      Spell.cast("Unholy Assault", () => this.getEnemyCount() > 1 && (Spell.getCooldown("Vile Contagion").timeleft < 6 || Spell.getCooldown("Vile Contagion").timeleft > 40 || !this.hasTalent("Vile Contagion")) || this.getTargetTimeRemaining() < 20),
-      Spell.cast("Vile Contagion", () => this.getDebuffStacks("Festering Wound") >= 4 && (this.getAddTimeRemaining() > 4 || this.getAddTimeRemaining() <= 0 && this.getTargetTimeRemaining() > 4) && (this.getAddTimeRemaining() <= 11 || Spell.getCooldown("Death and Decay").timeleft < 3 || me.hasAura(auras.death_and_decay) && this.getDebuffStacks("Festering Wound") >= 4) || this.getEnemyCount() > 1 && this.getDebuffStacks("Festering Wound") === 6),
-      Spell.cast("Outbreak", () => (this.getDebuffRemainingTime("Virulent Plague") === 0 || this.hasTalent("Morbidity") && !me.hasAura(auras.gift_of_the_sanlayn) && this.hasTalent("Superstrain") && this.getDebuffRemainingTime("Frost Fever") === 0 && this.getDebuffRemainingTime("Blood Plague") === 0) && (!this.hasTalent("Unholy Blight") || this.hasTalent("Unholy Blight") && Spell.getCooldown("Dark Transformation").timeleft > 15) && (!this.hasTalent("Raise Abomination") || this.hasTalent("Raise Abomination") && Spell.getCooldown("Raise Abomination").timeleft > 15)),
-      Spell.cast("Apocalypse", () => Settings.UseApocalypse && this.getEnemyCount() > 1 && me.getReadyRunes() <= 3),
-      Spell.cast("Abomination Limb", () => this.getEnemyCount() > 1),
-      // AoE Burst Rotation
-      Spell.cast("Festering Strike", () => me.hasAura(auras.festering_scythe)),
-      Spell.cast("Death Coil", () => !me.hasAura(auras.vampiric_strike) && this.getEnemyCount() < this.epidemicTargets() && (!this.hasTalent("Bursting Sores") || this.hasTalent("Bursting Sores") && this.getWoundedTargets() < this.getEnemyCount() && this.getWoundedTargets() < this.getEnemyCount() * 0.4 && me.hasAura(auras.sudden_doom) || me.hasAura(auras.sudden_doom) && (me.hasAura(auras.a_feast_of_souls) || this.getDebuffRemainingTime("Death Rot") < 1.5 || this.getDebuffStacks("Death Rot") < 10))),
-      Spell.cast("Epidemic", () => !me.hasAura(auras.vampiric_strike) && (!this.hasTalent("Bursting Sores") || this.hasTalent("Bursting Sores") && this.getWoundedTargets() < this.getEnemyCount() && this.getWoundedTargets() < this.getEnemyCount() * 0.4 && me.hasAura(auras.sudden_doom) || me.hasAura(auras.sudden_doom) && (me.hasAura(auras.a_feast_of_souls) || this.getDebuffRemainingTime("Death Rot") < 1.5 || this.getDebuffStacks("Death Rot") < 10))),
-      Spell.cast("Scourge Strike", () => this.getCurrentTarget().hasAuraByMe("Chains of Ice") && this.getCurrentTarget().hasAura("Chains of Ice Trollbane Slow")),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.getCurrentTarget().hasAuraByMe("Chains of Ice") && this.getCurrentTarget().hasAura("Chains of Ice Trollbane Slow")),
-      Spell.cast("Scourge Strike", () => this.getDebuffStacks("Festering Wound") >= 1 || me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && (this.getDebuffStacks("Festering Wound") >= 1 || me.hasAura(auras.vampiric_strike))),
-      Spell.cast("Death Coil", () => this.getEnemyCount() < this.epidemicTargets()),
-      Spell.cast("Epidemic"),
-      Spell.cast("Festering Strike", () => this.getDebuffStacks("Festering Wound") <= 2),
-      Spell.cast("Scourge Strike"),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows"))
-    );
+  // variable.sending_cds: (st_planning | adds_remain)
+  // Simplified: CDs enabled + TTD > 15s
+  sendingCDs() { return Settings.FWUdkUseCDs && this.targetTTD() > 15000; }
+
+  // variable.epidemic_prio = active_enemies >= 4 - pet.whitemane.active & !FK | active_enemies >= 6 - pet.whitemane.active & FK
+  // SimC: variable,name=epidemic_prio,value=active_enemies>=4-pet.whitemane.active&!buff.forbidden_knowledge.up|active_enemies>=6-pet.whitemane.active&buff.forbidden_knowledge.up
+  epidemicPrio() {
+    const enemies = this.getEnemyCount();
+    // Whitemane active: Rider + Army recently cast
+    const whitemane = this.isRider() && spell.getTimeSinceLastCast(S.armyOfTheDead) < 15000;
+    const adj = whitemane ? 1 : 0;
+    if (!this.hasFK()) return enemies >= (4 - adj);
+    return enemies >= (6 - adj);
   }
 
-  // AoE Burst
-  aoeBurstAction() {
-    return new bt.Selector(
-      this.useTrinkets(),
-      this.useRacials(),
-      this.sharedCooldowns(),
-      // AoE Cooldowns
-      Spell.cast("Unholy Assault", () => this.getEnemyCount() > 1 && (Spell.getCooldown("Vile Contagion").timeleft < 3 || Spell.getCooldown("Vile Contagion").timeleft > 40 || !this.hasTalent("Vile Contagion"))),
-      Spell.cast("Vile Contagion", () => this.getDebuffStacks("Festering Wound") >= 4 && (this.getAddTimeRemaining() > 4 || this.getAddTimeRemaining() <= 0 && this.getTargetTimeRemaining() > 4) && (this.getAddTimeRemaining() <= 11 || Spell.getCooldown("Death and Decay").timeleft < 3 || me.hasAura(auras.death_and_decay) && this.getDebuffStacks("Festering Wound") >= 4) || this.getEnemyCount() > 1 && this.getDebuffStacks("Festering Wound") === 6),
-      Spell.cast("Dark Transformation", () => this.getEnemyCount() > 1 && (Spell.getCooldown("Vile Contagion").timeleft > 5 || !this.hasTalent("Vile Contagion") || me.hasAura(auras.death_and_decay) || Spell.getCooldown("Death and Decay").timeleft < 3)),
-      Spell.cast("Outbreak", () => this.getDebuffTicksRemaining("Virulent Plague") < 5 && (this.getDebuffRemainingTime("Virulent Plague") === 0 || this.hasTalent("Morbidity") && !me.hasAura(auras.gift_of_the_sanlayn) && this.hasTalent("Superstrain") && this.getDebuffRemainingTime("Frost Fever") === 0 && this.getDebuffRemainingTime("Blood Plague") === 0) && (!this.hasTalent("Unholy Blight") || this.hasTalent("Unholy Blight") && Spell.getCooldown("Dark Transformation").timeleft > 0) && (!this.hasTalent("Raise Abomination") || this.hasTalent("Raise Abomination") && Spell.getCooldown("Raise Abomination").timeleft > 0)),
-      Spell.cast("Apocalypse", () => Settings.UseApocalypse && this.getEnemyCount() > 1 && me.getReadyRunes() <= 3),
-      Spell.cast("Abomination Limb", () => this.getEnemyCount() > 1),
-      // AoE Burst Rotation
-      Spell.cast("Death and Decay", () => !me.hasAura(auras.death_and_decay) && (!this.hasTalent("Bursting Sores") && !this.hasTalent("Vile Contagion") || this.getWoundedTargets() >= this.getEnemyCount() || this.getWoundedTargets() >= 8 || this.getAddTimeRemaining() <= 11 && this.getAddTimeRemaining() > 5 || !me.hasAura(auras.death_and_decay) && this.hasTalent("Defile"))),
-      Spell.cast("Defile", () => this.hasTalent("Defile") && !me.hasAura(auras.death_and_decay) && (!this.hasTalent("Bursting Sores") && !this.hasTalent("Vile Contagion") || this.getWoundedTargets() >= this.getEnemyCount() || this.getWoundedTargets() >= 8 || this.getAddTimeRemaining() <= 11 && this.getAddTimeRemaining() > 5)),
-      Spell.cast("Scourge Strike", () => this.getCurrentTarget().hasAuraByMe("Chains of Ice") && this.getCurrentTarget().hasAura("Chains of Ice Trollbane Slow")),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.getCurrentTarget().hasAuraByMe("Chains of Ice") && this.getCurrentTarget().hasAura("Chains of Ice Trollbane Slow")),
-      Spell.cast("Festering Strike", () => !this.hasTalent("Vile Contagion")),
-      Spell.cast("Festering Strike", () => Spell.getCooldown("Vile Contagion").timeleft < 5 || this.getWoundedTargets() >= this.getEnemyCount() && this.getDebuffStacks("Festering Wound") <= 4),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && me.hasAura(auras.sudden_doom) && this.getEnemyCount() < this.epidemicTargets()),
-      Spell.cast("Epidemic", () => !this.variablePoolingRunicPower && me.hasAura(auras.sudden_doom)),
-      Spell.cast("Festering Strike", () => Spell.getCooldown("Apocalypse").timeleft < 1.5 && this.getDebuffStacks("Festering Wound") === 0 || this.getWoundedTargets() < this.getEnemyCount()),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && this.getEnemyCount() < this.epidemicTargets()),
-      Spell.cast("Epidemic", () => !this.variablePoolingRunicPower)
-    );
+  // Buff helpers
+  hasSD() { return me.hasAura(A.suddenDoom); }
+  hasFK() { return me.hasAura(A.forbiddenKnowledge); }
+  inDT() { return me.hasAura(A.darkTransformation) || me.hasAura(A.darkTransformationAlt); }
+  inGift() { return this.isSanlayn() && this.inDT(); }
+
+  getDTAura() {
+    return me.getAura(A.darkTransformation) || me.getAura(A.darkTransformationAlt);
   }
 
-  // Cleave Action List (2 targets) with San'layn
-  cleaveActionSan() {
-    return new bt.Selector(
-      this.useTrinkets(),
-      this.useRacials(),
-      this.sharedCooldowns(),
-      // Cooldowns
-      Spell.cast("Dark Transformation", () => me.hasAura(auras.death_and_decay) && (this.hasTalent("Apocalypse") && me.hasPet() || !this.hasTalent("Apocalypse")) || this.getTargetTimeRemaining() < 20 || this.getAddTimeRemaining() < 20),
-      Spell.cast("Unholy Assault", () => me.hasAura(auras.dark_transformation) && this.getAuraRemainingTime("Dark Transformation") < 12 || this.getTargetTimeRemaining() < 20 || this.getAddTimeRemaining() < 20),
-      Spell.cast("Apocalypse", () => Settings.UseApocalypse),
-      Spell.cast("Outbreak", () => (this.getDebuffRemainingTime("Virulent Plague") === 0 || this.hasTalent("Morbidity") && me.hasAura(auras.infliction_of_sorrow) && this.hasTalent("Superstrain") && this.getDebuffRemainingTime("Frost Fever") === 0 && this.getDebuffRemainingTime("Blood Plague") === 0) && (!this.hasTalent("Unholy Blight") || this.hasTalent("Unholy Blight") && Spell.getCooldown("Dark Transformation").timeleft > 5) && (!this.hasTalent("Raise Abomination") || this.hasTalent("Raise Abomination") && Spell.getCooldown("Raise Abomination").timeleft > 5)),
-      Spell.cast("Abomination Limb", () => !me.hasAura(auras.gift_of_the_sanlayn) && !me.hasAura(auras.sudden_doom) && me.hasAura(auras.festermight) && this.getDebuffStacks("Festering Wound") <= 2 || !me.hasAura(auras.gift_of_the_sanlayn) && this.getTargetTimeRemaining() < 12),
-      // Rotation
-      Spell.cast("Death and Decay", () => !me.hasAura(auras.death_and_decay) && (Spell.getCooldown("Apocalypse").timeleft > 0 || !this.hasTalent("Apocalypse"))),
-      Spell.cast("Defile", () => this.hasTalent("Defile") && !me.hasAura(auras.death_and_decay) && (Spell.getCooldown("Apocalypse").timeleft > 0 || !this.hasTalent("Apocalypse"))),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && this.hasTalent("Improved Death Coil")),
-      Spell.cast("Scourge Strike", () => me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && !this.hasTalent("Improved Death Coil")),
-      Spell.cast("Festering Strike", () => !me.hasAura(auras.vampiric_strike) && !this.variablePopWounds && this.getDebuffStacks("Festering Wound") < 2 || me.hasAura(auras.festering_scythe)),
-      Spell.cast("Festering Strike", () => !me.hasAura(auras.vampiric_strike) && Spell.getCooldown("Apocalypse").timeleft < this.variableApocTiming && this.getDebuffStacks("Festering Wound") < 1),
-      Spell.cast("Scourge Strike", () => this.variablePopWounds),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.variablePopWounds)
-    );
+  getLGStacks() {
+    const aura = me.getAura(A.lesserGhoulReady);
+    return aura ? aura.stacks : 0;
   }
 
-  // Cleave Action List (2 targets)
-  cleaveAction() {
-    return new bt.Selector(
-      this.useTrinkets(),
-      this.useRacials(),
-      this.sharedCooldowns(),
-      // Rotation
-      Spell.cast("Death and Decay", () => !me.hasAura(auras.death_and_decay) && (Spell.getCooldown("Apocalypse").timeleft > 0 || !this.hasTalent("Apocalypse"))),
-      Spell.cast("Defile", () => this.hasTalent("Defile") && !me.hasAura(auras.death_and_decay) && (Spell.getCooldown("Apocalypse").timeleft > 0 || !this.hasTalent("Apocalypse"))),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && this.hasTalent("Improved Death Coil")),
-      Spell.cast("Scourge Strike", () => me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && !this.hasTalent("Improved Death Coil")),
-      Spell.cast("Festering Strike", () => !me.hasAura(auras.vampiric_strike) && !this.variablePopWounds && this.getDebuffStacks("Festering Wound") < 2 || me.hasAura(auras.festering_scythe)),
-      Spell.cast("Festering Strike", () => !me.hasAura(auras.vampiric_strike) && Spell.getCooldown("Apocalypse").timeleft < this.variableApocTiming && this.getDebuffStacks("Festering Wound") < 1),
-      Spell.cast("Scourge Strike", () => this.variablePopWounds),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.variablePopWounds)
-    );
+  targetHasFSDebuff() {
+    const t = this.getCurrentTarget();
+    if (!t) return false;
+    return !!(t.getAuraByMe(A.festeringScytheDeb));
   }
 
-  // San'layn Single Target Fishing
-  sanFishingAction() {
-    return new bt.Selector(
-      Spell.cast("Anti-Magic Shell", () => me.powerByType(PowerType.RunicPower) < 40),
-      Spell.cast("Scourge Strike", () => me.hasAura(auras.infliction_of_sorrow)),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && me.hasAura(auras.infliction_of_sorrow)),
-      Spell.cast("Death and Decay", () => !me.hasAura(auras.death_and_decay) && !me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Defile", () => this.hasTalent("Defile") && !me.hasAura(auras.death_and_decay) && !me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Death Coil", () => me.hasAura(auras.sudden_doom) && this.hasTalent("Doomed Bidding") || this.hasTalent("Frenzied Bloodthirst") && me.getAuraStacks("Essence of the Blood Queen") >= me.maxStacks("Essence of the Blood Queen") && !me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Soul Reaper", () => this.getCurrentTarget().pctHealth <= 35 && this.getTargetTimeRemaining() > 5),
-      Spell.cast("Death Coil", () => !me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Scourge Strike", () => (this.getDebuffStacks("Festering Wound") >= 3-(me.hasPet() && this.hasTalent("Abomination") ? 1 : 0) && Spell.getCooldown("Apocalypse").timeleft > this.variableApocTiming) || me.hasAura(auras.vampiric_strike)),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && ((this.getDebuffStacks("Festering Wound") >= 3-(me.hasPet() && this.hasTalent("Abomination") ? 1 : 0) && Spell.getCooldown("Apocalypse").timeleft > this.variableApocTiming) || me.hasAura(auras.vampiric_strike))),
-      Spell.cast("Festering Strike", () => this.getDebuffStacks("Festering Wound") < 3-(me.hasPet() && this.hasTalent("Abomination") ? 1 : 0))
-    );
+  // =============================================
+  // RESOURCE HELPERS (cached per tick)
+  // =============================================
+  getRP() {
+    if (this._rpFrame === wow.frameTime) return this._cachedRP;
+    this._rpFrame = wow.frameTime;
+    this._cachedRP = me.powerByType(PowerType.RunicPower);
+    return this._cachedRP;
   }
 
-  // Single Target San'layn
-  singleTargetSanAction() {
-    return new bt.Selector(
-      this.useTrinkets(),
-      this.useRacials(),
-      this.sharedCooldowns(),
-      this.cdsSingleTargetSan(),
-      // Rotation
-      Spell.cast("Death and Decay", () => !me.hasAura(auras.death_and_decay) && this.hasTalent("Unholy Ground") && Spell.getCooldown("Dark Transformation").timeleft < 5),
-      Spell.cast("Defile", () => this.hasTalent("Defile") && !me.hasAura(auras.death_and_decay) && this.hasTalent("Unholy Ground") && Spell.getCooldown("Dark Transformation").timeleft < 5),
-      Spell.cast("Scourge Strike", () => me.hasAura(auras.infliction_of_sorrow)),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && me.hasAura(auras.infliction_of_sorrow)),
-      Spell.cast("Death Coil", () => me.hasAura(auras.sudden_doom) && me.hasAura(auras.gift_of_the_sanlayn) && (this.hasTalent("Doomed Bidding") || this.hasTalent("Rotten Touch")) || me.getReadyRunes() < 3 && !me.hasAura(auras.runic_corruption) || me.powerByType(PowerType.RunicPower) > 80 || me.hasAura(auras.gift_of_the_sanlayn) && me.getAuraStacks("Essence of the Blood Queen") >= me.maxStacks("Essence of the Blood Queen") && this.hasTalent("Frenzied Bloodthirst") && me.getAuraRemainingTime("Essence of the Blood Queen") > 3),
-      Spell.cast("Scourge Strike", () => me.hasAura(auras.gift_of_the_sanlayn) && me.hasAura(auras.vampiric_strike) || this.hasTalent("Gift of the San'layn") && me.hasAura(auras.dark_transformation) && me.getAuraRemainingTime("Dark Transformation") < 1.5),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && (me.hasAura(auras.gift_of_the_sanlayn) && me.hasAura(auras.vampiric_strike) || this.hasTalent("Gift of the San'layn") && me.hasAura(auras.dark_transformation) && me.getAuraRemainingTime("Dark Transformation") < 1.5)),
-      Spell.cast("Soul Reaper", () => this.getCurrentTarget().pctHealth <= 35 && !me.hasAura(auras.gift_of_the_sanlayn) && this.getTargetTimeRemaining() > 5),
-      Spell.cast("Scourge Strike", () => me.hasAura(auras.vampiric_strike) && this.getDebuffStacks("Festering Wound") >= 1),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && me.hasAura(auras.vampiric_strike) && this.getDebuffStacks("Festering Wound") >= 1),
-      Spell.cast("Festering Strike", () => (this.getDebuffStacks("Festering Wound") === 0 && Spell.getCooldown("Apocalypse").timeleft < this.variableApocTiming) || (this.hasTalent("Gift of the San'layn") && !me.hasAura(auras.gift_of_the_sanlayn) || !this.hasTalent("Gift of the San'layn")) && (me.hasAura(auras.festering_scythe) || this.getDebuffStacks("Festering Wound") <= 1)),
-      Spell.cast("Scourge Strike", () => (!this.hasTalent("Apocalypse") || Spell.getCooldown("Apocalypse").timeleft > this.variableApocTiming) && (this.getDebuffStacks("Festering Wound") >= 3-(me.hasPet() && this.hasTalent("Abomination") ? 1 : 0) || me.hasAura(auras.vampiric_strike))),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && (!this.hasTalent("Apocalypse") || Spell.getCooldown("Apocalypse").timeleft > this.variableApocTiming) && (this.getDebuffStacks("Festering Wound") >= 3-(me.hasPet() && this.hasTalent("Abomination") ? 1 : 0) || me.hasAura(auras.vampiric_strike))),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && this.getDebuffRemainingTime("Death Rot") < 1.5 || (me.hasAura(auras.sudden_doom) && this.getDebuffStacks("Festering Wound") >= 1 || me.getReadyRunes() < 2)),
-      Spell.cast("Scourge Strike", () => this.getDebuffStacks("Festering Wound") > 4),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.getDebuffStacks("Festering Wound") > 4),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower)
-    );
+  getRunes() {
+    if (this._runeFrame === wow.frameTime) return this._cachedRunes;
+    this._runeFrame = wow.frameTime;
+    this._cachedRunes = me.powerByType(PowerType.Runes);
+    return this._cachedRunes;
   }
 
-  // Single Target
-  singleTargetAction() {
-    return new bt.Selector(
-      this.useTrinkets(),
-      this.useRacials(),
-      this.sharedCooldowns(),
-      this.cdsSingleTarget(),
-      // Rotation
-      Spell.cast("Soul Reaper", () => this.getCurrentTarget().pctHealth <= 35 && this.getTargetTimeRemaining() > 5),
-      Spell.cast("Scourge Strike", () => this.getCurrentTarget().hasAuraByMe("Chains of Ice") && this.getCurrentTarget().hasAura("Chains of Ice Trollbane Slow")),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.getCurrentTarget().hasAuraByMe("Chains of Ice") && this.getCurrentTarget().hasAura("Chains of Ice Trollbane Slow")),
-      Spell.cast("Death and Decay", () => this.hasTalent("Unholy Ground") && !me.hasAura(auras.death_and_decay) && (me.hasPet() || this.hasTalent("Raise Abomination") && me.hasPet() || me.pet && me.pet.active)),
-      Spell.cast("Defile", () => this.hasTalent("Defile") && this.hasTalent("Unholy Ground") && !me.hasAura(auras.death_and_decay) && (me.hasPet() || this.hasTalent("Raise Abomination") && me.hasPet() || me.pet && me.pet.active)),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower && this.variableSpendRp() || this.getTargetTimeRemaining() < 10),
-      Spell.cast("Festering Strike", () => this.getDebuffStacks("Festering Wound") < 4 && (!this.variablePopWounds || me.hasAura(auras.festering_scythe))),
-      Spell.cast("Scourge Strike", () => this.variablePopWounds),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && this.variablePopWounds),
-      Spell.cast("Death Coil", () => !this.variablePoolingRunicPower),
-      Spell.cast("Scourge Strike", () => !this.variablePopWounds && this.getDebuffStacks("Festering Wound") >= 4),
-      Spell.cast("Clawing Shadows", () => this.hasTalent("Clawing Shadows") && !this.variablePopWounds && this.getDebuffStacks("Festering Wound") >= 4)
-    );
-  }
-
-  // Helper methods
+  // =============================================
+  // TARGET (cached per tick)
+  // =============================================
   getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
     const target = me.target;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 8 && me.isFacing(target)) {
+      this._cachedTarget = target;
       return target;
     }
-    return combat.bestTarget;
+    if (me.inCombat()) {
+      const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (t && common.validTarget(t) && me.isFacing(t)) { this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
   }
 
   getEnemyCount() {
-    return me.getUnitsAroundCount(8);
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(8) + 1 : 1;
+    return this._cachedEnemyCount;
   }
 
-  shouldUseOffensiveCDs() {
-    const target = this.getCurrentTarget();
-    return target && target.timeToDeath() > 15;
-  }
-
-  getDebuffStacks(debuffName) {
-    const target = this.getCurrentTarget();
-    return target ? target.getAuraStacks(debuffName) || 0 : 0;
-  }
-
-  getDebuffRemainingTime(debuffName) {
-    const target = this.getCurrentTarget();
-    const aura = target ? target.getAura(debuffName) : null;
-    return aura ? aura.remaining / 1000 : 0;
-  }
-
-  getDebuffTicksRemaining(debuffName) {
-    const debuffTime = this.getDebuffRemainingTime(debuffName);
-    return Math.floor(debuffTime / 3); // Most DoTs tick every 3 seconds
-  }
-
-  getAuraRemainingTime(auraName) {
-    const aura = me.getAura(auraName);
-    return aura ? aura.remaining / 1000 : 0;
-  }
-
-  getTargetTimeRemaining() {
-    const target = this.getCurrentTarget();
-    return target ? target.timeToDeath() || 100 : 100;
-  }
-
-  getAddTimeRemaining() {
-    // For raid events in SimC - estimating 0 here in regular world
-    return 0;
-  }
-
-  getWoundedTargets() {
-    // Approximate the number of enemies with Festering Wounds
-    let count = 0;
-    const enemies = me.getUnitsAround(8);
-    for (const unit of enemies) {
-      if (unit.getAura("Festering Wound")) {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  hasTalent(talentName) {
-    // For Hero Talent San'layn, check for Vampiric Strike
-    if (talentName === "Vampiric Strike") {
-      return me.hasAura(auras.vampiric_strike); // Using the key talent from HeroTalents.txt
-    }
-    
-    // For San'layn tree detection
-    if (talentName === "Gift of the San'layn") {
-      return me.hasAura(auras.vampiric_strike); // If they have Vampiric Strike, assume they have San'layn tree
-    }
-    
-    return Spell.isSpellKnown(talentName);
-  }
-
-  epidemicTargets() {
-    // Calculate the threshold for switching to Epidemic
-    const sanCoilMult = me.getAuraStacks("Essence of the Blood Queen") >= 4 ? 2 : 1;
-    return 3 + (this.hasTalent("Improved Death Coil") ? 1 : 0) + 
-           (this.hasTalent("Frenzied Bloodthirst") ? sanCoilMult : 0) + 
-           (this.hasTalent("Hungering Thirst") && this.hasTalent("Harbinger of Doom") && me.hasAura(auras.sudden_doom) ? 1 : 0);
-  }
-
-  variableSpendRp() {
-    return (!this.hasTalent("Rotten Touch") || (this.hasTalent("Rotten Touch") && !this.getCurrentTarget().hasAuraByMe("Rotten Touch")) || me.powerByType(PowerType.RunicPower) > (me.maxPowerByType(PowerType.RunicPower) - 20)) && 
-           ((this.hasTalent("Improved Death Coil") && (this.getEnemyCount() === 2 || this.hasTalent("Coil of Devastation")) || 
-           me.getReadyRunes() < 3 || me.pet && (me.pet.isGargoyle && me.pet.active) || me.hasAura(auras.sudden_doom) || 
-           !this.variablePopWounds && this.getDebuffStacks("Festering Wound") >= 4));
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
   }
 }

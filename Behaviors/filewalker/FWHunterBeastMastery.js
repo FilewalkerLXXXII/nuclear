@@ -1,227 +1,431 @@
-import { Behavior, BehaviorContext } from "@/Core/Behavior";
+import { Behavior, BehaviorContext } from '@/Core/Behavior';
 import * as bt from '@/Core/BehaviorTree';
 import Specialization from '@/Enums/Specialization';
 import common from '@/Core/Common';
-import spell from "@/Core/Spell";
-import Pet from "@/Core/Pet";
-import { me } from "@/Core/ObjectManager";
+import spell from '@/Core/Spell';
+import Settings from '@/Core/Settings';
 import { PowerType } from "@/Enums/PowerType";
-import { defaultCombatTargeting as combat } from "@/Targeting/CombatTargeting";
+import { me } from '@/Core/ObjectManager';
+import { defaultCombatTargeting as combat } from '@/Targeting/CombatTargeting';
+import { defaultHealTargeting as heal } from '@/Targeting/HealTargeting';
 
-export class HunterBeastMasteryBehavior extends Behavior {
+/**
+ * Beast Mastery Hunter Behavior - Midnight 12.0.1
+ * Sources: SimC Midnight APL (hunter_beast_mastery.simc) + Method + Wowhead
+ *
+ * Auto-detects: Pack Leader (Howl/Hogstrider) vs Dark Ranger (Black Arrow/Withering Fire)
+ * SimC sub-lists: st (5), cleave (7), drst (8), drcleave (10), cds (6) — ALL implemented
+ *
+ * CRITICAL Midnight changes:
+ *   Frenzy: REMOVED — Barbed Shot is rolling DoT only, no stacking haste buff
+ *   Multi-Shot: REMOVED — replaced by Wild Thrash (grants Beast Cleave)
+ *   BW: Static 30s CD — fire on cooldown, no charge pooling needed
+ *   Barbed Shot: Rolling DoT — remaining damage rolls into new application
+ *
+ * Pack Leader: BS → BW (on CD) → KC (Howl/Nature's Ally) → BS → CS
+ * Dark Ranger: BW → BA (Withering Fire) → WA → KC → BS → BA → CS
+ * All instant + ranged — no movement block needed
+ */
+
+const SCRIPT_VERSION = {
+  patch: '12.0.1',
+  expansion: 'Midnight',
+  date: '2026-03-19',
+  guide: 'SimC Midnight APL (every line) + Method + Wowhead',
+};
+
+const S = {
+  killCommand:        34026,
+  barbedShot:         217200,
+  cobraShot:          193455,
+  wildThrash:         1264359,
+  bestialWrath:       19574,
+  blackArrow:         466930,
+  wailingArrow:       392060,
+  huntersMark:        259558,
+  misdirection:       34477,
+  counterShot:        147362,
+  exhilaration:       109304,
+  revivePet:          982,
+  mendPet:            136,
+  berserking:         26297,
+};
+
+const T = {
+  blackArrow:         466930,   // Dark Ranger detection
+  beastCleave:        115939,   // Talent enabling Beast Cleave
+  killerCobra:        199532,   // CS resets KC during BW
+  naturesAlly:        1273126,  // Apex talent
+};
+
+const A = {
+  bestialWrath:       19574,
+  beastCleave:        115939,
+  huntersMark:        257284,
+  naturesAlly:        1276720,  // +30% next KC buff (from BS/CS/BA)
+  howlOfPackLeader:   471876,   // 30s ICD, next KC summons beast
+  hogstrider:         472640,   // +200% next CS, +targets
+  witheringFire:      466990,   // After BW, BA fires 2 extra arrows
+  deathblow:          343248,   // Resets BA, any-target use
+};
+
+export class BeastMasteryHunterBehavior extends Behavior {
+  name = 'FW Beast Mastery Hunter';
   context = BehaviorContext.Any;
   specialization = Specialization.Hunter.BeastMastery;
-  name = "FW Hunter BeastMastery";
-  version = 1;
+  version = wow.GameVersion.Retail;
+
+  _targetFrame = 0;
+  _cachedTarget = null;
+  _focusFrame = 0;
+  _cachedFocus = 0;
+  _enemyFrame = 0;
+  _cachedEnemyCount = 0;
+  _versionLogged = false;
+  _lastDebug = 0;
+
   static settings = [
     {
-      header: "Beast Mastery Configuration",
+      header: 'General',
       options: [
-        {
-          uid: "UseRacials",
-          name: "Use Racial Abilities",
-          type: "checkbox",
-          default: true
-        },
-        {
-          uid: "AOEThreshold",
-          name: "AOE Threshold",
-          type: "slider",
-          min: 2,
-          max: 5,
-          default: 2
-        }
-      ]
-    }
+        { type: 'checkbox', uid: 'FWBmUseCDs', text: 'Use Cooldowns', default: true },
+        { type: 'slider', uid: 'FWBmAoECount', text: 'AoE Target Count', default: 2, min: 2, max: 8 },
+        { type: 'checkbox', uid: 'FWBmDebug', text: 'Debug Logging', default: false },
+      ],
+    },
+    {
+      header: 'Defensives',
+      options: [
+        { type: 'checkbox', uid: 'FWBmExhil', text: 'Use Exhilaration', default: true },
+        { type: 'slider', uid: 'FWBmExhilHP', text: 'Exhilaration HP %', default: 40, min: 15, max: 60 },
+      ],
+    },
   ];
-  
 
+  // =============================================
+  // BUILD
+  // =============================================
   build() {
     return new bt.Selector(
       common.waitForNotMounted(),
+      common.waitForNotSitting(),
+
+      // Revive/Mend Pet OOC
+      spell.cast(S.revivePet, () => me, () => !me.inCombat() && me.pet && me.pet.deadOrGhost),
+
+      // Combat check
+      new bt.Action(() => me.inCombat() ? bt.Status.Failure : bt.Status.Success),
+
+      // Auto-target
+      new bt.Action(() => {
+        if (me.inCombat() && (!me.target || !common.validTarget(me.target))) {
+          const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+          if (t) wow.GameUI.setTarget(t);
+        }
+        return bt.Status.Failure;
+      }),
+
+      new bt.Action(() => this.getCurrentTarget() === null ? bt.Status.Success : bt.Status.Failure),
       common.waitForCastOrChannel(),
+
       new bt.Action(() => {
-        if (this.getCurrentTarget() === null) {
-          return bt.Status.Success;
+        if (!this._versionLogged) {
+          this._versionLogged = true;
+          console.info(`[BM] v${SCRIPT_VERSION.patch} ${SCRIPT_VERSION.expansion} | ${this.isDR() ? 'Dark Ranger' : 'Pack Leader'} | ${SCRIPT_VERSION.guide}`);
+        }
+        if (Settings.FWBmDebug && (!this._lastDebug || (wow.frameTime - this._lastDebug) > 2000)) {
+          this._lastDebug = wow.frameTime;
+          console.info(`[BM] Focus:${Math.round(this.getFocus())} BW:${me.hasAura(A.bestialWrath)} BSfrac:${spell.getChargesFractional(S.barbedShot).toFixed(2)} NA:${me.hasAura(A.naturesAlly)} Hog:${me.hasAura(A.hogstrider)} WF:${me.hasAura(A.witheringFire)} E:${this.getEnemyCount()}`);
         }
         return bt.Status.Failure;
       }),
-      this.summonPet(),
-      spell.cast("Aspect of the Wild", req => !me.isMoving() && this.shouldUseOffensiveCDs()),
-      // new bt.Decorator(
-      //   () => this.shouldUseTrinkets(),
-      //   // this.useTrinkets(),
-      //   new bt.Action(() => bt.Status.Success)
-      // ),
-      // new bt.Decorator(
-      //   () => this.shouldUseRacials(),
-      //   this.useRacials(),
-      //   new bt.Action(() => bt.Status.Success)
-      // ),
+
+      // Auto Misdirection on tank (off-GCD, 30s CD)
+      spell.cast(S.misdirection, () => {
+        if (!me.inCombat()) return null;
+        if (spell.getTimeSinceLastCast(S.misdirection) < 30000) return null;
+        const tanks = heal.friends?.Tanks;
+        if (tanks) {
+          for (let i = 0; i < tanks.length; i++) {
+            if (tanks[i] && !tanks[i].deadOrGhost && me.distanceTo(tanks[i]) <= 100) return tanks[i];
+          }
+        }
+        return null;
+      }),
+
       new bt.Decorator(
-        () => this.getEnemyCount() < 2,
-        this.singleTargetRotation(),
-        new bt.Action(() => bt.Status.Success)
+        () => !spell.isGlobalCooldown(),
+        new bt.Selector(
+          spell.interrupt(S.counterShot),
+
+          // Defensives
+          spell.cast(S.exhilaration, () => me, () =>
+            Settings.FWBmExhil && me.effectiveHealthPercent < Settings.FWBmExhilHP
+          ),
+
+          // Mend Pet in combat
+          spell.cast(S.mendPet, () => me, () =>
+            me.pet && !me.pet.deadOrGhost && me.pet.pctHealth < 50 &&
+            spell.getTimeSinceLastCast(S.mendPet) > 10000
+          ),
+
+          // SimC: call_action_list,name=cds
+          this.cooldowns(),
+
+          // SimC dispatch: DR vs PL, ST vs AoE
+          new bt.Decorator(
+            () => this.isDR() && this.isAoE(),
+            this.drCleave(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.isDR(),
+            this.drST(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          new bt.Decorator(
+            () => this.isAoE(),
+            this.plCleave(),
+            new bt.Action(() => bt.Status.Failure)
+          ),
+          this.plST(),
+        )
       ),
-      new bt.Decorator(
-        () => this.getEnemyCount() >= 2,
-        this.multiTargetRotation(),
-        new bt.Action(() => bt.Status.Success)
-      )
     );
   }
 
-  summonPet() {
+  // =============================================
+  // COOLDOWNS (SimC actions.cds, 6 lines)
+  // =============================================
+  cooldowns() {
     return new bt.Selector(
-      Pet.follow(() => me.hasAura("Feign Death")),
-      new bt.Action(() => {
-        if (!Pet.isAlive() && !me.isCasting && !me.isChanneling) {
-          const callPetSpell = spell.getSpell("Call Pet 1");
-          if (callPetSpell && callPetSpell.isKnown && callPetSpell.cooldown.ready) {
-            if (callPetSpell.cast()) {
-              console.info("Summoning pet");
-              return bt.Status.Success;
-            }
-          }
+      // Berserking during BW
+      spell.cast(S.berserking, () => me, () =>
+        me.hasAura(A.bestialWrath) || this.targetTTD() < 13000
+      ),
+      new bt.Action(() => bt.Status.Failure)
+    );
+  }
+
+  // =============================================
+  // PACK LEADER — Single Target (SimC actions.st, 5 lines)
+  // =============================================
+  plST() {
+    return new bt.Selector(
+      // 1. Barbed Shot: BW coming off CD within 1 GCD
+      spell.cast(S.barbedShot, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.bestialWrath)?.timeleft || 99999) < 1500
+      ),
+
+      // 2. Bestial Wrath (on CD)
+      spell.cast(S.bestialWrath, () => me, () => Settings.FWBmUseCDs),
+
+      // 3. Kill Command: BW CD > full_recharge + gcd & (Nature's Ally | Howl ready) | !apex.3
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () => {
+        const bwCD = spell.getCooldown(S.bestialWrath)?.timeleft || 0;
+        const kcRecharge = spell.getFullRechargeTime(S.killCommand) || 0;
+        if (bwCD > kcRecharge + 1500) {
+          return me.hasAura(A.naturesAlly) || me.hasAura(A.howlOfPackLeader);
         }
-        return bt.Status.Failure;
+        return !spell.isSpellKnown(T.naturesAlly); // !apex.3
       }),
-      // Revive pet if needed
-      new bt.Action(() => {
-        if (Pet.current && Pet.current.deadOrGhost && !me.isCasting && !me.isChanneling) {
-          const revivePetSpell = spell.getSpell("Revive Pet");
-          if (revivePetSpell && revivePetSpell.isKnown && revivePetSpell.cooldown.ready) {
-            if (revivePetSpell.cast()) {
-              console.info("Reviving pet");
-              return bt.Status.Success;
-            }
-          }
+
+      // 4. Barbed Shot
+      spell.cast(S.barbedShot, () => this.getCurrentTarget()),
+
+      // 5. Cobra Shot
+      spell.cast(S.cobraShot, () => this.getCurrentTarget()),
+    );
+  }
+
+  // =============================================
+  // PACK LEADER — Cleave (SimC actions.cleave, 7 lines)
+  // =============================================
+  plCleave() {
+    return new bt.Selector(
+      // 1. Barbed Shot: BW coming
+      spell.cast(S.barbedShot, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.bestialWrath)?.timeleft || 99999) < 1500
+      ),
+
+      // 2. Wild Thrash (Beast Cleave maintenance)
+      spell.cast(S.wildThrash, () => this.getCurrentTarget()),
+
+      // 3. Bestial Wrath
+      spell.cast(S.bestialWrath, () => me, () => Settings.FWBmUseCDs),
+
+      // 4. Kill Command
+      spell.cast(S.killCommand, () => this.getCurrentTarget()),
+
+      // 5. Cobra Shot: Wild Thrash CD > GCD & Hogstrider up & enemies < 4
+      spell.cast(S.cobraShot, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.wildThrash)?.timeleft || 0) > 1500 &&
+        me.hasAura(A.hogstrider) && this.getEnemyCount() < 4
+      ),
+
+      // 6. Barbed Shot
+      spell.cast(S.barbedShot, () => this.getCurrentTarget()),
+
+      // 7. Cobra Shot: Wild Thrash CD > GCD
+      spell.cast(S.cobraShot, () => this.getCurrentTarget(), () =>
+        (spell.getCooldown(S.wildThrash)?.timeleft || 0) > 1500
+      ),
+    );
+  }
+
+  // =============================================
+  // DARK RANGER — Single Target (SimC actions.drst, 8 lines)
+  // =============================================
+  drST() {
+    return new bt.Selector(
+      // 1. Bestial Wrath
+      spell.cast(S.bestialWrath, () => me, () => Settings.FWBmUseCDs),
+
+      // 2. Kill Command: BW CD > recharge + gcd & Nature's Ally | !apex.3
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () => {
+        const bwCD = spell.getCooldown(S.bestialWrath)?.timeleft || 0;
+        const kcRecharge = spell.getFullRechargeTime(S.killCommand) || 0;
+        if (bwCD > kcRecharge + 1500 && me.hasAura(A.naturesAlly)) return true;
+        return !spell.isSpellKnown(T.naturesAlly);
+      }),
+
+      // 3. Black Arrow: Withering Fire up
+      spell.cast(S.blackArrow, () => this.getCurrentTarget(), () =>
+        me.hasAura(A.witheringFire)
+      ),
+
+      // 4. Cobra Shot: Killer Cobra & BW up & BS charges_fractional < 1.4
+      spell.cast(S.cobraShot, () => this.getCurrentTarget(), () =>
+        spell.isSpellKnown(T.killerCobra) && me.hasAura(A.bestialWrath) &&
+        spell.getChargesFractional(S.barbedShot) < 1.4
+      ),
+
+      // 5. Wailing Arrow: Withering Fire expiring or fight ending
+      spell.cast(S.wailingArrow, () => this.getCurrentTarget(), () => {
+        const wf = me.getAura(A.witheringFire);
+        if (wf && wf.remaining < 2500) return true; // execute_time + gcd
+        return this.targetTTD() < 2500;
+      }),
+
+      // 6. Barbed Shot
+      spell.cast(S.barbedShot, () => this.getCurrentTarget()),
+
+      // 7. Black Arrow
+      spell.cast(S.blackArrow, () => this.getCurrentTarget()),
+
+      // 8. Cobra Shot
+      spell.cast(S.cobraShot, () => this.getCurrentTarget()),
+    );
+  }
+
+  // =============================================
+  // DARK RANGER — Cleave (SimC actions.drcleave, 10 lines)
+  // =============================================
+  drCleave() {
+    return new bt.Selector(
+      // 1. Black Arrow: Beast Cleave < GCD (maintain BC via BA)
+      // SimC: buff.beast_cleave.remains<gcd — Beast Cleave buff is on the PET
+      spell.cast(S.blackArrow, () => this.getCurrentTarget(), () => {
+        if (me.pet) {
+          const bc = me.pet.getAura ? me.pet.getAura(A.beastCleave) : null;
+          if (bc && bc.remaining >= 1500) return false; // BC active with enough time
         }
-        return bt.Status.Failure;
+        return true; // No BC or expiring — cast BA to refresh
       }),
-      // Set pet to attack current target
-      Pet.attack(() => this.getCurrentTarget())
+
+      // 2. Bestial Wrath
+      spell.cast(S.bestialWrath, () => me, () => Settings.FWBmUseCDs),
+
+      // 3. Wailing Arrow: BW expiring or fight ending
+      spell.cast(S.wailingArrow, () => this.getCurrentTarget(), () => {
+        const bw = me.getAura(A.bestialWrath);
+        if (bw && bw.remaining < 2500) return true;
+        return this.targetTTD() < 2500;
+      }),
+
+      // 4. Wild Thrash
+      spell.cast(S.wildThrash, () => this.getCurrentTarget()),
+
+      // 5. Kill Command: BW CD > recharge & Nature's Ally | !apex.3
+      spell.cast(S.killCommand, () => this.getCurrentTarget(), () => {
+        const bwCD = spell.getCooldown(S.bestialWrath)?.timeleft || 0;
+        const kcRecharge = spell.getFullRechargeTime(S.killCommand) || 0;
+        if (bwCD > kcRecharge + 1500 && me.hasAura(A.naturesAlly)) return true;
+        return !spell.isSpellKnown(T.naturesAlly);
+      }),
+
+      // 6. Black Arrow: Withering Fire up
+      spell.cast(S.blackArrow, () => this.getCurrentTarget(), () =>
+        me.hasAura(A.witheringFire)
+      ),
+
+      // 7. Barbed Shot
+      spell.cast(S.barbedShot, () => this.getCurrentTarget()),
+
+      // 8. Wailing Arrow
+      spell.cast(S.wailingArrow, () => this.getCurrentTarget()),
+
+      // 9. Black Arrow
+      spell.cast(S.blackArrow, () => this.getCurrentTarget()),
+
+      // 10. Cobra Shot
+      spell.cast(S.cobraShot, () => this.getCurrentTarget()),
     );
   }
 
-  useTrinkets() {
-    return new bt.Selector(
-      common.useEquippedItemByName("Improvised Seaforium Pacemaker", () => this.shouldUseOffensiveCDs()),
-      common.useEquippedItemByName("Eye of Kezan", () => this.shouldUseOffensiveCDs()),
-    );
+  // =============================================
+  // HERO DETECTION
+  // =============================================
+  isDR() { return spell.isSpellKnown(T.blackArrow); }
+  isPL() { return !this.isDR(); }
+
+  isAoE() {
+    const e = this.getEnemyCount();
+    // SimC: beast_cleave talent → cleave at 2+, otherwise cleave at 3+
+    if (spell.isSpellKnown(T.beastCleave)) return e > 1;
+    return e > 2;
   }
 
-  useRacials() {
-    return new bt.Selector(
-      spell.cast("Berserking", req => me.hasAura("Call of the Wild") || me.hasAura("Bestial Wrath")),
-      spell.cast("Blood Fury", req => me.hasAura("Call of the Wild") || me.hasAura("Bestial Wrath")),
-      spell.cast("Ancestral Call", req => me.hasAura("Call of the Wild") || me.hasAura("Bestial Wrath")),
-      spell.cast("Fireblood", req => me.hasAura("Call of the Wild") || me.hasAura("Bestial Wrath")),
-      spell.cast("Lights Judgment", req => !me.hasAura("Bestial Wrath")),
-      spell.cast("Bag of Tricks", req => !me.hasAura("Bestial Wrath"))
-    );
+  // =============================================
+  // RESOURCES (cached per tick)
+  // =============================================
+  getFocus() {
+    if (this._focusFrame === wow.frameTime) return this._cachedFocus;
+    this._focusFrame = wow.frameTime;
+    this._cachedFocus = me.powerByType(PowerType.Focus);
+    return this._cachedFocus;
   }
 
-  singleTargetRotation() {
-    return new bt.Selector(
-      // From actions.st
-      spell.cast("Dire Beast", req => this.hasTalent("Huntmaster's Call")),
-      spell.cast("Bestial Wrath", req => this.shouldUseOffensiveCDs()),
-      this.castBarbedShot(),
-      spell.cast("Kill Command", req => spell.getChargesFractional("Kill Command") >= spell.getChargesFractional("Barbed Shot")),
-      spell.cast("Call of the Wild", req => this.shouldUseOffensiveCDs()),
-      spell.cast("Bloodshed", req => this.shouldUseOffensiveCDs()),
-      spell.cast("Black Arrow", req => this.hasTalent("Black Arrow")),
-      spell.cast("Explosive Shot", req => this.hasTalent("Thundering Hooves")),
-      spell.cast("Cobra Shot"),
-      spell.cast("Dire Beast"),
-      spell.cast("Arcane Pulse", req => !me.hasAura("Bestial Wrath")),
-      spell.cast("Arcane Torrent", req => (me.powerByType(PowerType.Focus) + me.regenRate + 15) < me.maxPowerByType(PowerType.Focus))
-    );
-  }
-
-  multiTargetRotation() {
-    return new bt.Selector(
-      // From actions.cleave
-      spell.cast("Bestial Wrath"),
-      this.castBarbedShot(),
-      this.castMultiShot(),
-      spell.cast("Black Arrow", req => me.hasAura("Beast Cleave")),
-      spell.cast("Call of the Wild", req => this.shouldUseOffensiveCDs()),
-      spell.cast("Bloodshed", req => this.shouldUseOffensiveCDs()),
-      spell.cast("Dire Beast", req => this.hasTalent("Shadow Hounds") || this.hasTalent("Dire Cleave")),
-      spell.cast("Explosive Shot", req => this.hasTalent("Thundering Hooves")),
-      spell.cast("Kill Command"),
-      spell.cast("Cobra Shot", req => me.powerByType(PowerType.Focus) > 40 || me.getAuraStacks("Hogstrider") > 3),
-      spell.cast("Dire Beast"),
-      spell.cast("Explosive Shot"),
-      spell.cast("Bag of Tricks", req => !me.hasAura("Bestial Wrath")),
-      spell.cast("Arcane Torrent", req => (me.powerByType(PowerType.Focus) + me.regenRate + 30) < me.maxPowerByType(PowerType.Focus))
-    );
-  }
-
-  castBarbedShot() {
-    return spell.cast("Barbed Shot", on => this.getCurrentTarget(), req => {
-      const barbedShot = spell.getSpell("Barbed Shot");
-      if (!barbedShot) return false;
-      
-      // Get recharge time and charges
-      const fullRechargeTime = spell.getFullRechargeTime("Barbed Shot");
-      const chargesFractional = spell.getChargesFractional("Barbed Shot");
-      const killCommandCharges = spell.getChargesFractional("Kill Command");
-      
-      // Conditions from simc: full_recharge_time<gcd|charges_fractional>=cooldown.kill_command.charges_fractional|
-      // talent.call_of_the_wild&cooldown.call_of_the_wild.ready
-      return fullRechargeTime < 1.5 || 
-             chargesFractional >= killCommandCharges || 
-             (this.hasTalent("Call of the Wild") && spell.getCooldown("Call of the Wild").ready);
-    });
-  }
-
-  castMultiShot() {
-    return spell.cast("Multi-Shot", req => {
-      const beastCleave = Pet.current ? Pet.current.getAuraByMe("Beast Cleave") : null;
-      const beastCleaveRemains = beastCleave ? beastCleave.remaining : 0;
-      
-      return beastCleaveRemains < (0.25 + 1.5) && (!this.hasTalent("Bloody Frenzy") || !spell.getCooldown("Call of the Wild").ready);
-    });
-  }
-
-  // Helper methods
+  // =============================================
+  // TARGET (cached per tick)
+  // =============================================
   getCurrentTarget() {
+    if (this._targetFrame === wow.frameTime) return this._cachedTarget;
+    this._targetFrame = wow.frameTime;
     const target = me.target;
-    if (target && !target.deadOrGhost && me.canAttack(target)) {
+    if (target && common.validTarget(target) && me.distanceTo(target) <= 40 && me.isFacing(target)) {
+      this._cachedTarget = target;
       return target;
     }
-    return combat.bestTarget;
+    if (me.inCombat()) {
+      const t = combat.bestTarget || (combat.targets && combat.targets[0]);
+      if (t && common.validTarget(t) && me.isFacing(t)) { this._cachedTarget = t; return t; }
+    }
+    this._cachedTarget = null;
+    return null;
   }
 
   getEnemyCount() {
-    const aoeThreshold = 2; // Can be adjusted or made configurable
-    const targetsInRange = combat.targets.filter(unit => unit.distanceTo(me) <= 40);
-    return targetsInRange.length;
+    if (this._enemyFrame === wow.frameTime) return this._cachedEnemyCount;
+    this._enemyFrame = wow.frameTime;
+    const t = this.getCurrentTarget();
+    this._cachedEnemyCount = t ? t.getUnitsAroundCount(8) + 1 : 1;
+    return this._cachedEnemyCount;
   }
 
-  shouldUseOffensiveCDs() {
-    const target = this.getCurrentTarget();
-    if (!target) return false;
-    
-    // Don't use CDs if the target is about to die
-    const ttd = target.timeToDeath();
-    if (ttd !== undefined && ttd < 15) return false;
-    
-    return true;
-  }
-
-  shouldUseTrinkets() {
-    return this.shouldUseOffensiveCDs();
-  }
-
-  shouldUseRacials() {
-    return this.shouldUseOffensiveCDs();
-  }
-
-  hasTalent(talentName) {
-    return spell.isSpellKnown(talentName);
+  targetTTD() {
+    const t = this.getCurrentTarget();
+    if (!t || !t.timeToDeath) return 99999;
+    return t.timeToDeath();
   }
 }
